@@ -1,0 +1,10 @@
+build
+builddir
+*.jp2
+*.jxl
+*.png
+*.jpg
+*.wtpc
+*.txt
+wtpc
+!samples/*
