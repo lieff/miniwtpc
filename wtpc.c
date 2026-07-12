@@ -5,13 +5,24 @@
 #include <string.h>
 #include <time.h>
 #include <limits.h>
+#ifndef _WIN32    
 #include <dirent.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <png.h>
+#else
+#include <windows.h>
+#include <mmsystem.h>
+#define snprintf _snprintf
+#endif
 
 #define WTPC_IMAGE_IMPLEMENTATION
 #include "wtpc_image.h"
+#ifdef _WIN32
+#ifdef WTPC_TUNE_PARAMS
+#undef WTPC_TUNE_PARAMS
+#endif
+#endif
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -26,11 +37,16 @@ static int g_tune_verbose = 0;
 #endif
 
 static double now_ms(void) {
+#ifdef _WIN32
+    return timeGetTime();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
 }
 
+#ifndef _WIN32    
 /* --- libpng-based PNG reader with ICC->sRGB via lcms2 --- */
 #include <lcms2.h>
 static uint8_t *read_png(const char *path, int *w, int *h, int *has_alpha) {
@@ -290,6 +306,7 @@ static void generate_tables(const char *dir_path) {
     put_set(freq_t1_420);
     printf("};\n");
 }
+#endif /* !_WIN32 */
 
 #ifdef WTPC_TUNE_PARAMS
 
@@ -370,7 +387,7 @@ typedef struct {
 } PreloadedImg;
 
 /* Per-target aggregate: one instance per (thread, target) pair, */
-/* merged across threads after workers join.                      */
+/* merged across threads after workers join.                     */
 typedef struct {
     double ssim_sum;   /* sum of ssimulacra2 scores */
     int    count;      /* number of valid measurements */
@@ -392,7 +409,7 @@ typedef struct {
     int nimg;
     int *targets;
     int ntargets;
-    int ntotal;        /* nimg * ntargets */
+    int ntotal;            /* nimg * ntargets */
     /* per-target stats (allocated per thread, [ntargets]) */
     PerTargetStats *stats;
 } ThreadCtx;
@@ -695,6 +712,9 @@ int main(int argc, char **argv) {
     int tune_start = 0;  /* -S: start grid from this param index (0=first) */
     int tune_420   = 0;  /* -420: tune chroma 4:2:0 params instead of main */
 #endif
+#ifdef _WIN32    
+    timeBeginPeriod(1);
+#endif
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-e") == 0) mode = 1;
         else if (strcmp(argv[i], "-d") == 0) mode = 0;
@@ -704,7 +724,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-c") == 0) chroma_420 = 1;
         else if (strcmp(argv[i], "-m") == 0 && i+1 < argc) { const char *m = argv[++i]; if (strcmp(m, "huffman") == 0) huffman_mode = 1; else if (strcmp(m, "ebcot") == 0) huffman_mode = 2; }
         else if (strcmp(argv[i], "-h") == 0 && i+1 < argc) huf_extra_ctx = atoi(argv[++i]);
+#ifndef _WIN32
         else if (strcmp(argv[i], "-G") == 0) mode = 3;
+#endif
 #ifdef WTPC_TUNE_PARAMS
         else if (strcmp(argv[i], "-T") == 0) mode = 4;
         else if (strcmp(argv[i], "-S") == 0 && i+1 < argc) tune_start = atoi(argv[++i]);
@@ -727,7 +749,9 @@ int main(int argc, char **argv) {
         printf("  -c  4:2:0 chroma subsampling\n");
         printf("  -m  best|ebcot|huffman  encoding mode (default: ebcot)\n");
         printf("  -h  context-aware Huffman tables (default: 0 = single table - faster, 1 - slower and slightly better compression ~35kb->36kb)\n");
+#ifndef _WIN32
         printf("  -G  generate huffman tables from images in directory\n");
+#endif
 #ifdef WTPC_TUNE_PARAMS
         printf("  -T  grid-search multipliers for tuning\n");
         printf("  -420  tune chroma 4:2:0 params (default: main luma+chroma444+DZ)\n");
@@ -751,11 +775,14 @@ int main(int argc, char **argv) {
         int w, h, comp, has_alpha;
         uint8_t *img = NULL;
         {
+#ifndef _WIN32    
             const char *ext = strrchr(input, '.');
             if (ext && strcmp(ext, ".png") == 0) {
                 img = read_png(input, &w, &h, &has_alpha);
                 if (!img) { printf("Cannot load: %s\n", input); return 1; }
-            } else {
+            } else
+#endif
+            {
                 img = stbi_load(input, &w, &h, &comp, 0);
                 if (!img) { printf("Cannot load: %s\n", input); return 1; }
                 has_alpha = (comp == 4);
@@ -794,9 +821,11 @@ int main(int argc, char **argv) {
         free(rgb);
         if (ret != 0) { printf("Cannot write output: %s\n", output); return 1; }
         printf("Decoded %s -> %s (%d comp) in %.3f ms\n", input, output, comp, dt);
+#ifndef _WIN32
     } else if (mode == 3) {
         if (!input) { printf("Usage: wtpc -g <directory>\n"); return 1; }
         generate_tables(input);
+#endif
 #ifdef WTPC_TUNE_PARAMS
     } else if (mode == 4) {
         int nparams = tune_420 ? NPARAMS_420 : NPARAMS_MAIN;
@@ -991,5 +1020,8 @@ int main(int argc, char **argv) {
         }
         if(!all_ok) return 1;
     }
+#ifdef _WIN32    
+    timeEndPeriod(1);
+#endif
     return 0;
 }

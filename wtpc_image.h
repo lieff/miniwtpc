@@ -60,6 +60,16 @@ unsigned char *wtpc_decode_file(const char *in_path, int *w, int *h, int *out_qu
 
 #ifdef WTPC_IMAGE_IMPLEMENTATION
 
+#ifdef _WIN32
+#define inline __inline
+#include <intrin.h>
+#pragma intrinsic(_BitScanReverse)
+static __inline int msvc_clz32(unsigned int x) {
+    unsigned long idx; _BitScanReverse(&idx, x); return 31 - (int)idx;
+}
+#define __builtin_clz(x) msvc_clz32((unsigned int)(x))
+#endif
+
 static void bitstream_init(Bitstream *bs, const uint8_t *buffer, int buf_size) {
     bs->data = (uint8_t*)buffer;
     bs->byte_pos = 0;

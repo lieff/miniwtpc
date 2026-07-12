@@ -1,0 +1,1 @@
+cl ./wtpc.c /O2 /link /OUT:wtpc.exe winmm.lib
