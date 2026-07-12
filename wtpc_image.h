@@ -392,9 +392,9 @@ static void cdf97_inverse_2d(float *data, int width, int height) {
 #endif
 #define DZ_FACTOR 0.58f
 #define MAX_BANDS 8
-static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS]    = {0.44f, 0.21f, 0.19f, 0.20f, 0.28f, 0.51f, 1.21f, 3.45f};
-static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS]    = {0.42f, 0.25f, 0.29f, 0.45f, 0.80f, 1.56f, 3.19f, 6.89f};
-static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS] = {0.42f, 0.25f, 0.29f, 0.45f, 0.80f, 1.56f, 3.19f, 6.89f};
+static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS]    = {0.41f, 0.21f, 0.18f, 0.19f, 0.27f, 0.51f, 1.17f, 3.31f};
+static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS]    = {0.43f, 0.26f, 0.29f, 0.42f, 0.77f, 1.55f, 3.19f, 6.89f};
+static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS] = {0.43f, 0.26f, 0.29f, 0.42f, 0.77f, 1.55f, 3.19f, 6.89f};
 #ifdef WTPC_TUNE_PARAMS
 extern float g_dz_factor;
 #endif
@@ -1720,6 +1720,24 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
     memset(&sizes[0], 0, sizeof(sizes));
 
     /* Helper: probe quality, update best if improved. Always sets *out_sz. */
+#ifdef WTPC_TUNE_PARAMS
+    /* Training: only undershoot (size <= target). Overshoot inflates metrics  */
+    /* by cheating rate control, biasing training toward worse compression.    */
+    #define TRY(tq, out_sz) do { \
+        int _sz; unsigned char *_d; wtpc_enc_info _ti; steps++; \
+        PROBE(tq, &_d, &_ti, &_sz); \
+        *(out_sz) = _sz; \
+        if (_sz < 0) { free(_d); sizes[tq] = 0; break; } \
+        sizes[tq] = _sz; \
+        if (_sz > target_bytes) { free(_d); break; } \
+        int _dist = target_bytes - _sz; \
+        if (_dist < best_dist || (_dist == best_dist && tq < best_q)) { \
+            best_dist = _dist; best_q = tq; \
+            free(best_data); \
+            best_data = _d; best_info = _ti; best_info.result_q = tq; \
+        } else { free(_d); } \
+    } while(0)
+#else
     #define TRY(tq, out_sz) do { \
         int _sz; unsigned char *_d; wtpc_enc_info _ti; steps++; \
         PROBE(tq, &_d, &_ti, &_sz); \
@@ -1733,6 +1751,7 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
             best_data = _d; best_info = _ti; best_info.result_q = tq; \
         } else { free(_d); } \
     } while(0)
+#endif
 
     int sz;
     TRY(q, &sz);
@@ -1778,8 +1797,14 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         for (int d = -1; d <= 1; d += 2) {
             int tq = center + d;
             if (tq < 1 || tq > MAX_QUALITY) continue;
+#ifdef WTPC_TUNE_PARAMS
+            if (sizes[tq] > target_bytes) continue;  /* overshoot: skip for training */
+            if (sizes[tq] > 0) {
+                int cd = target_bytes - sizes[tq];
+#else
             if (sizes[tq] > 0) {
                 int cd = abs(sizes[tq] - target_bytes);
+#endif
                 /* skip if provably not an improvement */
                 if (cd > best_dist) continue;
                 if (cd == best_dist && tq >= best_q) continue;

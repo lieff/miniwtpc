@@ -327,7 +327,7 @@ static const ParamCfg param_cfg[NPARAMS_MAIN] = {
     {"cb4",          0.01f, 0.6f},
     {"cb5",          0.01f, 0.6f},
     {"cb6",          0.01f, 0.7f},
-    {"cb7(finest)",  0.05f, 3.0f},
+    {"cb7(finest)",  0.01f, 1.0f},
     /* DZ */
     {"dz_factor",    0.01f, 0.02f},
 };
@@ -353,15 +353,14 @@ static void apply_params(void) {
 }
 
 static void print_all_params(int chroma) {
-    printf("# current:");
+    printf("# dz:   %.2ff\n", g_dz_factor);
     if (!chroma) {
-        for (int j = 0; j < NPARAMS_MAIN; j++)
-            printf(" %s=%.2f", param_cfg[j].name, g_params[j]);
+        printf("static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS]    = {"); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_y[b]); printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS]    = {"); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_c[b]); printf("};\n");
     } else {
-        for (int j = 0; j < NPARAMS_420; j++)
-            printf(" %s=%.2f", param_cfg_420[j].name, g_params[P420_BAND0 + j]);
+        printf("static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS] = {"); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_c420[b]); printf("};\n");
     }
-    printf("\n"); fflush(stdout);
+    fflush(stdout);
 }
 
 typedef struct {
@@ -369,6 +368,15 @@ typedef struct {
     int w, h;
     int has_alpha;
 } PreloadedImg;
+
+/* Per-target aggregate: one instance per (thread, target) pair, */
+/* merged across threads after workers join.                      */
+typedef struct {
+    double ssim_sum;   /* sum of ssimulacra2 scores */
+    int    count;      /* number of valid measurements */
+    int    max_dev;    /* max absolute deviation (bytes) */
+    double dev_sum;    /* sum of absolute deviations (bytes) */
+} PerTargetStats;
 
 typedef struct {
     int tid;
@@ -385,10 +393,8 @@ typedef struct {
     int *targets;
     int ntargets;
     int ntotal;        /* nimg * ntargets */
-    /* per-thread accumulation */
-    double *tsums;     /* [ntargets] */
-    int    *tcnts;     /* [ntargets] */
-    int    *max_devs;  /* [ntargets] max |encoded - target| bytes */
+    /* per-target stats (allocated per thread, [ntargets]) */
+    PerTargetStats *stats;
 } ThreadCtx;
 
 static void *tune_worker(void *arg) {
@@ -437,26 +443,26 @@ static void *tune_worker(void *arg) {
         if (!ss_ok) {
             if (g_tune_verbose) {
                 pthread_mutex_lock(ctx->print_mutex);
-                fprintf(stderr, "[th%d t=%d %s] %s: SSIMULACRA2 FAILED (bad ICC? skipping)\n",
-                    ctx->tid, ctx->targets[t], ctx->chroma_mode ? "420" : "444", ctx->names[i]);
+                fprintf(stderr, "[th%d t=%d %s] %s: SSIMULACRA2 FAILED (bad ICC? skipping)\n", ctx->tid, ctx->targets[t], ctx->chroma_mode ? "420" : "444", ctx->names[i]);
                 pthread_mutex_unlock(ctx->print_mutex);
             }
             continue;
         }
 
-        ctx->tsums[tidx] += score;
-        ctx->tcnts[tidx]++;
+        PerTargetStats *st = &ctx->stats[tidx];
+        st->ssim_sum += score;
+        st->count++;
         int dev = abs(info.encoded_bytes - ctx->targets[t]);
         if (dev > 0 && info.encoded_bytes < ctx->targets[t] && info.result_q <= 1) dev = 0;
-        if (dev > ctx->max_devs[tidx])
-            ctx->max_devs[tidx] = dev;
+        st->dev_sum += dev;
+        if (dev > st->max_dev) st->max_dev = dev;
 
-        if (g_tune_verbose || (t == (ctx->ntargets - 1) && score < 70.0f && strcmp(ctx->names[i], "n01807496_partridge_256.png"))) {
+        if (g_tune_verbose || (t == (ctx->ntargets - 1) && score < 69.0f && strcmp(ctx->names[i], "n01807496_partridge_256.png"))) {
             pthread_mutex_lock(ctx->print_mutex);
-            fprintf(stderr, "[th%d t=%d %s] %s: %.6f  (avg_t=%.6f n=%d max_dev=%d dev=%d q=%d)\n",
-                ctx->tid, ctx->targets[t], ctx->chroma_mode ? "420" : "444", ctx->names[i], score,
-                ctx->tcnts[tidx] > 0 ? ctx->tsums[tidx] / ctx->tcnts[tidx] : 0.0,
-                ctx->tcnts[tidx], ctx->max_devs[tidx], dev, info.result_q);
+            fprintf(stderr, "[th%d t=%d] %s: ssim2=%11.6f n=%3d q=%3d dev=%3d avg_s=%11.6f mean_d=%.1f max_d=%3d (%.1f%%) - %s\n",
+                ctx->tid, ctx->targets[t], ctx->chroma_mode ? "420" : "444", score, st->count, info.result_q, dev,
+                st->count > 0 ? st->ssim_sum / st->count : 0.0, st->count > 0 ? st->dev_sum / st->count : 0.0,
+                st->max_dev, (st->max_dev*100.f/ctx->targets[t]), ctx->names[i]);
             pthread_mutex_unlock(ctx->print_mutex);
         }
     }
@@ -552,9 +558,7 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
         int _next_idx = 0; \
         pthread_mutex_t _mutex = PTHREAD_MUTEX_INITIALIZER; \
         pthread_mutex_t _pmutex = PTHREAD_MUTEX_INITIALIZER; \
-        double *_atsums = calloc(_nth * ntargets, sizeof(double)); \
-        int    *_atcnts = calloc(_nth * ntargets, sizeof(int)); \
-        int    *_amdevs = calloc(_nth * ntargets, sizeof(int)); \
+        PerTargetStats *_astats = calloc(_nth * ntargets, sizeof(PerTargetStats)); \
         ThreadCtx _ctx[TUNE_THREADS]; \
         pthread_t _th[TUNE_THREADS]; \
         for (int _tid = 0; _tid < _nth; _tid++) { \
@@ -570,35 +574,40 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
             _ctx[_tid].targets     = targets; \
             _ctx[_tid].ntargets    = ntargets; \
             _ctx[_tid].ntotal      = _ntotal; \
-            _ctx[_tid].tsums       = _atsums + _tid * ntargets; \
-            _ctx[_tid].tcnts       = _atcnts + _tid * ntargets; \
-            _ctx[_tid].max_devs    = _amdevs + _tid * ntargets; \
-            memset(_ctx[_tid].tsums, 0, ntargets * sizeof(double)); \
-            memset(_ctx[_tid].tcnts, 0, ntargets * sizeof(int)); \
-            memset(_ctx[_tid].max_devs, 0, ntargets * sizeof(int)); \
+            _ctx[_tid].stats       = _astats + _tid * ntargets; \
+            memset(_ctx[_tid].stats, 0, ntargets * sizeof(PerTargetStats)); \
             pthread_create(&_th[_tid], NULL, tune_worker, &_ctx[_tid]); \
         } \
         for (int _tid = 0; _tid < _nth; _tid++) pthread_join(_th[_tid], NULL); \
         pthread_mutex_destroy(&_mutex); \
         pthread_mutex_destroy(&_pmutex); \
+        /* Aggregate across threads, print per-target breakdown */ \
         double _sum_ssim2 = 0; int _count = 0; \
+        int _overall_max_dev = 0; \
+        double _overall_max_dev_pct = 0; \
+        double _overall_mean_dev_sum = 0; \
+        double _overall_mean_pct_sum = 0; \
         for (int _tidx = 0; _tidx < ntargets; _tidx++) { \
-            double _tsum = 0; int _tcnt = 0; \
+            double _ts = 0, _td = 0; int _tn = 0, _tm = 0; \
             for (int _tid = 0; _tid < _nth; _tid++) { \
-                _tsum += _atsums[_tid * ntargets + _tidx]; \
-                _tcnt += _atcnts[_tid * ntargets + _tidx]; \
+                PerTargetStats *_st = &_astats[_tid * ntargets + _tidx]; \
+                _ts += _st->ssim_sum; _tn += _st->count; \
+                _td += _st->dev_sum; \
+                if (_st->max_dev > _tm) _tm = _st->max_dev; \
             } \
-            if (_tcnt > 0) { _sum_ssim2 += _tsum / _tcnt; _count++; } \
-        } \
-        free(_atsums); free(_atcnts); \
-        int _max_dev = 0; \
-        for (int _tidx = 0; _tidx < ntargets; _tidx++) { \
-            for (int _tid = 0; _tid < _nth; _tid++) { \
-                int _md = _amdevs[_tid * ntargets + _tidx]; \
-                if (_md > _max_dev) _max_dev = _md; \
+            if (_tn > 0) { \
+                double _as = _ts / _tn; \
+                double _ad = _td / _tn; \
+                _sum_ssim2 += _as; _count++; \
+                double _dp = _ad * 100.0 / targets[_tidx]; \
+                double _mp = _tm * 100.0 / targets[_tidx]; \
+                if (_tm > _overall_max_dev) { _overall_max_dev = _tm; _overall_max_dev_pct = _mp; } \
+                _overall_mean_dev_sum += _ad; \
+                _overall_mean_pct_sum += _dp; \
+                fprintf(stderr, "[t=%d n=%d ssim2=%-9.6f mean_d=%.1f (%.1f%%) max_d=%d (%.1f%%)]%s", targets[_tidx], _tn, _as, _ad, _dp, _tm, _mp, _tidx == (ntargets - 1) ? "\n" : " "); \
             } \
         } \
-        free(_amdevs); \
+        free(_astats); \
         double _avg = _count > 0 ? _sum_ssim2 / _count : 0; \
         *(ssim_out) = _avg; \
         printf("%s, %.3f, %.6f\n", pcfg->name, (val), _avg); \
@@ -606,7 +615,9 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
         double _dt_s = (now_ms() - _t_step) * 0.001; \
         step_num++; \
         int _remain = total_steps - step_num; \
-        fprintf(stderr, "  %-15s %s = %6.3f  ssim2=%-9.6f  (best: %.3f = %.6f)  max_dev=%d\n", pcfg->name, label, (val), _avg, best_val, best_ssim, _max_dev); \
+        double _gm_dev = _count > 0 ? _overall_mean_dev_sum / _count : 0; \
+        double _gm_pct = _count > 0 ? _overall_mean_pct_sum / _count : 0; \
+        fprintf(stderr, "  %-15s %s = %6.3f  ssim2=%-9.6f  (best: %.3f = %.6f)  mean_dev=%.1f (%.1f%%)  max_dev=%d (%.1f%%)\n", pcfg->name, label, (val), _avg, best_val, best_ssim, _gm_dev, _gm_pct, _overall_max_dev, _overall_max_dev_pct); \
         fprintf(stderr, "  step %d/%d (%d%%)  dt=%.1fs  eta=~%.0fm\n", step_num, total_steps, step_num*100/total_steps, _dt_s, _dt_s*_remain/60.0); \
     } while(0)
 
