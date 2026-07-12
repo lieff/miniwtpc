@@ -9,27 +9,72 @@ It has two modes: fast Huffman and slower EBCOT-lite (much simpler than
 JPEG 2000 -- not even Tier-1, since that would need far more code).
 Despite its simplicity, WTPC outperforms JPEG 2000 and JPEG XL on this
 small-image benchmark, likely because its quantization is tuned to sharpen
-at low bitrates and the test dataset is relatively small.
+at low bitrates and the test dataset is relatively small (~3000 images).
+
+## API and usage
 
 ```c
-//#define WTPC_NO_STDIO  // exclude stdio versions
-//#define DEBUG_WAVELET  // dump wavelet coefficients, requires stb image
-//#define STANDARD_CDF97 // enable standard CDF 9/7 K-scaling
-//#define WTPC_TUNE_PARAMS // quantization params tuning mode
+   === API ===
 
-unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info,
-    int w, int h, int target_bytes, int quality, int chroma_420,
-    int huffman_mode, int huf_extra_ctx, int has_alpha);
-unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len,
-    int *w, int *h, int *out_quality, int *out_comp);
+   typedef struct {
+       int encoded_bytes;   - output number of bytes
+       int result_q;        - resulting quantization factor if target_bytes provided, or same as 'quality' if target_bytes=0
+       int search_steps;    - number of iterations to search target bytes quantization 
+       int ebcot;           - 1 = ebcot or 0 = huffman mode for best pick if auto huffman_mode used
+       int huffman_y_size;  - in bits if not picked static table
+       int huffman_u_size;
+       int huffman_v_size;
+       int huffman_y_table; - 0..NUM_DEF_TABLES-1 - static, NUM_DEF_TABLES - custom written in bitstream
+       int huffman_u_table;
+       int huffman_v_table;
+   } wtpc_enc_info;
 
-#ifndef WTPC_NO_STDIO
-int wtpc_encode_file(const char *out_path, const unsigned char *rgb,
-    wtpc_enc_info *info, int w, int h, int target_bytes, int quality,
-    int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha);
-unsigned char *wtpc_decode_file(const char *in_path,
-    int *w, int *h, int *out_quality, int *out_comp);
-#endif // WTPC_NO_STDIO
+   unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info,
+       int w, int h, int target_bytes, int quality, int chroma_420,
+       int huffman_mode, int huf_extra_ctx, int has_alpha);
+     Encode an RGB/RGBA image in memory. Returns malloc'd WTPC bitstream,
+     or NULL on error. Caller must free().
+       rgb           : input pixels, w*h*3 bytes (RGB) or w*h*4 (RGBA).
+       info          : output struct, filled with encoding details (may be NULL).
+       w, h          : image dimensions (>= 1).
+       target_bytes  : desired output size in bytes. 0 = use 'quality' instead.
+                       When > 0, the encoder does a binary search over the
+                       quality range [1..MAX_QUALITY] to hit the target.
+       quality       : quantization level 1..MAX_QUALITY (1024). Lower = better
+                       quality / larger file. Used only when target_bytes == 0.
+       chroma_420    : 0 = 4:4:4 (full chroma), 1 = 4:2:0 (half chroma).
+                       4:2:0 saves ~15-30% bytes with minor visual loss.
+       huffman_mode  : 0 = auto-pick smaller of ebcot/huffman,
+                       1 = huffman, 2 = ebcot.
+       huf_extra_ctx : 0 = single Huffman table (faster),
+                       1 = two context-switched tables (slightly better).
+       has_alpha     : 0 = RGB (3 channels), 1 = RGBA (4 channels).
+
+   unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len,
+       int *w, int *h, int *out_quality, int *out_comp);
+     Decode a WTPC bitstream from memory. Returns malloc'd pixel buffer
+     (w*h*3 for RGB, w*h*4 for RGBA). Caller must free().
+       data          : input WTPC bitstream bytes.
+       data_len      : number of bytes in 'data'.
+       w, h          : output image dimensions.
+       out_quality   : quality level used for encoding (may be NULL).
+       out_comp      : number of color components: 3 = RGB, 4 = RGBA (may be NULL).
+
+   int wtpc_encode_file(const char *out_path, const unsigned char *rgb,
+       wtpc_enc_info *info, int w, int h, int target_bytes, int quality,
+       int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha);
+     Same as wtpc_encode_mem but writes directly to a file.
+     Returns 0 on success, -1 on error.
+
+   unsigned char *wtpc_decode_file(const char *in_path,
+       int *w, int *h, int *out_quality, int *out_comp);
+     Same as wtpc_decode_mem but reads from a file.
+
+   === Build-time options ===
+     #define WTPC_NO_STDIO        : exclude file I/O functions.
+     #define DEBUG_WAVELET        : dump wavelet coefficient images (needs stb).
+     #define STANDARD_CDF97       : enable standard CDF 9/7 K-scaling.
+     #define WTPC_TUNE_PARAMS     : mutable quantization tables for grid-search tuning.
 ```
 
 You can retrain quantization parameters and Huffman tables on your own
