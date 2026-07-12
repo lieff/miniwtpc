@@ -5,7 +5,7 @@
 #include <string.h>
 #include <time.h>
 #include <limits.h>
-#ifndef _WIN32    
+#ifndef _WIN32
 #include <dirent.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -350,14 +350,14 @@ static const ParamCfg param_cfg[NPARAMS_MAIN] = {
 };
 
 static const ParamCfg param_cfg_420[NPARAMS_420] = {
-    {"c420b0(coarsest)", 0.10f, 2.0f},
-    {"c420b1",           0.10f, 2.0f},
-    {"c420b2",           0.10f, 2.0f},
-    {"c420b3",           0.10f, 2.0f},
-    {"c420b4",           0.10f, 2.5f},
-    {"c420b5",           0.10f, 2.5f},
-    {"c420b6",           0.10f, 3.0f},
-    {"c420b7(finest)",   0.10f, 4.0f},
+    {"c420b0(coarsest)", 0.05f, 1.0f},
+    {"c420b1",           0.05f, 1.0f},
+    {"c420b2",           0.05f, 1.0f},
+    {"c420b3",           0.05f, 1.0f},
+    {"c420b4",           0.05f, 1.5f},
+    {"c420b5",           0.05f, 1.5f},
+    {"c420b6",           0.05f, 2.0f},
+    {"c420b7(finest)",   0.05f, 3.0f},
 };
 
 static float g_params[NPARAMS];
@@ -435,12 +435,16 @@ static void *tune_worker(void *arg) {
 
         wtpc_enc_info info;
         unsigned char *enc = wtpc_encode_mem(img, &info, w, h, ctx->targets[t], 0, ctx->chroma_mode, 2, 0, pimg->has_alpha);
-        if (!enc) continue;
+        if (!enc) {
+            fprintf(stderr, "[th%d] BAD ENCODE %s: %dx%dx%d\n", ctx->tid, ctx->names[i], w, h, pimg->has_alpha ? 4 : 3); continue;
+        }
 
-        int dw, dh, dq, dcomp;
+        int dw = 0, dh = 0, dq = 0, dcomp = 0;
         unsigned char *dec = wtpc_decode_mem(enc, info.encoded_bytes, &dw, &dh, &dq, &dcomp);
         free(enc);
-        if (!dec) continue;
+        if (!dec || dw != w || dh != h || dcomp < 3) {
+            fprintf(stderr, "[th%d] BAD DECODE %s: %dx%dx%d (expected %dx%d)\n", ctx->tid, ctx->names[i], dw, dh, dcomp, w, h); continue;
+        }
 
         char tmp_png[256];
         snprintf(tmp_png, sizeof(tmp_png), "/tmp/wtpc_tune_%d_%d_%d_%d.png", getpid(), ctx->tid, i, ctx->targets[t]);
@@ -452,7 +456,7 @@ static void *tune_worker(void *arg) {
         char cmd[2048];
         snprintf(cmd, sizeof(cmd), "ssimulacra2 \"%s\" \"%s\" 2>/dev/null", path, tmp_png);
         FILE *fp = popen(cmd, "r");
-        float score = 0;
+        float score = 0, min_score = ctx->chroma_mode ? 48.f : 69.f;
         int ss_ok = 0;
         if (fp) { ss_ok = (fscanf(fp, "%f", &score) == 1); pclose(fp); }
         remove(tmp_png);
@@ -474,9 +478,9 @@ static void *tune_worker(void *arg) {
         st->dev_sum += dev;
         if (dev > st->max_dev) st->max_dev = dev;
 
-        if (g_tune_verbose || (t == (ctx->ntargets - 1) && score < 69.0f && strcmp(ctx->names[i], "n01807496_partridge_256.png"))) {
+        if (g_tune_verbose || (t == (ctx->ntargets - 1) && score < min_score && strcmp(ctx->names[i], "n01807496_partridge_256.png"))) {
             pthread_mutex_lock(ctx->print_mutex);
-            fprintf(stderr, "[th%d t=%d] %s: ssim2=%11.6f n=%3d q=%3d dev=%3d avg_s=%11.6f mean_d=%.1f max_d=%3d (%.1f%%) - %s\n",
+            fprintf(stderr, "[th%d t=%d] %s: ssim2=%11.6f n=%3d q=%3d dev=%4d avg_s=%11.6f mean_d=%.1f max_d=%4d (%.1f%%) - %s\n",
                 ctx->tid, ctx->targets[t], ctx->chroma_mode ? "420" : "444", score, st->count, info.result_q, dev,
                 st->count > 0 ? st->ssim_sum / st->count : 0.0, st->count > 0 ? st->dev_sum / st->count : 0.0,
                 st->max_dev, (st->max_dev*100.f/ctx->targets[t]), ctx->names[i]);

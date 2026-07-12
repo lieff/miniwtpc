@@ -181,15 +181,22 @@ static void chroma_down_420(float *src, int w, int h, float *dst) {
 }
 static void chroma_up_420(float *src, int sw, int sh, float *dst, int dw, int dh) {
     for (int y = 0; y < dh; y++) {
-        float fy = (float)y * sh / dh;
-        int iy = (int)fy; if (iy >= sh-1) iy = (sh > 1) ? sh-2 : 0; if (iy < 0) iy = 0;
-        float wy = fy - iy;
+        /* Downsampled sample i sits at full-res center (i+0.5)*dw/sw.            */
+        /* For target full-res y the corresponding src coordinate is y*sh/dh-0.5. */
+        /* Clamp to [0, sh-1] so the fractional part stays in [0, 1).             */
+        float fy = ((float)y + 0.5f) * sh / dh - 0.5f;
+        if (fy < 0.0f) fy = 0.0f;
+        int iy = (int)fy; if (iy >= sh-1) iy = (sh > 1) ? sh-2 : 0;
+        int iy1 = (iy + 1 < sh) ? iy + 1 : iy;  /* clamp neighbour (sh==1) */
+        float wy = fy - (float)iy;
         for (int x = 0; x < dw; x++) {
-            float fx = (float)x * sw / dw;
-            int ix = (int)fx; if (ix >= sw-1) ix = (sw > 1) ? sw-2 : 0; if (ix < 0) ix = 0;
-            float wx = fx - ix;
-            float v00 = src[iy*sw + ix], v10 = src[iy*sw + ix+1];
-            float v01 = src[(iy+1)*sw + ix], v11 = src[(iy+1)*sw + ix+1];
+            float fx = ((float)x + 0.5f) * sw / dw - 0.5f;
+            if (fx < 0.0f) fx = 0.0f;
+            int ix = (int)fx; if (ix >= sw-1) ix = (sw > 1) ? sw-2 : 0;
+            int ix1 = (ix + 1 < sw) ? ix + 1 : ix;  /* clamp neighbour (sw==1) */
+            float wx = fx - (float)ix;
+            float v00 = src[iy*sw + ix], v10 = src[iy*sw + ix1];
+            float v01 = src[iy1*sw + ix], v11 = src[iy1*sw + ix1];
             dst[y*dw + x] = v00*(1-wx)*(1-wy) + v10*wx*(1-wy) + v01*(1-wx)*wy + v11*wx*wy;
         }
     }
@@ -404,7 +411,7 @@ static void cdf97_inverse_2d(float *data, int width, int height) {
 #define MAX_BANDS 8
 static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS]    = {0.41f, 0.21f, 0.18f, 0.19f, 0.27f, 0.51f, 1.17f, 3.31f};
 static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS]    = {0.43f, 0.26f, 0.29f, 0.42f, 0.77f, 1.55f, 3.19f, 6.89f};
-static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS] = {0.43f, 0.26f, 0.29f, 0.42f, 0.77f, 1.55f, 3.19f, 6.89f};
+static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS] = {0.28f, 0.16f, 0.24f, 0.32f, 0.57f, 1.15f, 2.19f, 6.89f};
 #ifdef WTPC_TUNE_PARAMS
 extern float g_dz_factor;
 #endif
