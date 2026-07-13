@@ -1,6 +1,10 @@
 
 if [ "${ENABLE_ASAN}" = "yes" ]; then
-  CFLAGS="${CFLAGS} -fsanitize=address -fsanitize-address-use-after-scope -fno-omit-frame-pointer -fno-common -Wno-maybe-uninitialized"
+  CFLAGS="${CFLAGS} -fsanitize=address -fsanitize-address-use-after-scope -fno-omit-frame-pointer -fno-common"
+fi
+
+if [ "${ENABLE_UBSAN}" = "yes" ]; then
+  CFLAGS="${CFLAGS} -fsanitize=undefined -fno-omit-frame-pointer -fno-common"
 fi
 
 if [ "${ENABLE_DEBUG}" = "yes" ]; then

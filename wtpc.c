@@ -32,7 +32,6 @@
 #define TUNE_THREADS 7
 #define MAX_WORSE_STEPS 3
 #define MAX_WORSE_SSIM  0.5f
-float g_dz_factor    = DZ_FACTOR;
 static int g_tune_verbose = 0;
 #endif
 
@@ -152,24 +151,41 @@ static void generate_tables(const char *dir_path) {
 
         char path[1024];
         snprintf(path, sizeof(path), "%s/%s", dir_path, name);
-        int w, h, comp;
-        uint8_t *rgb = stbi_load(path, &w, &h, &comp, 3);
+        int w, h, has_alpha = 0;
+        uint8_t *rgb;
+        if (ext && strcmp(ext, ".png") == 0) {
+            rgb = read_png(path, &w, &h, &has_alpha);
+        } else {
+            int comp;
+            rgb = stbi_load(path, &w, &h, &comp, 0);
+            has_alpha = (comp == 4);
+        }
         if (!rgb) continue;
 
-        int total = w * h;
+        int total = w * h, stride = has_alpha ? 4 : 3;
         float *y_w = malloc(total * sizeof(float));
         float *u_w = malloc(total * sizeof(float));
         float *v_w = malloc(total * sizeof(float));
         int16_t *q_y = malloc(total * sizeof(int16_t));
         int16_t *q_u = malloc(total * sizeof(int16_t));
         int16_t *q_v = malloc(total * sizeof(int16_t));
-        if (!y_w || !u_w || !v_w || !q_y || !q_u || !q_v) {
+        float *a_w = NULL; int16_t *q_a = NULL;
+        if (has_alpha) {
+            a_w = malloc(total * sizeof(float));
+            q_a = malloc(total * sizeof(int16_t));
+        }
+        if (!y_w || !u_w || !v_w || !q_y || !q_u || !q_v
+            || (has_alpha && (!a_w || !q_a))) {
             free(y_w); free(u_w); free(v_w); free(q_y); free(q_u); free(q_v);
-            stbi_image_free(rgb); continue;
+            free(a_w); free(q_a);
+            free(rgb); continue;
         }
         for (int i = 0; i < total; ++i)
-            rgb_to_yuv(rgb[i*3], rgb[i*3+1], rgb[i*3+2], &y_w[i], &u_w[i], &v_w[i]);
-        stbi_image_free(rgb);
+            rgb_to_yuv(rgb[i*stride], rgb[i*stride+1], rgb[i*stride+2], &y_w[i], &u_w[i], &v_w[i]);
+        if (has_alpha) {
+            for (int i = 0; i < total; i++) a_w[i] = (float)rgb[i*4 + 3] - 128.0f;
+        }
+        free(rgb);
 
         /* 4:2:0 path: downsample chroma BEFORE wavelet (u_w/v_w still in pixel domain) */
         int cw420 = (w+1)/2, ch420 = (h+1)/2, ctotal420 = cw420 * ch420;
@@ -191,6 +207,7 @@ static void generate_tables(const char *dir_path) {
         cdf97_forward_2d(y_w, w, h);
         cdf97_forward_2d(u_w, w, h);
         cdf97_forward_2d(v_w, w, h);
+        if (has_alpha) cdf97_forward_2d(a_w, w, h);
 
         for (int lev = 0; lev < NUM_DEF_TABLES; lev++) {
             int q = q_levels[lev];
@@ -216,6 +233,13 @@ static void generate_tables(const char *dir_path) {
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0[lev][1][s] += f0[s]; freq_t1[lev][1][s] += f1[s]; }
             count_frequencies_ctx(q_v, total, f0, f1);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0[lev][2][s] += f0[s]; freq_t1[lev][2][s] += f1[s]; }
+            if (has_alpha) {
+                quantize_coeffs(a_w, q_a, w, h, base, g_quant_y);
+                count_frequencies(q_a, total, fs);
+                for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single[lev][0][s] += fs[s];
+                count_frequencies_ctx(q_a, total, f0, f1);
+                for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0[lev][0][s] += f0[s]; freq_t1[lev][0][s] += f1[s]; }
+            }
 
             /* --- 4:2:0: quantize half-res U/V, Y already quantized from 4:4:4 --- */
             quantize_coeffs(u_ds, q_u420, cw420, ch420, base, g_quant_c420);
@@ -235,8 +259,15 @@ static void generate_tables(const char *dir_path) {
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0_420[lev][1][s] += f0[s]; freq_t1_420[lev][1][s] += f1[s]; }
             count_frequencies_ctx(q_v420, ctotal420, f0, f1);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0_420[lev][2][s] += f0[s]; freq_t1_420[lev][2][s] += f1[s]; }
+            if (has_alpha) {
+                count_frequencies(q_a, total, fs);
+                for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single_420[lev][0][s] += fs[s];
+                count_frequencies_ctx(q_a, total, f0, f1);
+                for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0_420[lev][0][s] += f0[s]; freq_t1_420[lev][0][s] += f1[s]; }
+            }
         }
         free(y_w); free(u_w); free(v_w); free(q_y); free(q_u); free(q_v);
+        free(a_w); free(q_a);
         free(u_ds); free(v_ds); free(q_u420); free(q_v420);
         img_count++;
         fprintf(stderr, "\r%d images", img_count); fflush(stderr);
@@ -280,28 +311,27 @@ static void generate_tables(const char *dir_path) {
     printf("// Quality levels: {%d,%d,%d,%d,%d,%d,%d}\n",
         q_levels[0], q_levels[1], q_levels[2], q_levels[3], q_levels[4], q_levels[5], q_levels[6]);
     printf("\n");
-    printf("// Single-table (huf_extra_ctx=0): all coefficients\n");
+    printf("/* Single-table (huf_extra_ctx=0): all coefficients */\n");
     printf("static const uint8_t def_tables_single[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {\n");
     put_set(freq_single);
     printf("};\n\n");
-    printf("// t0 tables (prev-cat <= 2)\n");
+    printf("/* t0 tables (prev-cat <= 2) */\n");
     printf("static const uint8_t def_tables_t0[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {\n");
     put_set(freq_t0);
     printf("};\n\n");
-    printf("// t1 tables (prev-cat > 2)\n");
+    printf("/* t1 tables (prev-cat > 2) */\n");
     printf("static const uint8_t def_tables_t1[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {\n");
     put_set(freq_t1);
     printf("};\n\n");
-    printf("// --- 4:2:0 chroma subsampling variants ---\n");
-    printf("// Single-table (huf_extra_ctx=0): all coefficients\n");
+    printf("/* 4:2:0 single-table (huf_extra_ctx=0): all coefficients */\n");
     printf("static const uint8_t def_tables_single_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {\n");
     put_set(freq_single_420);
     printf("};\n\n");
-    printf("// t0 tables (prev-cat <= 2)\n");
+    printf("/* 4:2:0 t0 tables (prev-cat <= 2) */\n");
     printf("static const uint8_t def_tables_t0_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {\n");
     put_set(freq_t0_420);
     printf("};\n\n");
-    printf("// t1 tables (prev-cat > 2)\n");
+    printf("/* 4:2:0 t1 tables (prev-cat > 2) */\n");
     printf("static const uint8_t def_tables_t1_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {\n");
     put_set(freq_t1_420);
     printf("};\n");
@@ -313,11 +343,12 @@ static void generate_tables(const char *dir_path) {
 enum {
     P_BAND0, P_BAND1, P_BAND2, P_BAND3, P_BAND4, P_BAND5, P_BAND6, P_BAND7,
     P_CBAND0, P_CBAND1, P_CBAND2, P_CBAND3, P_CBAND4, P_CBAND5, P_CBAND6, P_CBAND7,
-    P_DZ,
+    P_DZ_LUMA, P_DZ_CHROMA,
     P420_BAND0, P420_BAND1, P420_BAND2, P420_BAND3, P420_BAND4, P420_BAND5, P420_BAND6, P420_BAND7,
+    P420_DZ_CHROMA,
     NPARAMS
 };
-#define NPARAMS_MAIN (P_DZ + 1)
+#define NPARAMS_MAIN (P_DZ_CHROMA + 1)
 #define NPARAMS_420  (NPARAMS - NPARAMS_MAIN)
 
 typedef struct {
@@ -346,18 +377,20 @@ static const ParamCfg param_cfg[NPARAMS_MAIN] = {
     {"cb6",          0.01f, 0.7f},
     {"cb7(finest)",  0.01f, 1.0f},
     /* DZ */
-    {"dz_factor",    0.01f, 0.02f},
+    {"dz_luma",      0.01f, 0.05f},
+    {"dz_chroma",    0.01f, 0.05f},
 };
 
 static const ParamCfg param_cfg_420[NPARAMS_420] = {
-    {"c420b0(coarsest)", 0.05f, 1.0f},
-    {"c420b1",           0.05f, 1.0f},
-    {"c420b2",           0.05f, 1.0f},
-    {"c420b3",           0.05f, 1.0f},
-    {"c420b4",           0.05f, 1.5f},
-    {"c420b5",           0.05f, 1.5f},
-    {"c420b6",           0.05f, 2.0f},
-    {"c420b7(finest)",   0.05f, 3.0f},
+    {"c420b0(coarsest)", 0.01f, 0.8f},
+    {"c420b1",           0.01f, 0.8f},
+    {"c420b2",           0.01f, 0.8f},
+    {"c420b3",           0.01f, 0.8f},
+    {"c420b4",           0.01f, 0.8f},
+    {"c420b5",           0.01f, 0.8f},
+    {"c420b6",           0.01f, 1.0f},
+    {"c420b7(finest)",   0.01f, 1.5f},
+    {"dz420_chroma",     0.01f, 0.05f},
 };
 
 static float g_params[NPARAMS];
@@ -366,16 +399,17 @@ static void apply_params(void) {
     for (int b = 0; b < MAX_BANDS; b++) g_quant_y[b]    = g_params[P_BAND0 + b];
     for (int b = 0; b < MAX_BANDS; b++) g_quant_c[b]    = g_params[P_CBAND0 + b];
     for (int b = 0; b < MAX_BANDS; b++) g_quant_c420[b] = g_params[P420_BAND0 + b];
-    g_dz_factor = g_params[P_DZ];
+    g_quant_y[MAX_BANDS] = g_params[P_DZ_LUMA];
+    g_quant_c[MAX_BANDS] = g_params[P_DZ_CHROMA];
+    g_quant_c420[MAX_BANDS] = g_params[P420_DZ_CHROMA];
 }
 
 static void print_all_params(int chroma) {
-    printf("# dz:   %.2ff\n", g_dz_factor);
     if (!chroma) {
-        printf("static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS]    = {"); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_y[b]); printf("};\n");
-        printf("static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS]    = {"); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_c[b]); printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS+1]    = {"); for (int b = 0; b <= MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_y[b]); printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS+1]    = {"); for (int b = 0; b <= MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_c[b]); printf("};\n");
     } else {
-        printf("static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS] = {"); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_c420[b]); printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS+1] = {"); for (int b = 0; b <= MAX_BANDS; b++) printf("%s%.2ff", b ? ", " : "", g_quant_c420[b]); printf("};\n");
     }
     fflush(stdout);
 }
@@ -393,6 +427,7 @@ typedef struct {
     int    count;      /* number of valid measurements */
     int    max_dev;    /* max absolute deviation (bytes) */
     double dev_sum;    /* sum of absolute deviations (bytes) */
+    double q_sum;      /* sum of quality levels */
 } PerTargetStats;
 
 typedef struct {
@@ -473,6 +508,7 @@ static void *tune_worker(void *arg) {
         PerTargetStats *st = &ctx->stats[tidx];
         st->ssim_sum += score;
         st->count++;
+        st->q_sum += info.result_q;
         int dev = abs(info.encoded_bytes - ctx->targets[t]);
         if (dev > 0 && info.encoded_bytes < ctx->targets[t] && info.result_q <= 1) dev = 0;
         st->dev_sum += dev;
@@ -501,10 +537,12 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
     int ntargets = sizeof(targets) / sizeof(targets[0]);
 
     /* Init g_params from current g_quant tables (start from previous run's values) */
-    for (int b = 0; b < MAX_BANDS; b++) g_params[P_BAND0 + b] = g_quant_y[b];
-    for (int b = 0; b < MAX_BANDS; b++) g_params[P_CBAND0 + b] = g_quant_c[b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_BAND0 + b]    = g_quant_y[b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_CBAND0 + b]   = g_quant_c[b];
     for (int b = 0; b < MAX_BANDS; b++) g_params[P420_BAND0 + b] = g_quant_c420[b];
-    g_params[P_DZ] = g_dz_factor;
+    g_params[P_DZ_LUMA]      = g_quant_y[MAX_BANDS];
+    g_params[P_DZ_CHROMA]    = g_quant_c[MAX_BANDS];
+    g_params[P420_DZ_CHROMA] = g_quant_c420[MAX_BANDS];
     apply_params();
 
     /* Collect image list */
@@ -609,23 +647,25 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
         double _overall_mean_dev_sum = 0; \
         double _overall_mean_pct_sum = 0; \
         for (int _tidx = 0; _tidx < ntargets; _tidx++) { \
-            double _ts = 0, _td = 0; int _tn = 0, _tm = 0; \
+            double _ts = 0, _td = 0, _tq = 0; int _tn = 0, _tm = 0; \
             for (int _tid = 0; _tid < _nth; _tid++) { \
                 PerTargetStats *_st = &_astats[_tid * ntargets + _tidx]; \
                 _ts += _st->ssim_sum; _tn += _st->count; \
                 _td += _st->dev_sum; \
+                _tq += _st->q_sum; \
                 if (_st->max_dev > _tm) _tm = _st->max_dev; \
             } \
             if (_tn > 0) { \
                 double _as = _ts / _tn; \
                 double _ad = _td / _tn; \
+                double _aq = _tq / _tn; \
                 _sum_ssim2 += _as; _count++; \
                 double _dp = _ad * 100.0 / targets[_tidx]; \
                 double _mp = _tm * 100.0 / targets[_tidx]; \
                 if (_tm > _overall_max_dev) { _overall_max_dev = _tm; _overall_max_dev_pct = _mp; } \
                 _overall_mean_dev_sum += _ad; \
                 _overall_mean_pct_sum += _dp; \
-                fprintf(stderr, "[t=%d n=%d ssim2=%-9.6f mean_d=%.1f (%.1f%%) max_d=%d (%.1f%%)]%s", targets[_tidx], _tn, _as, _ad, _dp, _tm, _mp, _tidx == (ntargets - 1) ? "\n" : " "); \
+                fprintf(stderr, "[t=%d n=%d ssim2=%-9.6f mean_q=%.1f mean_d=%.1f (%.1f%%) max_d=%d (%.1f%%)]%s", targets[_tidx], _tn, _as, _aq, _ad, _dp, _tm, _mp, _tidx == (ntargets - 1) ? "\n" : " "); \
             } \
         } \
         free(_astats); \

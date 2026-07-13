@@ -75,6 +75,10 @@ at low bitrates and the test dataset is relatively small (~3000 images).
      #define DEBUG_WAVELET        : dump wavelet coefficient images (needs stb).
      #define STANDARD_CDF97       : enable standard CDF 9/7 K-scaling.
      #define WTPC_TUNE_PARAMS     : mutable quantization tables for grid-search tuning.
+     #define WTPC_RC_ONLY_LESS_THAN_TARGET : rate control never overshoots
+                                    target_bytes (picks the largest size <= target
+                                    instead of the closest). Implied by
+                                    WTPC_TUNE_PARAMS.
 ```
 
 You can retrain quantization parameters and Huffman tables on your own
