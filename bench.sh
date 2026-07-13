@@ -207,12 +207,13 @@ done
 echo "" | tee -a "$LOGFILE"
 echo "=== Generating results.md ===" | tee -a "$LOGFILE"
 
-python3 - "$LOGFILE" "$SCRIPT_DIR/results.md" "$DATE" << 'PYEOF'
+python3 - "$LOGFILE" "$SCRIPT_DIR/results.md" "$SCRIPT_DIR/readme.md" "$DATE" << 'PYEOF'
 import sys, re
 
 logfile = sys.argv[1]
 resfile = sys.argv[2]
-date_str = sys.argv[3]
+readmefile = sys.argv[3]
+date_str = sys.argv[4]
 
 # Parse log into dict: codec -> list of (param, size, psnr, ssim, enc_ms, dec_ms)
 data = {}
@@ -487,6 +488,138 @@ md.append(f'*Tools: ImageMagick 7.1.2, OpenJPEG 2.5.4, libjxl 0.11.1. Date: {dat
 with open(resfile, 'w') as f:
     f.write('\n'.join(md) + '\n')
 print(f'Generated {resfile} ({len(md)} lines)')
+
+# ============================================================
+# Update readme.md with benchmark results
+# ============================================================
+try:
+    with open(readmefile) as f:
+        rl = f.readlines()
+
+    def replace_table_in_lines(rl, section_header, new_data_rows):
+        """Replace data rows in a markdown table section."""
+        s_idx = None
+        for i, line in enumerate(rl):
+            if line.strip() == section_header:
+                s_idx = i
+                break
+        if s_idx is None:
+            return rl
+
+        pipe_rows = []
+        for i in range(s_idx + 1, len(rl)):
+            stripped = rl[i].strip()
+            if stripped.startswith('|'):
+                pipe_rows.append(i)
+            elif stripped == '':
+                continue
+            else:
+                break
+
+        if len(pipe_rows) < 3:
+            return rl
+
+        prefix = rl[:pipe_rows[2]]
+        suffix = rl[pipe_rows[-1] + 1:]
+        new_rows = [row.rstrip('\n') + '\n' for row in new_data_rows]
+        return prefix + new_rows + suffix
+
+    # ---- Best Codec by Target Size (by PSNR) ----
+    idx = None
+    for i, line in enumerate(rl):
+        if line.strip() == '### Best Codec by Target Size (by PSNR)':
+            idx = i
+            break
+    if idx is not None:
+        targets = [200, 400, 600, 800, 1400, 2000, 3000, 4000, 5000, 6000, 8000, 10000, 13000, 15000, 18000, 22000, 28000, 36000]
+        clabels = {
+            'WTPC_E': 'WTPC 4:4:4 EBCOT',
+            'WTPC_H': 'WTPC 4:4:4 Huffman',
+            'W420_E': 'WTPC 4:2:0 EBCOT',
+            'W420_H': 'WTPC 4:2:0 Huffman',
+            'J2K': 'JPEG 2000',
+            'JXL': 'JPEG XL',
+            'JPEG': 'JPEG',
+        }
+
+        new_rows = []
+        for target in targets:
+            lo, hi = int(target * 0.7), int(target * 1.3)
+            # For each codec find the CLOSEST entry to target
+            closest_per_codec = {}
+            for codec in data:
+                closest = None; closest_dist = 999999
+                for param, sz, psnr, ssim, _enc, _dec in data[codec]:
+                    if lo <= sz <= hi:
+                        dist = abs(sz - target)
+                        if dist < closest_dist: closest_dist = dist; closest = (param, sz, psnr, ssim)
+                if closest: closest_per_codec[codec] = closest
+            # Among closest entries, pick the best PSNR
+            best_codec = None
+            best_psnr = -1.0
+            best_entry = None
+            for codec, entry in closest_per_codec.items():
+                if entry[2] > best_psnr:
+                    best_psnr = entry[2]
+                    best_codec = codec
+                    best_entry = entry
+            if best_entry:
+                param, sz, psnr, ssim = best_entry
+                label = clabels.get(best_codec, best_codec)
+                t_label = f"{target} B" if target < 1000 else f"{target // 1000} KB"
+                new_rows.append(f"| {t_label} | {label} | {sz} B | {psnr:.2f} | {ssim:.2f} |")
+
+        rl = replace_table_in_lines(rl, '### Best Codec by Target Size (by PSNR)', new_rows)
+        print(f'  Updated Best Codec table ({len(new_rows)} rows)')
+
+    # ---- Speed Summary (fixed q=20) ----
+    idx = None
+    for i, line in enumerate(rl):
+        if line.strip() == '### Speed Summary (lena 256x256, fixed q=20)':
+            idx = i
+            break
+    if idx is not None:
+        wtpc_labels = {
+            'WTPC_E': 'WTPC EBCOT 4:4:4',
+            'WTPC_H': 'WTPC Huffman 4:4:4',
+            'W420_E': 'WTPC EBCOT 4:2:0',
+            'W420_H': 'WTPC Huffman 4:2:0',
+        }
+
+        speed_rows = []
+        for var in ['WTPC_E', 'WTPC_H', 'W420_E', 'W420_H']:
+            if var in time_data:
+                entry = [e for e in time_data[var] if e[0] == 20]
+                if entry:
+                    enc, dec = entry[0][2], entry[0][3]
+                    speed_rows.append(f"| {wtpc_labels[var]} | {round(enc)} | {round(dec)} |")
+
+        # JPEG 2000: rate=20 entry
+        for p, sz, psnr, ssim, enc, dec in data.get('J2K', []):
+            if str(p) == '20':
+                speed_rows.append(f"| JPEG 2000 | {round(enc)} | {round(dec)} |")
+                break
+
+        # JPEG XL: min quality (first/best entry)
+        jxl = data.get('JXL', [])
+        if jxl:
+            enc, dec = jxl[0][4], jxl[0][5]
+            speed_rows.append(f"| JPEG XL | {round(enc)} | {round(dec) if dec > 0 else '-'} |")
+
+        # JPEG: q=20 entry
+        for p, sz, psnr, ssim, enc, dec in data.get('JPEG', []):
+            if str(p) == '20':
+                speed_rows.append(f"| JPEG | {round(enc)} | - |")
+                break
+
+        rl = replace_table_in_lines(rl, '### Speed Summary (lena 256x256, fixed q=20)', speed_rows)
+        print(f'  Updated Speed Summary table ({len(speed_rows)} rows)')
+
+    with open(readmefile, 'w') as f:
+        f.writelines(rl)
+    print(f'Updated {readmefile}')
+except Exception as ex:
+    print(f'Skipping readme.md update: {ex}')
 PYEOF
 
 echo "" | tee -a "$LOGFILE"

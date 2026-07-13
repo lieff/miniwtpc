@@ -96,50 +96,36 @@ run tuning (`wtpc -T`) and/or Huffman table generation (`wtpc -G`).
 
 | Target | Best Codec         | Size   | PSNR   | ssimulacra2 |
 |--------|--------------------|--------|--------|-------------|
-| 200 B  | WTPC 4:2:0 EBCOT   | 200 B  | 19.65  | -61.34      |
-| 400 B  | WTPC 4:4:4 EBCOT   | 400 B  | 21.76  | -42.91      |
-| 600 B  | WTPC 4:4:4 EBCOT   | 600 B  | 22.94  | -27.32      |
-| 800 B  | WTPC 4:4:4 EBCOT   | 801 B  | 23.81  | -13.12      |
-| 1.4 KB | WTPC 4:4:4 EBCOT   | 1398 B | 25.66  | 14.96       |
-| 2 KB   | WTPC 4:4:4 EBCOT   | 2006 B | 26.97  | 30.48       |
-| 3 KB   | WTPC 4:4:4 EBCOT   | 3008 B | 28.34  | 48.55       |
-| 4 KB   | JPEG 2000           | 4111 B | 29.41  | 45.18       |
-| 5 KB   | WTPC 4:4:4 EBCOT   | 4982 B | 30.40  | 63.24       |
-| 6 KB   | WTPC 4:4:4 EBCOT   | 6069 B | 31.37  | 69.08       |
-| 8 KB   | WTPC 4:4:4 EBCOT   | 8038 B | 32.93  | 74.87       |
-| 10 KB  | WTPC 4:4:4 EBCOT   | 9902 B | 34.12  | 78.72       |
-| 13 KB  | WTPC 4:4:4 EBCOT   | 13090 B| 35.76  | 83.63       |
-| 15 KB  | WTPC 4:4:4 EBCOT   | 15065 B| 36.55  | 85.62       |
-| 18 KB  | WTPC 4:4:4 EBCOT   | 17870 B| 37.56  | 87.81       |
-| 22 KB  | WTPC 4:4:4 EBCOT   | 22025 B| 38.89  | 90.15       |
-| 28 KB  | WTPC 4:4:4 EBCOT   | 28256 B| 40.61  | 92.11       |
-| 36 KB  | WTPC 4:4:4 EBCOT   | 36760 B| 42.52  | 93.78       |
-
-### Key Takeaways
-
-- **WTPC EBCOT 4:4:4** dominates PSNR across almost the entire range
-  (wins 20 out of 22 targets). JPEG 2000 wins only at ~4 KB; JPEG XL
-  never leads on PSNR.
-- **WTPC 4:2:0 EBCOT** leads at the very smallest sizes (200 B) thanks
-  to chroma subsampling saving bits.
-- **WTPC Huffman** is 2-5x faster to encode and 3-10x faster to decode
-  than EBCOT, at a PSNR cost of 0.5-1.5 dB.
-- **JPEG** is far behind at all sizes below ~25 KB.
-- **JPEG XL** has competitive ssimulacra2 at higher sizes (wins 3 targets
-  by perceptual metric), but its minimum file size is ~1.4 KB -- it cannot
-  reach the 200 B-1 KB range.
+| 200 B | WTPC 4:2:0 EBCOT | 200 B | 19.89 | -60.91 |
+| 400 B | WTPC 4:4:4 EBCOT | 400 B | 21.77 | -42.93 |
+| 600 B | WTPC 4:2:0 EBCOT | 599 B | 23.07 | -27.50 |
+| 800 B | WTPC 4:2:0 EBCOT | 803 B | 23.85 | -11.55 |
+| 1 KB | WTPC 4:2:0 EBCOT | 1400 B | 25.71 | 15.15 |
+| 2 KB | WTPC 4:2:0 EBCOT | 1992 B | 26.94 | 31.53 |
+| 3 KB | WTPC 4:2:0 EBCOT | 2986 B | 28.31 | 47.61 |
+| 4 KB | WTPC 4:2:0 EBCOT | 4043 B | 29.50 | 56.94 |
+| 5 KB | WTPC 4:2:0 EBCOT | 5070 B | 30.52 | 63.86 |
+| 6 KB | WTPC 4:2:0 EBCOT | 6115 B | 31.43 | 68.64 |
+| 8 KB | WTPC 4:4:4 EBCOT | 7947 B | 32.81 | 74.35 |
+| 10 KB | WTPC 4:4:4 EBCOT | 10079 B | 34.17 | 79.09 |
+| 13 KB | WTPC 4:4:4 EBCOT | 12895 B | 35.62 | 83.51 |
+| 15 KB | WTPC 4:4:4 EBCOT | 14996 B | 36.47 | 85.59 |
+| 18 KB | WTPC 4:4:4 EBCOT | 18021 B | 37.52 | 88.01 |
+| 22 KB | WTPC 4:4:4 EBCOT | 22139 B | 38.83 | 90.28 |
+| 28 KB | WTPC 4:4:4 EBCOT | 28339 B | 40.52 | 92.13 |
+| 36 KB | WTPC 4:4:4 EBCOT | 36735 B | 42.42 | 93.81 |
 
 ### Speed Summary (lena 256x256, fixed q=20)
 
 | Codec               | Encode (ms) | Decode (ms) |
 |---------------------|-------------|-------------|
-| WTPC EBCOT 4:4:4    | 19          | 16          |
-| WTPC Huffman 4:4:4  | 5           | 3           |
-| WTPC EBCOT 4:2:0    | 10          | 10          |
-| WTPC Huffman 4:2:0  | 3           | 2           |
-| JPEG 2000            | 20          | 40          |
-| JPEG XL              | 17-150      | 8           |
-| JPEG                 | 5-7         | -           |
+| WTPC EBCOT 4:4:4 | 10 | 10 |
+| WTPC Huffman 4:4:4 | 4 | 2 |
+| WTPC EBCOT 4:2:0 | 6 | 7 |
+| WTPC Huffman 4:2:0 | 3 | 2 |
+| JPEG 2000 | 17 | 35 |
+| JPEG XL | 104 | 6 |
+| JPEG | 4 | - |
 
 See [results.md](results.md) for the complete per-size breakdown, speed
 measurements across all quality levels, mermaid charts, and raw data.

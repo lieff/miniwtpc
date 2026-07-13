@@ -579,39 +579,56 @@ static void compute_safe_steps(float min_step[5], int w, int h) {
     }
 }
 
-/* Which band does (x,y) fall into? 4=coarsest(DC), 0=finest. */
-/* lw[0]=1, lw[4..7] always valid (padded). Matches get_quant_mult. */
-static int quant_band(int x, int y, const int *lw, const int *lh) {
-    if (x < lw[4] && y < lh[4]) return 4;  /* coarsest (DC) */
-    if (x < lw[5] && y < lh[5]) return 3;
-    if (x < lw[6] && y < lh[6]) return 2;
-    if (x < lw[7] && y < lh[7]) return 1;
-    return 0;  /* finest */
-}
-
 static void quantize_coeffs(const float *wavelet, int16_t *quantized, int w, int h, float base, const float *bands_mult) {
     int lw[17], lh[17];
     compute_ll_sizes(w, h, lw, lh);
     float min_step[5];
     compute_safe_steps(min_step, w, h);
     float dz_factor = bands_mult[MAX_BANDS];
+    /* Padded local copy of bands_mult (stack, 68 bytes) — no bounds check in loop */
+    #define LUT_SZ 17
+    float lb[LUT_SZ];
+    for (int b = 0; b < MAX_BANDS; b++) lb[b] = bands_mult[b];
+    for (int b = MAX_BANDS; b < LUT_SZ; b++) lb[b] = bands_mult[MAX_BANDS-1];
+    static const int qb_lut[17] = {0,4,4,4,4,3,2,1,0,0,0,0,0,0,0,0,0};
+    int i = 0;
+    /* Precompute per-band step + deadzone (k=1..LUT_SZ-1): saves 1 mul+1 LUT+1 clamp+1 mul per pixel */
+    float step_k[LUT_SZ], dz_k[LUT_SZ];
+    for (int k = 1; k < LUT_SZ; k++) {
+        float s = base * lb[k - 1];
+        int qb = qb_lut[k];
+        s = fmaxf(s, min_step[qb]);   // branchless SSE maxss
+        step_k[k] = s;
+        dz_k[k]  = s * dz_factor;
+    }
+
     for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            int i = y * w + x;
-            float val = wavelet[i];
-            float step = base * get_quant_mult(x, y, lw, lh, bands_mult);
-            int b = quant_band(x, y, lw, lh);
-            if (step < min_step[b]) step = min_step[b];
-            float abs_val = fabsf(val);
-            int q;
-            if (abs_val < step * dz_factor)
-                q = 0;
-            else
-                q = (int)(abs_val / step + 0.5f);
-            if (val < 0) q = -q;
-            quantized[i] = (int16_t)q;
+        int k_y = MAX_BANDS;
+        for (int k = 1; k < MAX_BANDS; k++) { if (y < lh[k]) { k_y = k; break; } }
+
+        /* Segment the row by subband boundary lw[k]: within [x, seg_end) the band   */
+        /* index k = max(k_x, k_y) is constant, so step/deadzone are loop-invariant. */
+        /* get_quant_mult(x,y) picks the first k with x<lw[k] && y<lh[k] = max(k_x,  */
+        /* k_y) since lw/lh are monotone. NOTE: do NOT shortcut k_x via floor(log2   */
+        /* x)+1 even for power-of-two widths -- lw[k] != 2^k when width and height   */
+        /* decompose into a different number of levels (non-square images pad the    */
+        /* coarse end of lw), which silently corrupts quantization. */
+        int x = 0, k_x = 1;
+        while (k_x < MAX_BANDS && lw[k_x] <= 0) k_x++;
+        while (x < w) {
+            int seg_end = (k_x < MAX_BANDS) ? lw[k_x] : w;
+            if (seg_end > w) seg_end = w;
+            int k = k_x > k_y ? k_x : k_y;
+            float step = step_k[k], dz = dz_k[k];
+            for (; x < seg_end; x++, i++) {
+                float val = wavelet[i];
+                if (fabsf(val) < dz) { quantized[i] = 0; }
+                else { float v = val / step; quantized[i] = (int16_t)(int)(v + copysignf(0.5f, v)); }
+            }
+            if (k_x < MAX_BANDS) k_x++; else break;  /* seg_end==w reached end of row */
         }
     }
+    #undef LUT_SZ
 }
 
 static void dequantize_channel(const int16_t *quantized, float *f_out, int w, int h, float base, const float *bands_mult) {
@@ -619,15 +636,38 @@ static void dequantize_channel(const int16_t *quantized, float *f_out, int w, in
     compute_ll_sizes(w, h, lw, lh);
     float min_step[5];
     compute_safe_steps(min_step, w, h);
+    #define LUT_SZ 17
+    float lb[LUT_SZ];
+    for (int b = 0; b < MAX_BANDS; b++) lb[b] = bands_mult[b];
+    for (int b = MAX_BANDS; b < LUT_SZ; b++) lb[b] = bands_mult[MAX_BANDS-1];
+    static const int qb_lut[17] = {0,4,4,4,4,3,2,1,0,0,0,0,0,0,0,0,0};
+    int i = 0;
+    /* Precompute per-band step (k=1..LUT_SZ-1): saves 1 mul+1 LUT+1 clamp per pixel */
+    float step_k[LUT_SZ];
+    for (int k = 1; k < LUT_SZ; k++) {
+        float s = base * lb[k - 1];
+        int qb = qb_lut[k];
+        step_k[k] = fmaxf(s, min_step[qb]);
+    }
+
     for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            int i = y * w + x;
-            float step = base * get_quant_mult(x, y, lw, lh, bands_mult);
-            int b = quant_band(x, y, lw, lh);
-            if (step < min_step[b]) step = min_step[b];
-            f_out[i] = (float)(quantized[i] * step);
+        int k_y = MAX_BANDS;
+        for (int k = 1; k < MAX_BANDS; k++) { if (y < lh[k]) { k_y = k; break; } }
+
+        /* Same segmented row walk as quantize_coeffs (must match exactly). */
+        int x = 0, k_x = 1;
+        while (k_x < MAX_BANDS && lw[k_x] <= 0) k_x++;
+        while (x < w) {
+            int seg_end = (k_x < MAX_BANDS) ? lw[k_x] : w;
+            if (seg_end > w) seg_end = w;
+            int k = k_x > k_y ? k_x : k_y;
+            float step = step_k[k];
+            for (; x < seg_end; x++, i++)
+                f_out[i] = (float)(quantized[i] * step);
+            if (k_x < MAX_BANDS) k_x++; else break;
         }
     }
+    #undef LUT_SZ
 }
 
 /* ===================================================================== */
@@ -1324,6 +1364,7 @@ static int bac_decode(BacDec *d, BacModel *m) {
 /* Returns number of bit-planes (bp). */
 static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int h) {
     int total = w * h;
+    if (total <= 0) return 0;
     /* Find max absolute value to determine bit-planes */
     int max_val = 0;
     for (int i = 0; i < total; i++) {
@@ -1339,8 +1380,16 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
     for (int i = 0; i < TOTAL_CTX; i++) bacm_init_ctx(&models[i], i);
 
     /* Significance map */
-    uint8_t *sig = (uint8_t*)calloc((size_t)(total > 0 ? total : 0), 1);
+    uint8_t *sig = (uint8_t*)calloc((size_t)total, 1);
     if (!sig) return 0;
+    /* Neighbour-significance counts, maintained incrementally: nsig[i] = number  */
+    /* of the 8 neighbours of i that are already significant. Significance is     */
+    /* monotone (0->1, never reset), so instead of rescanning the 3x3 window for  */
+    /* every coefficient of every bit-plane we bump the 8 neighbours' counts once */
+    /* when a coefficient becomes significant. Reading nsig[i] (clamped to 4) is  */
+    /* bit-identical to the old fresh sum. */
+    uint8_t *nsig = (uint8_t*)calloc((size_t)total, 1);
+    if (!nsig) { free(sig); return 0; }
 
     /* For each bit-plane (MSB first) */
     for (int b = bp - 1; b >= 0; b--) {
@@ -1349,15 +1398,7 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
             if (x == w) { x = 0; y++; }
             int16_t v = coeffs[i];
 
-            int ctx_sig = 0;
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    if (dx == 0 && dy == 0) continue;
-                    int nx = x + dx, ny = y + dy;
-                    if (nx >= 0 && nx < w && ny >= 0 && ny < h)
-                        ctx_sig += sig[ny * w + nx];
-                }
-            }
+            int ctx_sig = nsig[i];
             if (ctx_sig > 4) ctx_sig = 4;
 
             if (!sig[i]) {
@@ -1371,6 +1412,13 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
                 bac_encode(e, is_sig, &models[sctx]);
                 if (is_sig) {
                     sig[i] = 1;
+                    /* Bump neighbour counts (monotone; in-bounds only, matching the */
+                    /* old border-skipping fresh sum). */
+                    int y0 = y > 0, y1 = y + 1 < h, x0 = x > 0, x1 = x + 1 < w;
+                    if (y0) { if (x0) nsig[i-w-1]++; nsig[i-w]++; if (x1) nsig[i-w+1]++; }
+                    if (x0) nsig[i-1]++;
+                    if (x1) nsig[i+1]++;
+                    if (y1) { if (x0) nsig[i+w-1]++; nsig[i+w]++; if (x1) nsig[i+w+1]++; }
                     int ctx_sgn = 2, sgn_sum = 0;
                     for (int dy = -1; dy <= 1; dy++) {
                         for (int dx = -1; dx <= 1; dx++) {
@@ -1399,6 +1447,7 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
         }
     }
     free(sig);
+    free(nsig);
     return (uint8_t)bp;
 }
 
@@ -1412,20 +1461,15 @@ static void ebcot_decode_channel(BacDec *d, int16_t *coeffs, int w, int h, int b
 
     uint8_t *sig = (uint8_t*)calloc((size_t)(total > 0 ? total : 0), 1);
     if (!sig) return;
+    /* Incremental neighbour-significance counts (see ebcot_encode_channel). */
+    uint8_t *nsig = (uint8_t*)calloc((size_t)(total > 0 ? total : 0), 1);
+    if (!nsig) { free(sig); return; }
 
     for (int b = bp - 1; b >= 0; b--) {
         int bit_mask = 1 << b;
         for (int i = 0, x = 0, y = 0; i < total; i++, x++) {
             if (x == w) { x = 0; y++; }
-            int ctx_sig = 0;
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    if (dx == 0 && dy == 0) continue;
-                    int nx = x + dx, ny = y + dy;
-                    if (nx >= 0 && nx < w && ny >= 0 && ny < h)
-                        ctx_sig += sig[ny * w + nx];
-                }
-            }
+            int ctx_sig = nsig[i];
             if (ctx_sig > 4) ctx_sig = 4;
 
             if (!sig[i]) {
@@ -1436,6 +1480,11 @@ static void ebcot_decode_channel(BacDec *d, int16_t *coeffs, int w, int h, int b
                 int is_sig = bac_decode(d, &models[sctx]);
                 if (is_sig) {
                     sig[i] = 1;
+                    int y0 = y > 0, y1 = y + 1 < h, x0 = x > 0, x1 = x + 1 < w;
+                    if (y0) { if (x0) nsig[i-w-1]++; nsig[i-w]++; if (x1) nsig[i-w+1]++; }
+                    if (x0) nsig[i-1]++;
+                    if (x1) nsig[i+1]++;
+                    if (y1) { if (x0) nsig[i+w-1]++; nsig[i+w]++; if (x1) nsig[i+w+1]++; }
                     int ctx_sgn = 2, sgn_sum = 0;
                     for (int dy = -1; dy <= 1; dy++) {
                         for (int dx = -1; dx <= 1; dx++) {
@@ -1470,6 +1519,7 @@ static void ebcot_decode_channel(BacDec *d, int16_t *coeffs, int w, int h, int b
     }
 
     free(sig);
+    free(nsig);
 }
 
 /* ===================================================================== */
