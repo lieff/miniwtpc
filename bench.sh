@@ -84,11 +84,14 @@ if [ "$FAST" = "0" ]; then
     echo "" | tee -a "$LOGFILE"
     echo "### JPEG ###" | tee -a "$LOGFILE"
     for q in 1 2 3 4 5 6 8 10 11 13 15 17 20 23 26 28 31 35 40 45 48 52 55 58 61 65 70 78 83 88 92 93 94 95 98 100; do
-        jpg="$TMPD/jpeg_q${q}.jpg"
+        jpg="$TMPD/jpeg_q${q}.jpg"; dec_bmp="$TMPD/jpeg_q${q}_dec.bmp"; dec_png="$TMPD/jpeg_q${q}_dec.png"
         t0=$(date +%s%N 2>/dev/null); convert "$IMAGE" -quality "$q" "$jpg" 2>/dev/null; t1=$(date +%s%N 2>/dev/null)
         enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
-        sz=$(fsize "$jpg"); met=$(METRICS "$IMAGE" "$jpg" 2>/dev/null)
-        echo "JPEG q=$q | $sz | $met | enc=$enc_ms dec=0" | tee -a "$LOGFILE"
+        t0=$(date +%s%N 2>/dev/null); convert "$jpg" "$dec_bmp" 2>/dev/null; t1=$(date +%s%N 2>/dev/null)
+        dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
+        convert "$dec_bmp" "$dec_png" 2>/dev/null || true  # for ssimulacra2 (doesn't support BMP)
+        sz=$(fsize "$jpg"); met=$(METRICS "$IMAGE" "$dec_png" 2>/dev/null)
+        echo "JPEG q=$q | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
     done
 fi
 
@@ -102,12 +105,13 @@ if [ "$FAST" = "0" ]; then
     # High rates for very small files (stretch to ~70-800 B range)
     j2k_rates="2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 36 40 44 48 52 56 60 64 68 72 76 80 84 88 92 96 100 104 108 112 120 128 132 140 148 156 168 180 192 208 224 240 256 284 320 360 400 450 500 600 800 1000 1200 1500 2000"
     for r in $j2k_rates; do
-        j2k="$TMPD/j2k_r${r}.jp2"; dec="$TMPD/j2k_r${r}_dec.png"
+        j2k="$TMPD/j2k_r${r}.jp2"; dec_bmp="$TMPD/j2k_r${r}_dec.bmp"; dec_png="$TMPD/j2k_r${r}_dec.png"
         t0=$(date +%s%N 2>/dev/null); opj_compress -i "$ppm" -o "$j2k" -r "$r" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
         enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
-        t0=$(date +%s%N 2>/dev/null); opj_decompress -i "$j2k" -o "$dec" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
+        t0=$(date +%s%N 2>/dev/null); opj_decompress -i "$j2k" -o "$dec_bmp" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
         dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
-        sz=$(fsize "$j2k"); met=$(METRICS "$IMAGE" "$dec" 2>/dev/null)
+        convert "$dec_bmp" "$dec_png" 2>/dev/null || true  # for ssimulacra2
+        sz=$(fsize "$j2k"); met=$(METRICS "$IMAGE" "$dec_png" 2>/dev/null)
         echo "J2K r=$r | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
     done
 fi
@@ -116,21 +120,23 @@ fi
 if [ "$FAST" = "0" ]; then
     echo "" | tee -a "$LOGFILE"
     echo "### JPEGXL ###" | tee -a "$LOGFILE"
-    jxl="$TMPD/jxl_min.jxl"; dec="$TMPD/jxl_min_dec.png"
+    jxl="$TMPD/jxl_min.jxl"; dec_pnm="$TMPD/jxl_min_dec.pnm"; dec_png="$TMPD/jxl_min_dec.png"
     t0=$(date +%s%N 2>/dev/null); cjxl "$IMAGE" "$jxl" -m 0 -q 0 -e 10 --quiet 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
     enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
-    t0=$(date +%s%N 2>/dev/null); djxl "$jxl" "$dec" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
+    t0=$(date +%s%N 2>/dev/null); djxl "$jxl" "$dec_pnm" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
     dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
-    sz=$(fsize "$jxl"); met=$(METRICS "$IMAGE" "$dec" 2>/dev/null)
+    convert "$dec_pnm" "$dec_png" 2>/dev/null || true  # for readme samples
+    sz=$(fsize "$jxl"); met=$(METRICS "$IMAGE" "$dec_pnm" 2>/dev/null)
     echo "JXL min | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
     jxl_dist="30 25 20 18 14 11 8 5.5 4.5 3 2 1.5 1.2 1 0.9 0.7 0.5 0.4 0.38 0.35 0.3"
     for d in $jxl_dist; do
-        jxl="$TMPD/jxl_d${d}.jxl"; dec="$TMPD/jxl_d${d}_dec.png"
+        jxl="$TMPD/jxl_d${d}.jxl"; dec_pnm="$TMPD/jxl_d${d}_dec.pnm"; dec_png="$TMPD/jxl_d${d}_dec.png"
         t0=$(date +%s%N 2>/dev/null); cjxl "$IMAGE" "$jxl" -d "$d" --quiet 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
         enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
-        t0=$(date +%s%N 2>/dev/null); djxl "$jxl" "$dec" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
+        t0=$(date +%s%N 2>/dev/null); djxl "$jxl" "$dec_pnm" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
         dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
-        sz=$(fsize "$jxl"); met=$(METRICS "$IMAGE" "$dec" 2>/dev/null)
+        convert "$dec_pnm" "$dec_png" 2>/dev/null || true  # for readme samples
+        sz=$(fsize "$jxl"); met=$(METRICS "$IMAGE" "$dec_pnm" 2>/dev/null)
         echo "JXL d=$d | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
     done
 fi
@@ -276,19 +282,71 @@ md.append('')
 # ---- Mermaid chart ----
 md.append('## PSNR vs File Size')
 md.append('')
-md.append('```mermaid')
-md.append('xy-chart')
-md.append('    title "PSNR vs File Size (lena 256x256)"')
-md.append('    x-axis "File Size (bytes)" 100 --> 40000')
-md.append('    y-axis "PSNR (dB)" 18 --> 42')
+# Helper: format target labels
+def _fmt_labels(ts):
+    labels = []
+    for t in ts:
+        if t < 1000: labels.append(str(t))
+        elif t % 1000 == 0: labels.append(f'{t//1000}K')
+        else: labels.append(f'{t/1000:.1f}K')
+    return ', '.join(f'"{l}"' for l in labels)
 
 mlabels = {'WTPC_E': 'WTPC EBC', 'WTPC_H': 'WTPC Huff', 'W420_E': 'W420 EBC', 'W420_H': 'W420 Huff', 'JPEG': 'JPEG', 'J2K': 'JPEG2000', 'JXL': 'JPEGXL'}
-for c in order:
-    pts = [(sz, psnr) for (_, sz, psnr, _e, _d, _) in data[c] if 100 <= sz <= 40000 and psnr > 0]
-    if pts:
-        pts_str = ', '.join(f'[{sz}, {psnr:.2f}]' for sz, psnr in pts)
-        md.append(f'    line "{mlabels[c]}" {pts_str}')
+# Fixed colors matching line order: blue, red, orange, green, purple, cyan, pink
+colors = {'WTPC_E': '#3366cc', 'WTPC_H': '#dc3912', 'W420_E': '#ff9900', 'W420_H': '#109618', 'J2K': '#990099', 'JPEG': '#0099c6', 'JXL': '#dd4477'}
+emojis = {'WTPC_E': '\U0001F535', 'WTPC_H': '\U0001F534', 'W420_E': '\U0001F7E0', 'W420_H': '\U0001F7E2', 'J2K': '\U0001F7E3', 'JPEG': '\U0001F539', 'JXL': '\U0001F497'}
+
+# Chart 1: Ultra-low bitrate - only WTPC + JP2K (JPEG/JXL can't go this low)
+low_codecs = ['WTPC_E', 'WTPC_H', 'W420_E', 'W420_H', 'J2K']
+low_colors = ', '.join(colors[c] for c in low_codecs)
+low_names  = ', '.join(mlabels[c] for c in low_codecs)
+low_legend = '  '.join(f'{emojis[c]} {mlabels[c]}' for c in low_codecs)
+
+md.append('### Ultra-low range (200 B - 1.2 KB)')
+md.append('')
+md.append('```mermaid')
+md.append(f'%%{{init: {{"themeVariables": {{"xyChart": {{"plotColorPalette": "{low_colors}"}}}}}}}}%%')
+md.append('xychart-beta')
+md.append('    title "Ultra-low bitrate"')
+md.append('    y-axis "PSNR (dB)" 12 --> 26')
+low_targets = [200, 400, 600, 800, 1000, 1200]
+md.append(f'    x-axis [{_fmt_labels(low_targets)}]')
+for c in low_codecs:
+    if c not in data: continue
+    y_vals = []
+    all_pts = [(sz, psnr) for (_, sz, psnr, _e, _d, _) in data[c]]
+    for t in low_targets:
+        best = min(all_pts, key=lambda p: abs(p[0] - t))
+        y_vals.append(f'{best[1]:.2f}')
+    md.append(f'    line "{mlabels[c]}" [{', '.join(y_vals)}]')
 md.append('```')
+md.append(f'{low_legend}')
+md.append('')
+
+# Chart 2: Standard range - all codecs including JPEG/JXL
+std_codecs = [c for c in order if c in data]
+std_colors = ', '.join(colors[c] for c in std_codecs)
+std_names  = ', '.join(mlabels[c] for c in std_codecs)
+std_legend = '  '.join(f'{emojis[c]} {mlabels[c]}' for c in std_codecs)
+
+md.append('### Standard range (1.4 KB - 36 KB)')
+md.append('')
+md.append('```mermaid')
+md.append(f'%%{{init: {{"themeVariables": {{"xyChart": {{"plotColorPalette": "{std_colors}"}}}}}}}}%%')
+md.append('xychart-beta')
+md.append('    title "Standard range"')
+md.append('    y-axis "PSNR (dB)" 21 --> 42')
+std_targets = [1400, 1500, 2000, 3000, 4000, 5000, 6000, 8000, 10000, 13000, 15000, 18000, 20000, 22000, 25000, 28000, 30000, 32000, 36000]
+md.append(f'    x-axis [{_fmt_labels(std_targets)}]')
+for c in std_codecs:
+    y_vals = []
+    all_pts = [(sz, psnr) for (_, sz, psnr, _e, _d, _) in data[c]]
+    for t in std_targets:
+        best = min(all_pts, key=lambda p: abs(p[0] - t))
+        y_vals.append(f'{best[1]:.2f}')
+    md.append(f'    line "{mlabels[c]}" [{', '.join(y_vals)}]')
+md.append('```')
+md.append(f'{std_legend}')
 md.append('')
 
 # ---- Cross-table: each row = size step, columns = codecs ----
@@ -609,7 +667,7 @@ try:
         # JPEG: q=20 entry
         for p, sz, psnr, ssim, enc, dec in data.get('JPEG', []):
             if str(p) == '20':
-                speed_rows.append(f"| JPEG | {round(enc)} | - |")
+                speed_rows.append(f"| JPEG | {round(enc)} | {round(dec) if dec > 0 else '-'} |")
                 break
 
         rl = replace_table_in_lines(rl, '### Speed Summary (lena 256x256, fixed q=20)', speed_rows)

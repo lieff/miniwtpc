@@ -7,6 +7,10 @@ if [ "${ENABLE_UBSAN}" = "yes" ]; then
   CFLAGS="${CFLAGS} -fsanitize=undefined -fno-omit-frame-pointer -fno-common"
 fi
 
+if [ "${ENABLE_RD}" = "yes" ]; then
+  CFLAGS="${CFLAGS} -g"
+fi
+
 if [ "${ENABLE_DEBUG}" = "yes" ]; then
   CFLAGS="${CFLAGS} -g -O0 -D_DEBUG"
 else

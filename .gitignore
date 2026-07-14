@@ -6,5 +6,7 @@ builddir
 *.jpg
 *.wtpc
 *.txt
+*.obj
+*.exe
 wtpc
 !samples/*

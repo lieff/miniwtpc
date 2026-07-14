@@ -123,9 +123,9 @@ run tuning (`wtpc -T`) and/or Huffman table generation (`wtpc -G`).
 | WTPC Huffman 4:4:4 | 4 | 2 |
 | WTPC EBCOT 4:2:0 | 6 | 7 |
 | WTPC Huffman 4:2:0 | 3 | 2 |
-| JPEG 2000 | 17 | 35 |
-| JPEG XL | 104 | 6 |
-| JPEG | 4 | - |
+| JPEG 2000 | 16 | 5 |
+| JPEG XL | 106 | 4 |
+| JPEG | 4 | 3 |
 
 See [results.md](results.md) for the complete per-size breakdown, speed
 measurements across all quality levels, mermaid charts, and raw data.
