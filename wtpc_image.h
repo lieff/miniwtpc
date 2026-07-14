@@ -64,6 +64,7 @@
      #define DEBUG_WAVELET        : dump wavelet coefficient images (needs stb).
      #define STANDARD_CDF97       : enable standard CDF 9/7 K-scaling.
      #define WTPC_TUNE_PARAMS     : mutable quantization tables for grid-search tuning.
+     #define WTPC_NO_SIMD         : do not use sse/avx/neon intrinsics.
      #define WTPC_RC_ONLY_LESS_THAN_TARGET : rate control never overshoots
                                     target_bytes (picks the largest size <= target
                                     instead of the closest). Implied by
@@ -76,6 +77,7 @@
 /*#define DEBUG_WAVELET*/     /* dump wavelet coefficients, requires stb image */
 /*#define STANDARD_CDF97*/    /* enable standard CDF 9/7 K-scaling */
 /*#define WTPC_RC_ONLY_LESS_THAN_TARGET*/  /* rate control: never overshoot target_bytes */
+/*#define WTPC_NO_SIMD*/      /* do not use sse/avx/neon intrinsics */
 /*#define WTPC_TUNE_PARAMS*/  /* quantization params tuning mode */
 
 #ifndef WTPC_NO_STDIO
@@ -292,76 +294,790 @@ static void chroma_up_420(float *src, int sw, int sh, float *dst, int dw, int dh
 #define CDF97_INVK   1.0f
 #endif
 
-static void cdf97_forward_2d(float *data, int width, int height) {
+#define WTPC_CPU_SSE2  (1u<<0)
+#define WTPC_CPU_AVX   (1u<<1)
+#define WTPC_CPU_NEON  (1u<<2)
+
+static unsigned wtpc_cpu_flags_ = 0;
+static int      wtpc_cpu_done_  = 0;
+
+static void wtpc_cpu_init_(void) {
+    if (wtpc_cpu_done_) return;
+    wtpc_cpu_done_ = 1;
+/* SSE2 - baseline on x86-64, compile-time */
+#if (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+    wtpc_cpu_flags_ |= WTPC_CPU_SSE2;
+#endif
+/* AVX - runtime probe (may be compiled but CPU lacks it) */
+#if defined(__AVX__) || ((defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__)))
+  #if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_cpu_supports("avx")) wtpc_cpu_flags_ |= WTPC_CPU_AVX;
+  #elif defined(_MSC_VER)
+    { int r_[4]; __cpuidex(r_, 1, 0); if (r_[2] & (1<<28)) wtpc_cpu_flags_ |= WTPC_CPU_AVX; }
+  #endif
+#endif
+/* NEON - baseline on AArch64, optional on ARMv7 */
+#if defined(__aarch64__)
+    wtpc_cpu_flags_ |= WTPC_CPU_NEON;
+#elif defined(__ARM_NEON)
+    wtpc_cpu_flags_ |= WTPC_CPU_NEON;  /* compiler guarantees NEON is present */
+#endif
+}
+
+/* ================================================================
+ * SSE2 4-wide wrappers  (compiled on x86-64, no runtime flag needed)
+ * ================================================================ */
+#if (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)) && !defined(WTPC_NO_SIMD)
+#include <emmintrin.h>
+#define SIMD4_W 4
+typedef __m128 simd4_f;
+static inline simd4_f simd4_set1(float x)              { return _mm_set1_ps(x); }
+static inline simd4_f simd4_load(const float *p)       { return _mm_loadu_ps(p); }
+static inline void   simd4_store(float *p, simd4_f v)  { _mm_storeu_ps(p, v); }
+static inline simd4_f simd4_add(simd4_f a, simd4_f b)  { return _mm_add_ps(a,b); }
+static inline simd4_f simd4_sub(simd4_f a, simd4_f b)  { return _mm_sub_ps(a,b); }
+static inline simd4_f simd4_mul(simd4_f a, simd4_f b)  { return _mm_mul_ps(a,b); }
+static inline simd4_f simd4_unpacklo(simd4_f a, simd4_f b) { return _mm_unpacklo_ps(a,b); }
+static inline simd4_f simd4_unpackhi(simd4_f a, simd4_f b) { return _mm_unpackhi_ps(a,b); }
+#define WTPC_HAS_SSE2 1
+#endif
+
+/* ================================================================
+ * AVX 8-wide wrappers  (compiled on GCC/Clang w/ target attr)
+ * ================================================================ */
+#if (defined(__AVX__) || ((defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__)))) && !defined(WTPC_NO_SIMD)
+#include <immintrin.h>
+#define SIMD8_W 8
+typedef __m256 simd8_f;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC push_options
+#pragma GCC target("avx")
+#endif
+static inline simd8_f simd8_set1(float x)              { return _mm256_set1_ps(x); }
+static inline simd8_f simd8_load(const float *p)       { return _mm256_loadu_ps(p); }
+static inline void   simd8_store(float *p, simd8_f v)  { _mm256_storeu_ps(p, v); }
+static inline simd8_f simd8_add(simd8_f a, simd8_f b)  { return _mm256_add_ps(a,b); }
+static inline simd8_f simd8_sub(simd8_f a, simd8_f b)  { return _mm256_sub_ps(a,b); }
+static inline simd8_f simd8_mul(simd8_f a, simd8_f b)  { return _mm256_mul_ps(a,b); }
+/* AVX unpack interleaves within 128-bit lanes -> manual fix */
+static inline simd8_f simd8_unpacklo(simd8_f a, simd8_f b) {
+    __m128 al=_mm256_castps256_ps128(a), bl=_mm256_castps256_ps128(b);
+    __m128 r0=_mm_unpacklo_ps(al,bl), r1=_mm_unpackhi_ps(al,bl);
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(r0), r1, 1);
+}
+static inline simd8_f simd8_unpackhi(simd8_f a, simd8_f b) {
+    __m128 ah=_mm256_extractf128_ps(a,1), bh=_mm256_extractf128_ps(b,1);
+    __m128 r0=_mm_unpacklo_ps(ah,bh), r1=_mm_unpackhi_ps(ah,bh);
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(r0), r1, 1);
+}
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#endif
+#define WTPC_HAS_AVX 1
+#endif
+
+/* ================================================================
+ * NEON 4-wide wrappers  (AArch64 / ARMv7+NEON)
+ * ================================================================ */
+#if (defined(__aarch64__) || defined(__ARM_NEON)) && !defined(WTPC_NO_SIMD)
+#include <arm_neon.h>
+#define SIMDN_W 4
+typedef float32x4_t simdn_f;
+static inline simdn_f simdn_set1(float x)              { return vdupq_n_f32(x); }
+static inline simdn_f simdn_load(const float *p)       { return vld1q_f32(p); }
+static inline void   simdn_store(float *p, simdn_f v)  { vst1q_f32(p, v); }
+static inline simdn_f simdn_add(simdn_f a, simdn_f b)  { return vaddq_f32(a,b); }
+static inline simdn_f simdn_sub(simdn_f a, simdn_f b)  { return vsubq_f32(a,b); }
+static inline simdn_f simdn_mul(simdn_f a, simdn_f b)  { return vmulq_f32(a,b); }
+/* NEON vzipq_f32 interleaves two registers */
+static inline simdn_f simdn_unpacklo(simdn_f a, simdn_f b) {
+    float32x4x2_t z = vzipq_f32(a, b); return z.val[0]; /* a0,b0,a1,b1 */
+}
+static inline simdn_f simdn_unpackhi(simdn_f a, simdn_f b) {
+    float32x4x2_t z = vzipq_f32(a, b); return z.val[1]; /* a2,b2,a3,b3 */
+}
+#define WTPC_HAS_NEON 1
+#endif
+
+/* ================================================================
+ * X-macros: generate one variant per (prefix, simd_type, SIMD_W)
+ *
+ * WTPC_FWD_HORIZ(FN, sf, SW, pf)  - forward horizontal lifting
+ * WTPC_FWD_VERT (FN, sf, SW, pf)  - forward vertical lifting
+ * WTPC_INV_HORIZ(FN, sf, SW, pf)  - inverse horizontal lifting
+ * WTPC_INV_VERT (FN, sf, SW, pf)  - inverse vertical lifting
+ * ================================================================ */
+
+#define WTPC_FWD_HORIZ(FN, sf, SW, pf) \
+static void FN(float *data, int stride, int w, int h, \
+               float *tl, float *th) \
+{ \
+    if (w <= 1) return; \
+    int lw = (w + 1) / 2, hw = w / 2; \
+    const int MS = SW; \
+    const sf vA = pf##_set1(CDF97_A), vB = pf##_set1(CDF97_B); \
+    const sf vG = pf##_set1(CDF97_G), vD = pf##_set1(CDF97_D); \
+    const sf vK = pf##_set1(CDF97_K), vIK = pf##_set1(CDF97_INVK); \
+    for (int row = 0; row < h; ++row) { \
+        float *r = data + row * stride; \
+        int j; \
+        for (j = 0; j < hw; ++j) { \
+            tl[j] = r[2*j]; \
+            th[j] = r[2*j + 1]; \
+        } \
+        if (w & 1) tl[lw - 1] = r[w - 1]; \
+        /* step 1: predict1  h[j] += A * (l[j] + l[j+1]) */ \
+        for (j = 0; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            sf a = pf##_load(&tl[j]), b = pf##_load(&tl[j + 1]); \
+            sf s = pf##_add(a, b); \
+            sf c = pf##_load(&th[j]); \
+            c = pf##_add(c, pf##_mul(vA, s)); \
+            pf##_store(&th[j], c); \
+        } \
+        for (; j < hw; ++j) { \
+            int jn = (j + 1 < lw) ? j + 1 : lw - 1; \
+            th[j] += CDF97_A * (tl[j] + tl[jn]); \
+        } \
+        /* step 2: update1  l[j] += B * (h[j-1] + h[j]) */ \
+        tl[0] += CDF97_B * (th[0] + th[0]); \
+        for (j = 1; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            sf a = pf##_load(&th[j - 1]), b = pf##_load(&th[j]); \
+            sf s = pf##_add(a, b); \
+            sf c = pf##_load(&tl[j]); \
+            c = pf##_add(c, pf##_mul(vB, s)); \
+            pf##_store(&tl[j], c); \
+        } \
+        for (; j < lw; ++j) { \
+            int jp = (j > 0) ? j - 1 : 0; \
+            int jj = (j < hw) ? j : hw - 1; \
+            tl[j] += CDF97_B * (th[jp] + th[jj]); \
+        } \
+        /* step 3: predict2  h[j] += G * (l[j] + l[j+1]) */ \
+        for (j = 0; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            sf a = pf##_load(&tl[j]), b = pf##_load(&tl[j + 1]); \
+            sf s = pf##_add(a, b); \
+            sf c = pf##_load(&th[j]); \
+            c = pf##_add(c, pf##_mul(vG, s)); \
+            pf##_store(&th[j], c); \
+        } \
+        for (; j < hw; ++j) { \
+            int jn = (j + 1 < lw) ? j + 1 : lw - 1; \
+            th[j] += CDF97_G * (tl[j] + tl[jn]); \
+        } \
+        /* step 4: update2  l[j] += D * (h[j-1] + h[j]) */ \
+        tl[0] += CDF97_D * (th[0] + th[0]); \
+        for (j = 1; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            sf a = pf##_load(&th[j - 1]), b = pf##_load(&th[j]); \
+            sf s = pf##_add(a, b); \
+            sf c = pf##_load(&tl[j]); \
+            c = pf##_add(c, pf##_mul(vD, s)); \
+            pf##_store(&tl[j], c); \
+        } \
+        for (; j < lw; ++j) { \
+            int jp = (j > 0) ? j - 1 : 0; \
+            int jj = (j < hw) ? j : hw - 1; \
+            tl[j] += CDF97_D * (th[jp] + th[jj]); \
+        } \
+        /* write-back: LL then HL (contiguous, K-scaled) */ \
+        for (j = 0; j + MS - 1 < lw; j += MS) { \
+            pf##_store(&r[j], pf##_mul(pf##_load(&tl[j]), vK)); \
+        } \
+        for (; j < lw; ++j) r[j] = tl[j] * CDF97_K; \
+        for (j = 0; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            pf##_store(&r[lw + j], pf##_mul(pf##_load(&th[j]), vIK)); \
+        } \
+        for (; j < hw; ++j) r[lw + j] = th[j] * CDF97_INVK; \
+    } \
+}
+
+#define WTPC_FWD_VERT(FN, sf, SW, pf) \
+static void FN(float *data, int stride, int w, int h, \
+               float *tl4, float *th4) \
+{ \
+    if (h <= 1) return; \
+    int lh = (h + 1) / 2, hh = h / 2; \
+    const sf vA = pf##_set1(CDF97_A), vB = pf##_set1(CDF97_B); \
+    const sf vG = pf##_set1(CDF97_G), vD = pf##_set1(CDF97_D); \
+    const sf vK = pf##_set1(CDF97_K), vIK = pf##_set1(CDF97_INVK); \
+    for (int col = 0; col < w; col += SW) { \
+        int nc = (w - col >= SW) ? SW : (w - col); \
+        /* deinterleave rows into tl4[i*SW+c], th4[i*SW+c] */ \
+        for (int i = 0; i < hh; ++i) { \
+            for (int c = 0; c < nc; ++c) { \
+                tl4[i*SW + c] = data[(2*i)     * stride + col + c]; \
+                th4[i*SW + c] = data[(2*i + 1) * stride + col + c]; \
+            } \
+        } \
+        if (h & 1) { \
+            for (int c = 0; c < nc; ++c) \
+                tl4[(lh - 1)*SW + c] = data[(h - 1) * stride + col + c]; \
+        } \
+        if (nc == SW) { \
+            /* ---- step 1: predict1 ---- */ \
+            for (int i = 0; i + 1 < hh; ++i) { \
+                sf a = pf##_load(&tl4[i*SW]), b = pf##_load(&tl4[(i + 1)*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&th4[i*SW]); \
+                c = pf##_add(c, pf##_mul(vA, s)); \
+                pf##_store(&th4[i*SW], c); \
+            } \
+            { \
+                int i = hh - 1, in = (i + 1 < lh) ? i + 1 : lh - 1; \
+                sf a = pf##_load(&tl4[i*SW]), b = pf##_load(&tl4[in*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&th4[i*SW]); \
+                c = pf##_add(c, pf##_mul(vA, s)); \
+                pf##_store(&th4[i*SW], c); \
+            } \
+            /* ---- step 2: update1 ---- */ \
+            { \
+                sf a = pf##_load(&th4[0]); \
+                sf s = pf##_add(a, a); \
+                sf b = pf##_load(&tl4[0]); \
+                b = pf##_add(b, pf##_mul(vB, s)); \
+                pf##_store(&tl4[0], b); \
+            } \
+            for (int i = 1; i < hh; ++i) { \
+                sf a = pf##_load(&th4[(i - 1)*SW]), b = pf##_load(&th4[i*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&tl4[i*SW]); \
+                c = pf##_add(c, pf##_mul(vB, s)); \
+                pf##_store(&tl4[i*SW], c); \
+            } \
+            for (int i = hh; i < lh; ++i) { \
+                sf a = pf##_load(&th4[(i - 1)*SW]), b = pf##_load(&th4[(hh - 1)*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&tl4[i*SW]); \
+                c = pf##_add(c, pf##_mul(vB, s)); \
+                pf##_store(&tl4[i*SW], c); \
+            } \
+            /* ---- step 3: predict2 ---- */ \
+            for (int i = 0; i + 1 < hh; ++i) { \
+                sf a = pf##_load(&tl4[i*SW]), b = pf##_load(&tl4[(i + 1)*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&th4[i*SW]); \
+                c = pf##_add(c, pf##_mul(vG, s)); \
+                pf##_store(&th4[i*SW], c); \
+            } \
+            { \
+                int i = hh - 1, in = (i + 1 < lh) ? i + 1 : lh - 1; \
+                sf a = pf##_load(&tl4[i*SW]), b = pf##_load(&tl4[in*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&th4[i*SW]); \
+                c = pf##_add(c, pf##_mul(vG, s)); \
+                pf##_store(&th4[i*SW], c); \
+            } \
+            /* ---- step 4: update2 ---- */ \
+            { \
+                sf a = pf##_load(&th4[0]); \
+                sf s = pf##_add(a, a); \
+                sf b = pf##_load(&tl4[0]); \
+                b = pf##_add(b, pf##_mul(vD, s)); \
+                pf##_store(&tl4[0], b); \
+            } \
+            for (int i = 1; i < hh; ++i) { \
+                sf a = pf##_load(&th4[(i - 1)*SW]), b = pf##_load(&th4[i*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&tl4[i*SW]); \
+                c = pf##_add(c, pf##_mul(vD, s)); \
+                pf##_store(&tl4[i*SW], c); \
+            } \
+            for (int i = hh; i < lh; ++i) { \
+                sf a = pf##_load(&th4[(i - 1)*SW]), b = pf##_load(&th4[(hh - 1)*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&tl4[i*SW]); \
+                c = pf##_add(c, pf##_mul(vD, s)); \
+                pf##_store(&tl4[i*SW], c); \
+            } \
+            /* write-back: LL rows then HH rows */ \
+            for (int i = 0; i < lh; ++i) { \
+                sf v = pf##_load(&tl4[i*SW]); \
+                pf##_store(&data[i * stride + col], pf##_mul(v, vK)); \
+            } \
+            for (int i = 0; i < hh; ++i) { \
+                sf v = pf##_load(&th4[i*SW]); \
+                pf##_store(&data[(lh + i) * stride + col], pf##_mul(v, vIK)); \
+            } \
+        } else { \
+            /* nc < SW: scalar tail for partial column group */ \
+            for (int i = 0; i < hh; ++i) { \
+                int in = (i + 1 < lh) ? i + 1 : lh - 1; \
+                for (int c = 0; c < nc; ++c) \
+                    th4[i*SW + c] += CDF97_A * (tl4[i*SW + c] + tl4[in*SW + c]); \
+            } \
+            for (int i = 0; i < lh; ++i) { \
+                int ip = (i > 0) ? i - 1 : 0, ii = (i < hh) ? i : hh - 1; \
+                for (int c = 0; c < nc; ++c) \
+                    tl4[i*SW + c] += CDF97_B * (th4[ip*SW + c] + th4[ii*SW + c]); \
+            } \
+            for (int i = 0; i < hh; ++i) { \
+                int in = (i + 1 < lh) ? i + 1 : lh - 1; \
+                for (int c = 0; c < nc; ++c) \
+                    th4[i*SW + c] += CDF97_G * (tl4[i*SW + c] + tl4[in*SW + c]); \
+            } \
+            for (int i = 0; i < lh; ++i) { \
+                int ip = (i > 0) ? i - 1 : 0, ii = (i < hh) ? i : hh - 1; \
+                for (int c = 0; c < nc; ++c) \
+                    tl4[i*SW + c] += CDF97_D * (th4[ip*SW + c] + th4[ii*SW + c]); \
+            } \
+            for (int i = 0; i < lh; ++i) \
+                for (int c = 0; c < nc; ++c) \
+                    data[i * stride + col + c] = tl4[i*SW + c] * CDF97_K; \
+            for (int i = 0; i < hh; ++i) \
+                for (int c = 0; c < nc; ++c) \
+                    data[(lh + i) * stride + col + c] = th4[i*SW + c] * CDF97_INVK; \
+        } \
+    } \
+}
+
+#define WTPC_INV_HORIZ(FN, sf, SW, pf) \
+static void FN(float *data, int stride, int w, int h, \
+               float *tl, float *th) \
+{ \
+    if (w <= 1) return; \
+    int lw = (w + 1) / 2, hw = w / 2; \
+    const int MS = SW; \
+    const sf vA = pf##_set1(CDF97_A), vB = pf##_set1(CDF97_B); \
+    const sf vG = pf##_set1(CDF97_G), vD = pf##_set1(CDF97_D); \
+    for (int row = 0; row < h; ++row) { \
+        float *r = data + row * stride; \
+        int j; \
+        /* copy LL + HH back to temp */ \
+        for (j = 0; j < lw; ++j) tl[j] = r[j]; \
+        for (j = 0; j < hw; ++j) th[j] = r[lw + j]; \
+        /* inv update2:  l[j] -= D * (h[j-1] + h[j]) */ \
+        tl[0] -= CDF97_D * (th[0] + th[0]); \
+        for (j = 1; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            sf a = pf##_load(&th[j - 1]), b = pf##_load(&th[j]); \
+            sf s = pf##_add(a, b); \
+            sf c = pf##_load(&tl[j]); \
+            c = pf##_sub(c, pf##_mul(vD, s)); \
+            pf##_store(&tl[j], c); \
+        } \
+        for (; j < lw; ++j) { \
+            int jp = (j > 0) ? j - 1 : 0; \
+            int jj = (j < hw) ? j : hw - 1; \
+            tl[j] -= CDF97_D * (th[jp] + th[jj]); \
+        } \
+        /* inv predict2:  h[j] -= G * (l[j] + l[j+1]) */ \
+        for (j = 0; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            sf a = pf##_load(&tl[j]), b = pf##_load(&tl[j + 1]); \
+            sf s = pf##_add(a, b); \
+            sf c = pf##_load(&th[j]); \
+            c = pf##_sub(c, pf##_mul(vG, s)); \
+            pf##_store(&th[j], c); \
+        } \
+        for (; j < hw; ++j) { \
+            int jn = (j + 1 < lw) ? j + 1 : lw - 1; \
+            th[j] -= CDF97_G * (tl[j] + tl[jn]); \
+        } \
+        /* inv update1:  l[j] -= B * (h[j-1] + h[j]) */ \
+        tl[0] -= CDF97_B * (th[0] + th[0]); \
+        for (j = 1; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            sf a = pf##_load(&th[j - 1]), b = pf##_load(&th[j]); \
+            sf s = pf##_add(a, b); \
+            sf c = pf##_load(&tl[j]); \
+            c = pf##_sub(c, pf##_mul(vB, s)); \
+            pf##_store(&tl[j], c); \
+        } \
+        for (; j < lw; ++j) { \
+            int jp = (j > 0) ? j - 1 : 0; \
+            int jj = (j < hw) ? j : hw - 1; \
+            tl[j] -= CDF97_B * (th[jp] + th[jj]); \
+        } \
+        /* inv predict1:  h[j] -= A * (l[j] + l[j+1]) */ \
+        for (j = 0; j + MS < lw && j + MS - 1 < hw; j += MS) { \
+            sf a = pf##_load(&tl[j]), b = pf##_load(&tl[j + 1]); \
+            sf s = pf##_add(a, b); \
+            sf c = pf##_load(&th[j]); \
+            c = pf##_sub(c, pf##_mul(vA, s)); \
+            pf##_store(&th[j], c); \
+        } \
+        for (; j < hw; ++j) { \
+            int jn = (j + 1 < lw) ? j + 1 : lw - 1; \
+            th[j] -= CDF97_A * (tl[j] + tl[jn]); \
+        } \
+        /* write-back interleaved: r[2*j]=l, r[2*j+1]=h */ \
+        for (j = 0; j + MS - 1 < hw; j += MS) { \
+            sf l = pf##_load(&tl[j]), h = pf##_load(&th[j]); \
+            sf lo = pf##_unpacklo(l, h), hi = pf##_unpackhi(l, h); \
+            pf##_store(&r[2*j], lo); \
+            pf##_store(&r[2*j + MS], hi); \
+        } \
+        for (; j < hw; ++j) { \
+            r[2*j]     = tl[j]; \
+            r[2*j + 1] = th[j]; \
+        } \
+        for (j = hw; j < lw; ++j) r[2*j] = tl[j]; \
+    } \
+}
+
+#define WTPC_INV_VERT(FN, sf, SW, pf) \
+static void FN(float *data, int stride, int w, int h, \
+               float *tl4, float *th4) \
+{ \
+    if (h <= 1) return; \
+    int lh = (h + 1) / 2, hh = h / 2; \
+    const sf vA = pf##_set1(CDF97_A), vB = pf##_set1(CDF97_B); \
+    const sf vG = pf##_set1(CDF97_G), vD = pf##_set1(CDF97_D); \
+    for (int col = 0; col < w; col += SW) { \
+        int nc = (w - col >= SW) ? SW : (w - col); \
+        /* load LL and HH for these columns */ \
+        for (int i = 0; i < lh; ++i) \
+            for (int c = 0; c < nc; ++c) \
+                tl4[i*SW + c] = data[i * stride + col + c]; \
+        for (int i = 0; i < hh; ++i) \
+            for (int c = 0; c < nc; ++c) \
+                th4[i*SW + c] = data[(lh + i) * stride + col + c]; \
+        if (nc == SW) { \
+            /* inv update2 */ \
+            { \
+                sf a = pf##_load(&th4[0]); \
+                sf s = pf##_add(a, a); \
+                sf c = pf##_load(&tl4[0]); \
+                c = pf##_sub(c, pf##_mul(vD, s)); \
+                pf##_store(&tl4[0], c); \
+            } \
+            for (int i = 1; i < hh; ++i) { \
+                sf a = pf##_load(&th4[(i - 1)*SW]), b = pf##_load(&th4[i*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&tl4[i*SW]); \
+                c = pf##_sub(c, pf##_mul(vD, s)); \
+                pf##_store(&tl4[i*SW], c); \
+            } \
+            for (int i = hh; i < lh; ++i) { \
+                sf a = pf##_load(&th4[(i - 1)*SW]), b = pf##_load(&th4[(hh - 1)*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&tl4[i*SW]); \
+                c = pf##_sub(c, pf##_mul(vD, s)); \
+                pf##_store(&tl4[i*SW], c); \
+            } \
+            /* inv predict2 */ \
+            for (int i = 0; i + 1 < hh; ++i) { \
+                sf a = pf##_load(&tl4[i*SW]), b = pf##_load(&tl4[(i + 1)*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&th4[i*SW]); \
+                c = pf##_sub(c, pf##_mul(vG, s)); \
+                pf##_store(&th4[i*SW], c); \
+            } \
+            { \
+                int i = hh - 1, in = (i + 1 < lh) ? i + 1 : lh - 1; \
+                sf a = pf##_load(&tl4[i*SW]), b = pf##_load(&tl4[in*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&th4[i*SW]); \
+                c = pf##_sub(c, pf##_mul(vG, s)); \
+                pf##_store(&th4[i*SW], c); \
+            } \
+            /* inv update1 */ \
+            { \
+                sf a = pf##_load(&th4[0]); \
+                sf s = pf##_add(a, a); \
+                sf c = pf##_load(&tl4[0]); \
+                c = pf##_sub(c, pf##_mul(vB, s)); \
+                pf##_store(&tl4[0], c); \
+            } \
+            for (int i = 1; i < hh; ++i) { \
+                sf a = pf##_load(&th4[(i - 1)*SW]), b = pf##_load(&th4[i*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&tl4[i*SW]); \
+                c = pf##_sub(c, pf##_mul(vB, s)); \
+                pf##_store(&tl4[i*SW], c); \
+            } \
+            for (int i = hh; i < lh; ++i) { \
+                sf a = pf##_load(&th4[(i - 1)*SW]), b = pf##_load(&th4[(hh - 1)*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&tl4[i*SW]); \
+                c = pf##_sub(c, pf##_mul(vB, s)); \
+                pf##_store(&tl4[i*SW], c); \
+            } \
+            /* inv predict1 */ \
+            for (int i = 0; i + 1 < hh; ++i) { \
+                sf a = pf##_load(&tl4[i*SW]), b = pf##_load(&tl4[(i + 1)*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&th4[i*SW]); \
+                c = pf##_sub(c, pf##_mul(vA, s)); \
+                pf##_store(&th4[i*SW], c); \
+            } \
+            { \
+                int i = hh - 1, in = (i + 1 < lh) ? i + 1 : lh - 1; \
+                sf a = pf##_load(&tl4[i*SW]), b = pf##_load(&tl4[in*SW]); \
+                sf s = pf##_add(a, b); \
+                sf c = pf##_load(&th4[i*SW]); \
+                c = pf##_sub(c, pf##_mul(vA, s)); \
+                pf##_store(&th4[i*SW], c); \
+            } \
+            /* write-back interleaved: even rows = LL, odd rows = HH */ \
+            for (int i = 0; i < lh; ++i) { \
+                sf v = pf##_load(&tl4[i*SW]); \
+                pf##_store(&data[(2*i) * stride + col], v); \
+            } \
+            for (int i = 0; i < hh; ++i) { \
+                sf v = pf##_load(&th4[i*SW]); \
+                pf##_store(&data[(2*i + 1) * stride + col], v); \
+            } \
+        } else { \
+            /* scalar tail for partial column group */ \
+            for (int i = 0; i < lh; ++i) { \
+                int ip = (i > 0) ? i - 1 : 0, ii = (i < hh) ? i : hh - 1; \
+                for (int c = 0; c < nc; ++c) \
+                    tl4[i*SW + c] -= CDF97_D * (th4[ip*SW + c] + th4[ii*SW + c]); \
+            } \
+            for (int i = 0; i < hh; ++i) { \
+                int in = (i + 1 < lh) ? i + 1 : lh - 1; \
+                for (int c = 0; c < nc; ++c) \
+                    th4[i*SW + c] -= CDF97_G * (tl4[i*SW + c] + tl4[in*SW + c]); \
+            } \
+            for (int i = 0; i < lh; ++i) { \
+                int ip = (i > 0) ? i - 1 : 0, ii = (i < hh) ? i : hh - 1; \
+                for (int c = 0; c < nc; ++c) \
+                    tl4[i*SW + c] -= CDF97_B * (th4[ip*SW + c] + th4[ii*SW + c]); \
+            } \
+            for (int i = 0; i < hh; ++i) { \
+                int in = (i + 1 < lh) ? i + 1 : lh - 1; \
+                for (int c = 0; c < nc; ++c) \
+                    th4[i*SW + c] -= CDF97_A * (tl4[i*SW + c] + tl4[in*SW + c]); \
+            } \
+            for (int i = 0; i < lh; ++i) \
+                for (int c = 0; c < nc; ++c) \
+                    data[(2*i) * stride + col + c] = tl4[i*SW + c]; \
+            for (int i = 0; i < hh; ++i) \
+                for (int c = 0; c < nc; ++c) \
+                    data[(2*i + 1) * stride + col + c] = th4[i*SW + c]; \
+        } \
+    } \
+}
+
+#ifdef WTPC_HAS_SSE2
+WTPC_FWD_HORIZ(fwd_horiz_sse2, simd4_f, SIMD4_W, simd4)
+WTPC_FWD_VERT (fwd_vert_sse2,  simd4_f, SIMD4_W, simd4)
+WTPC_INV_HORIZ(inv_horiz_sse2, simd4_f, SIMD4_W, simd4)
+WTPC_INV_VERT (inv_vert_sse2,  simd4_f, SIMD4_W, simd4)
+#endif
+#ifdef WTPC_HAS_AVX
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC push_options
+#pragma GCC target("avx")
+#endif
+WTPC_FWD_HORIZ(fwd_horiz_avx, simd8_f, SIMD8_W, simd8)
+WTPC_FWD_VERT (fwd_vert_avx,  simd8_f, SIMD8_W, simd8)
+WTPC_INV_HORIZ(inv_horiz_avx, simd8_f, SIMD8_W, simd8)
+WTPC_INV_VERT (inv_vert_avx,  simd8_f, SIMD8_W, simd8)
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#endif
+#endif
+#ifdef WTPC_HAS_NEON
+WTPC_FWD_HORIZ(fwd_horiz_neon, simdn_f, SIMDN_W, simdn)
+WTPC_FWD_VERT (fwd_vert_neon,  simdn_f, SIMDN_W, simdn)
+WTPC_INV_HORIZ(inv_horiz_neon, simdn_f, SIMDN_W, simdn)
+WTPC_INV_VERT (inv_vert_neon,  simdn_f, SIMDN_W, simdn)
+#endif
+#undef WTPC_FWD_HORIZ
+#undef WTPC_FWD_VERT
+#undef WTPC_INV_HORIZ
+#undef WTPC_INV_VERT
+
+/* ================================================================
+ * Top-level 2D transforms - one per variant
+ * ================================================================ */
+#ifdef WTPC_HAS_SSE2
+static void cdf97_forward_2d_sse2(float *data, int width, int height) {
+    int md = width > height ? width : height;
+    float *tl = (float*)malloc((size_t)md * SIMD4_W * sizeof(float));
+    float *th = (float*)malloc((size_t)md * SIMD4_W * sizeof(float));
+    if (!tl || !th) { free(tl); free(th); return; }
+    int w = width, h = height;
+    while (w > 1 || h > 1) {
+        int lw = (w + 1) / 2, lh = (h + 1) / 2;
+        fwd_horiz_sse2(data, width, w, h, tl, th);
+        fwd_vert_sse2(data, width, w, h, tl, th);
+        w = lw; h = lh;
+    }
+    free(tl); free(th);
+}
+static void cdf97_inverse_2d_sse2(float *data, int width, int height) {
+    int md = width > height ? width : height;
+    float *tl = (float*)malloc((size_t)md * SIMD4_W * sizeof(float));
+    float *th = (float*)malloc((size_t)md * SIMD4_W * sizeof(float));
+    if (!tl || !th) { free(tl); free(th); return; }
+    int ws[32], hs[32], lv = 0, w = width, h = height;
+    while (w > 1 || h > 1) {
+        ws[lv] = w; hs[lv] = h;
+        w = (w + 1) / 2; h = (h + 1) / 2;
+        lv++;
+    }
+    for (int lev = lv - 1; lev >= 0; lev--) {
+        int pw = ws[lev], ph = hs[lev], lw = w, lh = h;
+        int hw = pw - lw, hh = ph - lh;
+#ifdef STANDARD_CDF97
+        { float Kv = 1.0f; if (hw > 0) Kv *= CDF97_K; if (hh > 0) Kv *= CDF97_K;
+          if (Kv != 1.0f) { float iK = 1.0f / Kv;
+            for (int y = 0; y < lh; y++) for (int x = 0; x < lw; x++) data[y*width+x] *= iK;
+            int hx = (hw > 0) ? lw : 0, hy = (hh > 0) ? lh : 0;
+            for (int y = hy; y < ph; y++) for (int x = hx; x < pw; x++) data[y*width+x] *= Kv; } }
+#endif
+        if (hh > 0) inv_vert_sse2(data, width, pw, ph, tl, th);
+        if (hw > 0) inv_horiz_sse2(data, width, pw, ph, tl, th);
+        w = pw; h = ph;
+    }
+    free(tl); free(th);
+}
+#endif /* WTPC_HAS_SSE2 */
+
+#ifdef WTPC_HAS_AVX
+static void cdf97_forward_2d_avx(float *data, int width, int height) {
+    int md = width > height ? width : height;
+    float *tl = (float*)malloc((size_t)md * SIMD8_W * sizeof(float));
+    float *th = (float*)malloc((size_t)md * SIMD8_W * sizeof(float));
+    if (!tl || !th) { free(tl); free(th); return; }
+    int w = width, h = height;
+    while (w > 1 || h > 1) {
+        int lw = (w + 1) / 2, lh = (h + 1) / 2;
+        fwd_horiz_avx(data, width, w, h, tl, th);
+        fwd_vert_avx(data, width, w, h, tl, th);
+        w = lw; h = lh;
+    }
+    free(tl); free(th);
+}
+static void cdf97_inverse_2d_avx(float *data, int width, int height) {
+    int md = width > height ? width : height;
+    float *tl = (float*)malloc((size_t)md * SIMD8_W * sizeof(float));
+    float *th = (float*)malloc((size_t)md * SIMD8_W * sizeof(float));
+    if (!tl || !th) { free(tl); free(th); return; }
+    int ws[32], hs[32], lv = 0, w = width, h = height;
+    while (w > 1 || h > 1) {
+        ws[lv] = w; hs[lv] = h;
+        w = (w + 1) / 2; h = (h + 1) / 2;
+        lv++;
+    }
+    for (int lev = lv - 1; lev >= 0; lev--) {
+        int pw = ws[lev], ph = hs[lev], lw = w, lh = h;
+        int hw = pw - lw, hh = ph - lh;
+#ifdef STANDARD_CDF97
+        { float Kv = 1.0f; if (hw > 0) Kv *= CDF97_K; if (hh > 0) Kv *= CDF97_K;
+          if (Kv != 1.0f) { float iK = 1.0f / Kv;
+            for (int y = 0; y < lh; y++) for (int x = 0; x < lw; x++) data[y*width+x] *= iK;
+            int hx = (hw > 0) ? lw : 0, hy = (hh > 0) ? lh : 0;
+            for (int y = hy; y < ph; y++) for (int x = hx; x < pw; x++) data[y*width+x] *= Kv; } }
+#endif
+        if (hh > 0) inv_vert_avx(data, width, pw, ph, tl, th);
+        if (hw > 0) inv_horiz_avx(data, width, pw, ph, tl, th);
+        w = pw; h = ph;
+    }
+    free(tl); free(th);
+}
+#endif /* WTPC_HAS_AVX */
+
+#ifdef WTPC_HAS_NEON
+static void cdf97_forward_2d_neon(float *data, int width, int height) {
+    int md = width > height ? width : height;
+    float *tl = (float*)malloc((size_t)md * SIMDN_W * sizeof(float));
+    float *th = (float*)malloc((size_t)md * SIMDN_W * sizeof(float));
+    if (!tl || !th) { free(tl); free(th); return; }
+    int w = width, h = height;
+    while (w > 1 || h > 1) {
+        int lw = (w + 1) / 2, lh = (h + 1) / 2;
+        fwd_horiz_neon(data, width, w, h, tl, th);
+        fwd_vert_neon(data, width, w, h, tl, th);
+        w = lw; h = lh;
+    }
+    free(tl); free(th);
+}
+static void cdf97_inverse_2d_neon(float *data, int width, int height) {
+    int md = width > height ? width : height;
+    float *tl = (float*)malloc((size_t)md * SIMDN_W * sizeof(float));
+    float *th = (float*)malloc((size_t)md * SIMDN_W * sizeof(float));
+    if (!tl || !th) { free(tl); free(th); return; }
+    int ws[32], hs[32], lv = 0, w = width, h = height;
+    while (w > 1 || h > 1) {
+        ws[lv] = w; hs[lv] = h;
+        w = (w + 1) / 2; h = (h + 1) / 2;
+        lv++;
+    }
+    for (int lev = lv - 1; lev >= 0; lev--) {
+        int pw = ws[lev], ph = hs[lev], lw = w, lh = h;
+        int hw = pw - lw, hh = ph - lh;
+#ifdef STANDARD_CDF97
+        { float Kv = 1.0f; if (hw > 0) Kv *= CDF97_K; if (hh > 0) Kv *= CDF97_K;
+          if (Kv != 1.0f) { float iK = 1.0f / Kv;
+            for (int y = 0; y < lh; y++) for (int x = 0; x < lw; x++) data[y*width+x] *= iK;
+            int hx = (hw > 0) ? lw : 0, hy = (hh > 0) ? lh : 0;
+            for (int y = hy; y < ph; y++) for (int x = hx; x < pw; x++) data[y*width+x] *= Kv; } }
+#endif
+        if (hh > 0) inv_vert_neon(data, width, pw, ph, tl, th);
+        if (hw > 0) inv_horiz_neon(data, width, pw, ph, tl, th);
+        w = pw; h = ph;
+    }
+    free(tl); free(th);
+}
+#endif /* WTPC_HAS_NEON */
+
+static void cdf97_forward_2d_c(float *data, int width, int height) {
     int max_dim = width > height ? width : height;
     float *temp_l = (float*)malloc(max_dim * sizeof(float));
     float *temp_h = (float*)malloc(max_dim * sizeof(float));
-
     int w = width, h = height;
     while (w > 1 || h > 1) {
         int low_w = (w + 1) / 2, high_w = w / 2;  /* ceil, floor */
         int low_h = (h + 1) / 2, high_h = h / 2;
-
         /* --- Horizontal lifting (first w columns, first h rows) --- */
         if (w > 1) {
             for (int row = 0; row < h; ++row) {
                 float *r = data + row * width;
-                for (int j = 0; j < high_w; ++j) {
+                int j;
+                for (j = 0; j < high_w; ++j) {
                     temp_l[j] = r[2*j];
                     temp_h[j] = r[2*j + 1];
                 }
                 if (w & 1) temp_l[low_w - 1] = r[w - 1];  /* odd width: extra lowpass */
-                for (int j = 0; j < high_w; ++j) {
+                for (j = 0; j < high_w; ++j) {
                     int jn = (j + 1 < low_w) ? j + 1 : low_w - 1;
-                    temp_h[j] += (float)(CDF97_A * (temp_l[j] + temp_l[jn]));
+                    temp_h[j] += CDF97_A * (temp_l[j] + temp_l[jn]);
                 }
-                for (int j = 0; j < low_w; ++j) {
-                    int jp = (j > 0) ? j - 1 : 0;
-                    int jj = (j < high_w) ? j : high_w - 1;
-                    temp_l[j] += (float)(CDF97_B * (temp_h[jp] + temp_h[jj]));
+                for (j = 0; j < low_w; ++j) {
+                    int jp = (j > 0) ? j - 1 : 0, jj = (j < high_w) ? j : high_w - 1;
+                    temp_l[j] += CDF97_B * (temp_h[jp] + temp_h[jj]);
                 }
-                for (int j = 0; j < high_w; ++j) {
+                for (j = 0; j < high_w; ++j) {
                     int jn = (j + 1 < low_w) ? j + 1 : low_w - 1;
-                    temp_h[j] += (float)(CDF97_G * (temp_l[j] + temp_l[jn]));
+                    temp_h[j] += CDF97_G * (temp_l[j] + temp_l[jn]);
                 }
-                for (int j = 0; j < low_w; ++j) {
-                    int jp = (j > 0) ? j - 1 : 0;
-                    int jj = (j < high_w) ? j : high_w - 1;
-                    temp_l[j] += (float)(CDF97_D * (temp_h[jp] + temp_h[jj]));
+                for (j = 0; j < low_w; ++j) {
+                    int jp = (j > 0) ? j - 1 : 0, jj = (j < high_w) ? j : high_w - 1;
+                    temp_l[j] += CDF97_D * (temp_h[jp] + temp_h[jj]);
                 }
                 /* Write back: lowpass first, then highpass. K-scaling optional: low *= K, high /= K */
-                for (int j = 0; j < low_w; ++j)  r[j] = temp_l[j] * CDF97_K;
-                for (int j = 0; j < high_w; ++j) r[low_w + j] = temp_h[j] * CDF97_INVK;
+                for (j = 0; j < low_w; ++j) r[j] = temp_l[j] * CDF97_K;
+                for (j = 0; j < high_w; ++j) r[low_w + j] = temp_h[j] * CDF97_INVK;
             }
         }
         /* --- Vertical lifting (first w columns, first h rows) --- */
         if (h > 1) {
             for (int col = 0; col < w; ++col) {
-                for (int i = 0; i < high_h; ++i) {
+                int i;
+                for (i = 0; i < high_h; ++i) {
                     temp_l[i] = data[(2*i)     * width + col];
                     temp_h[i] = data[(2*i + 1) * width + col];
                 }
                 if (h & 1) temp_l[low_h - 1] = data[(h - 1) * width + col];
-                for (int i = 0; i < high_h; ++i) {
+                for (i = 0; i < high_h; ++i) {
                     int in = (i + 1 < low_h) ? i + 1 : low_h - 1;
-                    temp_h[i] += (float)(CDF97_A * (temp_l[i] + temp_l[in]));
+                    temp_h[i] += CDF97_A * (temp_l[i] + temp_l[in]);
                 }
-                for (int i = 0; i < low_h; ++i) {
-                    int ip = (i > 0) ? i - 1 : 0;
-                    int ii = (i < high_h) ? i : high_h - 1;
-                    temp_l[i] += (float)(CDF97_B * (temp_h[ip] + temp_h[ii]));
+                for (i = 0; i < low_h; ++i) {
+                    int ip = (i > 0) ? i - 1 : 0, ii = (i < high_h) ? i : high_h - 1;
+                    temp_l[i] += CDF97_B * (temp_h[ip] + temp_h[ii]);
                 }
-                for (int i = 0; i < high_h; ++i) {
+                for (i = 0; i < high_h; ++i) {
                     int in = (i + 1 < low_h) ? i + 1 : low_h - 1;
-                    temp_h[i] += (float)(CDF97_G * (temp_l[i] + temp_l[in]));
+                    temp_h[i] += CDF97_G * (temp_l[i] + temp_l[in]);
                 }
-                for (int i = 0; i < low_h; ++i) {
-                    int ip = (i > 0) ? i - 1 : 0;
-                    int ii = (i < high_h) ? i : high_h - 1;
-                    temp_l[i] += (float)(CDF97_D * (temp_h[ip] + temp_h[ii]));
+                for (i = 0; i < low_h; ++i) {
+                    int ip = (i > 0) ? i - 1 : 0, ii = (i < high_h) ? i : high_h - 1;
+                    temp_l[i] += CDF97_D * (temp_h[ip] + temp_h[ii]);
                 }
-                for (int i = 0; i < low_h; ++i)  data[i        * width + col] = temp_l[i] * CDF97_K;
-                for (int i = 0; i < high_h; ++i) data[(low_h + i) * width + col] = temp_h[i] * CDF97_INVK;
+                for (i = 0; i < low_h; ++i) data[i * width + col] = temp_l[i] * CDF97_K;
+                for (i = 0; i < high_h; ++i) data[(low_h + i) * width + col] = temp_h[i] * CDF97_INVK;
             }
         }
         w = low_w; h = low_h;
@@ -369,7 +1085,7 @@ static void cdf97_forward_2d(float *data, int width, int height) {
     free(temp_l); free(temp_h);
 }
 
-static void cdf97_inverse_2d(float *data, int width, int height) {
+static void cdf97_inverse_2d_c(float *data, int width, int height) {
     int max_dim = width > height ? width : height;
     float *temp_l = (float*)malloc(max_dim * sizeof(float));
     float *temp_h = (float*)malloc(max_dim * sizeof(float));
@@ -407,64 +1123,93 @@ static void cdf97_inverse_2d(float *data, int width, int height) {
         /* --- Inverse vertical lifting (prev_w cols x prev_h rows) --- */
         if (high_h > 0)
         for (int col = 0; col < prev_w; ++col) {
-            for (int i = 0; i < low_h; ++i)
+            int i;
+            for (i = 0; i < low_h; ++i)
                 temp_l[i] = data[i        * width + col];
-            for (int i = 0; i < high_h; ++i)
+            for (i = 0; i < high_h; ++i)
                 temp_h[i] = data[(low_h + i) * width + col];
-            for (int i = 0; i < low_h; ++i) {
+            for (i = 0; i < low_h; ++i) {
                 int ip = (i > 0) ? i - 1 : 0;
                 int ii = (i < high_h) ? i : high_h - 1;
-                temp_l[i] -= (float)(CDF97_D * (temp_h[ip] + temp_h[ii]));
+                temp_l[i] -= CDF97_D * (temp_h[ip] + temp_h[ii]);
             }
-            for (int i = 0; i < high_h; ++i) {
+            for (i = 0; i < high_h; ++i) {
                 int in = (i + 1 < low_h) ? i + 1 : low_h - 1;
-                temp_h[i] -= (float)(CDF97_G * (temp_l[i] + temp_l[in]));
+                temp_h[i] -= CDF97_G * (temp_l[i] + temp_l[in]);
             }
-            for (int i = 0; i < low_h; ++i) {
+            for (i = 0; i < low_h; ++i) {
                 int ip = (i > 0) ? i - 1 : 0;
                 int ii = (i < high_h) ? i : high_h - 1;
-                temp_l[i] -= (float)(CDF97_B * (temp_h[ip] + temp_h[ii]));
+                temp_l[i] -= CDF97_B * (temp_h[ip] + temp_h[ii]);
             }
-            for (int i = 0; i < high_h; ++i) {
+            for (i = 0; i < high_h; ++i) {
                 int in = (i + 1 < low_h) ? i + 1 : low_h - 1;
-                temp_h[i] -= (float)(CDF97_A * (temp_l[i] + temp_l[in]));
+                temp_h[i] -= CDF97_A * (temp_l[i] + temp_l[in]);
             }
-            /* Write back: interleaved even/odd rows */
-            for (int i = 0; i < low_h; ++i)
+            for (i = 0; i < low_h; ++i)
                 data[(2*i)     * width + col] = temp_l[i];
-            for (int i = 0; i < high_h; ++i)
+            for (i = 0; i < high_h; ++i)
                 data[(2*i + 1) * width + col] = temp_h[i];
         }
         /* --- Inverse horizontal lifting (prev_w cols x prev_h rows) --- */
         if (high_w > 0)
         for (int row = 0; row < prev_h; ++row) {
             float *r = data + row * width;
-            for (int j = 0; j < low_w; ++j)  temp_l[j] = r[j];
-            for (int j = 0; j < high_w; ++j) temp_h[j] = r[low_w + j];
-            for (int j = 0; j < low_w; ++j) {
+            int j;
+            for (j = 0; j < low_w; ++j) temp_l[j] = r[j];
+            for (j = 0; j < high_w; ++j) temp_h[j] = r[low_w + j];
+            for (j = 0; j < low_w; ++j) {
                 int jp = (j > 0) ? j - 1 : 0;
                 int jj = (j < high_w) ? j : high_w - 1;
-                temp_l[j] -= (float)(CDF97_D * (temp_h[jp] + temp_h[jj]));
+                temp_l[j] -= CDF97_D * (temp_h[jp] + temp_h[jj]);
             }
-            for (int j = 0; j < high_w; ++j) {
+            for (j = 0; j < high_w; ++j) {
                 int jn = (j + 1 < low_w) ? j + 1 : low_w - 1;
-                temp_h[j] -= (float)(CDF97_G * (temp_l[j] + temp_l[jn]));
+                temp_h[j] -= CDF97_G * (temp_l[j] + temp_l[jn]);
             }
-            for (int j = 0; j < low_w; ++j) {
+            for (j = 0; j < low_w; ++j) {
                 int jp = (j > 0) ? j - 1 : 0;
                 int jj = (j < high_w) ? j : high_w - 1;
-                temp_l[j] -= (float)(CDF97_B * (temp_h[jp] + temp_h[jj]));
+                temp_l[j] -= CDF97_B * (temp_h[jp] + temp_h[jj]);
             }
-            for (int j = 0; j < high_w; ++j) {
+            for (j = 0; j < high_w; ++j) {
                 int jn = (j + 1 < low_w) ? j + 1 : low_w - 1;
-                temp_h[j] -= (float)(CDF97_A * (temp_l[j] + temp_l[jn]));
+                temp_h[j] -= CDF97_A * (temp_l[j] + temp_l[jn]);
             }
-            for (int j = 0; j < low_w; ++j)  r[2*j]     = temp_l[j];
-            for (int j = 0; j < high_w; ++j) r[2*j + 1] = temp_h[j];
+            for (j = 0; j < low_w; ++j)  r[2*j]     = temp_l[j];
+            for (j = 0; j < high_w; ++j) r[2*j + 1] = temp_h[j];
         }
         w = prev_w; h = prev_h;
     }
     free(temp_l); free(temp_h);
+}
+
+static void cdf97_forward_2d(float *data, int width, int height) {
+    wtpc_cpu_init_();
+#if defined(WTPC_HAS_AVX)
+    if (wtpc_cpu_flags_ & WTPC_CPU_AVX)  { cdf97_forward_2d_avx(data, width, height); return; }
+#endif
+#if defined(WTPC_HAS_SSE2)
+    if (wtpc_cpu_flags_ & WTPC_CPU_SSE2) { cdf97_forward_2d_sse2(data, width, height); return; }
+#endif
+#if defined(WTPC_HAS_NEON)
+    if (wtpc_cpu_flags_ & WTPC_CPU_NEON) { cdf97_forward_2d_neon(data, width, height); return; }
+#endif
+    cdf97_forward_2d_c(data, width, height);
+}
+
+static void cdf97_inverse_2d(float *data, int width, int height) {
+    wtpc_cpu_init_();
+#if defined(WTPC_HAS_AVX)
+    if (wtpc_cpu_flags_ & WTPC_CPU_AVX)  { cdf97_inverse_2d_avx(data, width, height); return; }
+#endif
+#if defined(WTPC_HAS_SSE2)
+    if (wtpc_cpu_flags_ & WTPC_CPU_SSE2) { cdf97_inverse_2d_sse2(data, width, height); return; }
+#endif
+#if defined(WTPC_HAS_NEON)
+    if (wtpc_cpu_flags_ & WTPC_CPU_NEON) { cdf97_inverse_2d_neon(data, width, height); return; }
+#endif
+    cdf97_inverse_2d_c(data, width, height);
 }
 
 /* --- QUANTIZATION HELPERS --- */
@@ -585,7 +1330,7 @@ static void quantize_coeffs(const float *wavelet, int16_t *quantized, int w, int
     float min_step[5];
     compute_safe_steps(min_step, w, h);
     float dz_factor = bands_mult[MAX_BANDS];
-    /* Padded local copy of bands_mult (stack, 68 bytes) — no bounds check in loop */
+    /* Padded local copy of bands_mult (stack, 68 bytes) - no bounds check in loop */
     #define LUT_SZ 17
     float lb[LUT_SZ];
     for (int b = 0; b < MAX_BANDS; b++) lb[b] = bands_mult[b];
@@ -1216,21 +1961,43 @@ static void huffman_decode_ctx(Bitstream *bs, int16_t *o, int sz,
 }
 
 /* ===================================================================== */
-/*  EBCOT-lite: bit-plane coding with context from 8 neighbors + BAC */
-/*  Based on JPEG 2000 EBCOT, simplified (single pass per bit-plane). */
+/*  EBCOT-lite: bit-plane coding with context from 8 neighbors + BAC     */
+/*  Based on JPEG 2000 EBCOT, simplified (single pass per bit-plane).    */
 /* ===================================================================== */
 
-/* --- Binary arithmetic coder (WNC bit-oriented, proven correct) --- */
-/* BAC_CODE_BITS controls interval precision. It works for any value up to 30 */
-/* (lo/hi/code are uint32_t; renorm shifts must stay within 32 bits, and */
-/* bacm_p0 uses uint64_t intermediates). Higher precision only marginally helps */
-/* (~2-3 bytes/file at ~1.4 KB targets) because the probability model itself is */
-/* limited to ~14-bit counts; 24 captures essentially all of the available gain. */
+/* --- Binary arithmetic coder (byte-renormalized range coder, 24-bit) --- */
+/* Uses 64-bit low for carry propagation (LZMA/nvcomp pattern).            */
+/* BAC_SPLIT: 32x32->64 multiply + shift (umull on ARM, mul on x86).       */
+/* BAC_P0: 64-bit division (default) or reciprocal table (BAC_USE_TABLE).  */
+
 #define BAC_CODE_BITS 24
-#define BAC_TOP ((1u << BAC_CODE_BITS) - 1)
-#define BAC_HALF (BAC_TOP / 2 + 1)
-#define BAC_Q1 (BAC_TOP / 4 + 1)
-#define BAC_Q3 (3 * BAC_Q1)
+#define BAC_TOP       ((1u << BAC_CODE_BITS) - 1)  /* 0x00FFFFFF */
+#define BAC_TOP1      (1u << BAC_CODE_BITS)        /* 0x01000000 */
+#define BAC_RENORM_THRESH BAC_TOP1                 /* renorm when range < 2^24 */
+#define BAC_MAX_TOTAL 0x3FF0  /* ~14-bit model, rescale when c0+c1 exceeds */
+
+/*  Define BAC_USE_TABLE for reciprocal table (64 KB, ~+1-3% speed).
+ *  Default: 64-bit division - no extra memory, works everywhere. */
+#ifdef BAC_USE_TABLE
+  #define BAC_MAX_T     0x4000
+  static uint32_t g_bac_recip[BAC_MAX_T];
+  static int      g_bac_recip_ok = 0;
+  static void bac_recip_init(void) {
+      if (g_bac_recip_ok) return;
+      for (uint32_t f = 1; f < BAC_MAX_T; f++)
+          g_bac_recip[f] = (uint32_t)((0x100000000ULL + f/2) / f);
+      g_bac_recip[0] = 0xFFFFFFFFu;
+      g_bac_recip_ok = 1;
+  }
+  /* Division-free: p0 = (c0*2^24)/t via recip[t]=round(2^32/t). */
+  #define BAC_P0(c0, t)  ((uint32_t)(((uint64_t)(c0) * g_bac_recip[t]) >> 8))
+#else
+  /* 64-bit division for p0 - simplest, zero memory overhead. */
+  #define BAC_P0(c0, t)  ((uint32_t)(((uint64_t)(c0) * BAC_TOP1) / (t)))
+#endif
+
+/* BAC_SPLIT: 32x32->64 multiply + shift (umull/mul, 3-4 cycles). */
+#define BAC_SPLIT(range, prob)  ((uint32_t)(((uint64_t)(range) * (prob)) >> BAC_CODE_BITS))
 
 /* Adaptive probability model (count-based, implicit EMA via rescaling) */
 typedef struct { uint16_t c0, c1; } BacModel;
@@ -1247,102 +2014,157 @@ static void bacm_init_ctx(BacModel *m, int ctx) {
     }
 }
 
-static uint32_t bacm_p0(BacModel *m) {
-    uint32_t t = (uint32_t)m->c0 + (uint32_t)m->c1;
-    if (t > 0x3FF0) { m->c0 = (m->c0 >> 1) | 1; m->c1 = (m->c1 >> 1) | 1; t = m->c0 + m->c1; }
-    uint32_t p = (uint32_t)(((uint64_t)m->c0 * (BAC_TOP + 1)) / t);
-    return p < 1 ? 1 : (p > BAC_TOP ? BAC_TOP : p);
+static inline uint32_t bacm_p0(BacModel *m) {
+    uint32_t c0 = (uint32_t)m->c0, c1 = (uint32_t)m->c1;
+    uint32_t t = c0 + c1;
+    if (t > BAC_MAX_TOTAL) {
+        m->c0 = (m->c0 >> 1) | 1; m->c1 = (m->c1 >> 1) | 1;
+        t = (uint32_t)m->c0 + m->c1;
+    }
+    uint32_t p = BAC_P0(c0, t);
+    if (p < 1)       p = 1;
+    if (p > BAC_TOP) p = BAC_TOP;
+    return p;
 }
 
 static void bacm_update(BacModel *m, int bit) {
     if (bit) m->c1++; else m->c0++;
-    if ((uint32_t)m->c0 + m->c1 > 0x3FF0) { m->c0 = (m->c0>>1)|1; m->c1 = (m->c1>>1)|1; }
+    if ((uint32_t)m->c0 + m->c1 > BAC_MAX_TOTAL) { m->c0 = (m->c0>>1)|1; m->c1 = (m->c1>>1)|1; }
 }
 
-/* --- WNC Encoder (outputs bits into byte buffer) --- */
+/* --- Byte-renormalized Encoder --- */
+/* Uses 64-bit low so carries naturally propagate to bits 32+.          */
+/* Carry-handling follows the standard LZMA/nvcomp pattern: buffer      */
+/* 0xFF bytes that might receive a carry, resolve when top byte < 0xFF  */
+/* or when a carry actually happens (low >= 0x100000000).               */
 typedef struct {
     uint8_t *out;
-    uint32_t lo, hi;
-    int pos, sz, follow, bbuf, nbits;
+    uint64_t low;        /* 64-bit - carries propagate to bits 32+ */
+    uint32_t range;
+    int      pos, sz;
+    uint8_t  cache;      /* most recent non-0xFF output byte            */
+    int      cache_nff;  /* number of buffered 0xFF bytes (may carry)   */
+    int      first;      /* first output byte not yet committed         */
 } BacEnc;
 
-static void bac_putb(BacEnc *e, int b) {
-    e->bbuf = (e->bbuf << 1) | b;
-    if (++e->nbits == 8) { if (e->pos < e->sz) e->out[e->pos++] = (uint8_t)e->bbuf; e->nbits = 0; e->bbuf = 0; }
-}
+/* Shift one byte out of low with correct carry propagation. */
+static void bac_shift_low(BacEnc *e) {
+    uint64_t lo = e->low;
+    uint32_t carry = (uint32_t)(lo >> 32);  /* 1 if a carry propagated through */
 
-static void bac_putb_follow(BacEnc *e, int b) {
-    bac_putb(e, b);
-    while(e->follow > 0) { bac_putb(e, !b); e->follow--; }
+    if (lo < 0xFF000000ULL || carry) {
+        /* No carry pending (top byte < 0xFF) OR carry already resolved. */
+        if (!e->first) {
+            if (e->pos < e->sz) e->out[e->pos++] = (uint8_t)(e->cache + carry);
+            while (e->cache_nff-- > 0)
+                if (e->pos < e->sz) e->out[e->pos++] = carry ? 0x00 : 0xFF;
+        }
+        e->cache     = (uint8_t)(lo >> 24);
+        e->cache_nff = 0;
+        e->first     = 0;
+    } else {
+        /* low in [0xFF000000, 0xFFFFFFFF]: top byte == 0xFF, may carry. */
+        e->cache_nff++;
+    }
+    e->low = (lo << 8) & 0xFFFFFFFFULL;
 }
 
 static void bac_init_enc(BacEnc *e, uint8_t *buf, int sz) {
-    e->out = buf; e->pos = 0; e->sz = sz; e->lo=0;
-    e->hi = BAC_TOP; e->follow = 0; e->bbuf = 0; e->nbits = 0;
+#ifdef BAC_USE_TABLE
+    bac_recip_init();
+#endif
+    e->out = buf; e->pos = 0; e->sz = sz;
+    e->low = 0; e->range = 0xFFFFFFFFu;
+    e->cache = 0; e->cache_nff = 0; e->first = 0;  /* 0: flush always outputs from iter 0 */
 }
 
 static void bac_encode(BacEnc *e, int bit, BacModel *m) {
-    uint32_t p0 = bacm_p0(m), range=e->hi-e->lo+1;
-    if (bit) e->lo = e->lo + (uint32_t)(((uint64_t)range*p0)/(BAC_TOP + 1));
-    else     e->hi = e->lo + (uint32_t)(((uint64_t)range*p0)/(BAC_TOP + 1)) - 1;
+    uint32_t p0    = bacm_p0(m);
+    uint32_t range = e->range;
+    uint32_t split = BAC_SPLIT(range, p0);
+    if (bit) { e->low += split;  e->range = range - split; }
+    else     {                   e->range = split; }
     bacm_update(m, bit);
-    for(;;) {
-        if(e->hi < BAC_HALF) { bac_putb_follow(e, 0); }
-        else if(e->lo >= BAC_HALF) { bac_putb_follow(e, 1); e->lo -= BAC_HALF; e->hi-=BAC_HALF;}
-        else if(e->lo >= BAC_Q1 && e->hi < BAC_Q3) { e->follow++; e->lo -= BAC_Q1; e->hi -= BAC_Q1;}
-        else break;
-        e->lo <<= 1; e->hi = (e->hi << 1) | 1;
+    /* Byte renormalization - output bytes while range < threshold */
+    if (e->range < BAC_RENORM_THRESH) {
+        do {
+            e->range <<= 8;
+            bac_shift_low(e);
+        } while (e->range < BAC_RENORM_THRESH);
     }
 }
 
 static int bac_flush_enc(BacEnc *e) {
-    e->follow++;
-    bac_putb_follow(e, e->lo < BAC_Q1 ? 0 : 1);
-    if(e->nbits > 0 && e->pos < e->sz) e->out[e->pos++] = (uint8_t)(e->bbuf << (8 - e->nbits));
+    /* Flush 5 bytes from low (32 bits of remaining value + safety). */
+    for (int i = 0; i < 4; i++) {
+        uint64_t lo = e->low;
+        uint32_t carry = (uint32_t)(lo >> 32);
+        if (lo < 0xFF000000ULL || carry) {
+            if (!e->first) {
+                if (e->pos < e->sz) e->out[e->pos++] = (uint8_t)(e->cache + carry);
+                while (e->cache_nff-- > 0)
+                    if (e->pos < e->sz) e->out[e->pos++] = carry ? 0x00 : 0xFF;
+            }
+            e->cache     = (uint8_t)(lo >> 24);
+            e->cache_nff = 0;
+            e->first     = 0;
+        } else {
+            e->cache_nff++;
+        }
+        e->low = (lo << 8) & 0xFFFFFFFFULL;
+    }
+    /* Output final cached byte and buffered 0xFF's. */
+    if (!e->first) {
+        if (e->pos < e->sz) e->out[e->pos++] = e->cache;
+        while (e->cache_nff-- > 0)
+            if (e->pos < e->sz) e->out[e->pos++] = 0xFF;
+    }
     return e->pos;
 }
 
-/* --- WNC Decoder (reads bits from byte buffer) --- */
+/* --- Byte-renormalized Decoder --- */
 typedef struct {
     const uint8_t *in;
-    uint32_t lo, hi, code;
-    int pos, sz, bbuf, nbits;
+    uint32_t range, code;   /* code = 4-byte window into the bitstream */
+    int      pos, sz;
 } BacDec;
 
-static int bac_getb(BacDec *d) {
-    if(d->nbits == 0) {
-        if(d->pos < d->sz) { d->bbuf = d->in[d->pos++]; d->nbits = 8; } else return 0;
-    }
-    int b = (d->bbuf >> 7) & 1;
-    d->bbuf <<= 1;
-    d->nbits--;
-    return b;
-}
 static void bac_init_dec(BacDec *d, const uint8_t *buf, int sz) {
-    d->in = buf; d->pos = 0; d->sz = sz; d->lo = 0; d->hi = BAC_TOP; d->code = 0;
-    d->bbuf = 0; d->nbits = 0;
-    for(int i = 0; i < BAC_CODE_BITS; i++) d->code = (d->code << 1) | bac_getb(d);
+#ifdef BAC_USE_TABLE
+    bac_recip_init();
+#endif
+    d->in = buf; d->pos = 0; d->sz = sz;
+    d->range = 0xFFFFFFFFu;
+    d->code  = 0;
+    /* Read initial 5 bytes (matches bac_flush_enc 5x shift - LZMA pattern).
+     * Byte 0 (cache carry) overflows code; bytes 1-4 become the 32-bit low value. */
+    for (int i = 0; i < 5; i++) {
+        uint32_t b = (d->pos < d->sz) ? d->in[d->pos++] : 0;
+        d->code = (d->code << 8) | b;
+    }
 }
+
 static int bac_decode(BacDec *d, BacModel *m) {
-    uint32_t p0 = bacm_p0(m), range = d->hi - d->lo + 1;
-    uint32_t split = d->lo + (uint32_t)(((uint64_t)range*p0)/(BAC_TOP + 1));
+    uint32_t p0    = bacm_p0(m);
+    uint32_t range = d->range;
+    uint32_t split = BAC_SPLIT(range, p0);
     int bit;
-    if(d->code < split) {
+    if (d->code < split) {
         bit = 0;
-        d->hi = split - 1;
+        d->range = split;
     } else {
         bit = 1;
-        d->lo = split;
+        d->code  -= split;
+        d->range -= split;
     }
     bacm_update(m, bit);
-    for(;;){
-        if(d->hi < BAC_HALF) {}
-        else if(d->lo >= BAC_HALF){ d->lo -= BAC_HALF; d->hi -= BAC_HALF; d->code -= BAC_HALF; }
-        else if(d->lo >= BAC_Q1 && d->hi < BAC_Q3) { d->lo -= BAC_Q1; d->hi -= BAC_Q1; d->code -= BAC_Q1; }
-        else break;
-        d->lo <<= 1;
-        d->hi = (d->hi << 1) | 1;
-        d->code = (d->code << 1) | bac_getb(d);
+    /* Byte renormalization - bring in new bytes while range < threshold */
+    if (d->range < BAC_RENORM_THRESH) {
+        do {
+            d->range <<= 8;
+            uint32_t b = (d->pos < d->sz) ? d->in[d->pos++] : 0;
+            d->code = (d->code << 8) | b;
+        } while (d->range < BAC_RENORM_THRESH);
     }
     return bit;
 }

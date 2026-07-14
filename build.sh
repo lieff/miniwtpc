@@ -17,4 +17,8 @@ else
   CFLAGS="${CFLAGS} -O3 -ffunction-sections -fdata-sections -Wl,--gc-sections -U_FORTIFY_SOURCE -DNDEBUG"
 fi
 
+if [ "${ENABLE_AVX}" = "yes" ]; then
+  CFLAGS="${CFLAGS} -mavx"
+fi
+
 gcc $CFLAGS -Wall -Wextra ./wtpc.c -o wtpc -lm -lpng16 -llcms2 -lpthread

@@ -473,6 +473,8 @@ static void *tune_worker(void *arg) {
         if (!enc) {
             fprintf(stderr, "[th%d] BAD ENCODE %s: %dx%dx%d\n", ctx->tid, ctx->names[i], w, h, pimg->has_alpha ? 4 : 3); continue;
         }
+        if (info.encoded_bytes > ctx->targets[t])
+            fprintf(stderr, "[th%d t=%d] ENCODE OVERSHOOT %s: %dx%dx%d size=%d\n", ctx->tid, ctx->targets[t], ctx->names[i], w, h, pimg->has_alpha ? 4 : 3, info.encoded_bytes);
 
         int dw = 0, dh = 0, dq = 0, dcomp = 0;
         unsigned char *dec = wtpc_decode_mem(enc, info.encoded_bytes, &dw, &dh, &dq, &dcomp);
@@ -968,27 +970,100 @@ int main(int argc, char **argv) {
             else
                 { printf("[SELF-TEST EBCOT-STRESS] FAIL: %u mismatches (BAC_CODE_BITS=%d)\n", fails, BAC_CODE_BITS); all_ok = 0; }
             free(sc); free(sd);
-            }
-        /* Self-test: wavelet roundtrip on non-square, non-power-of-2 (256x375) */
+        }
+        /* Stress-test: BAC roundtrip on many sizes (catches byte-renorm desync) */
         {
-            int tw = 256, th = 375, tt = tw*th;
-            float *tf = (float*)malloc(tt*sizeof(float));
-            float *ts = (float*)malloc(tt*sizeof(float));  /* save copy */
-            unsigned rng = 42;
-            for(int i = 0; i < tt; i++) {
-                rng = rng*1664525u + 1013904223u;
-                tf[i] = (float)((int)(rng & 0xFF) - 128);
-                ts[i] = tf[i];
+            int test_w[] = {2,3,4,5,7,8,11,13,16,17,23,31,32,37,47,64,0};
+            unsigned rng = 999983, total_fails = 0, total_trials = 0;
+            for (int si = 0; test_w[si] != 0; si++) {
+                int sw = test_w[si], sh = sw + (si & 1);
+                int st = sw * sh;
+                int16_t *sc = (int16_t*)malloc(st*sizeof(int16_t));
+                int16_t *sd = (int16_t*)calloc(st, sizeof(int16_t));
+                for (int trial = 0; trial < 20; trial++) {
+                    int maxbits = 1 + (trial % 14);
+                    for (int i = 0; i < st; i++) {
+                        rng = rng*1664525u + 1013904223u;
+                        int mag = (rng >> 9) & ((1 << maxbits) - 1);
+                        if (((rng >> 3) & 7) < 5) mag = 0;
+                        sc[i] = (rng & 0x100) ? (int16_t)-mag : (int16_t)mag;
+                    }
+                    int sbp=0, smv=0;
+                    for (int i=0;i<st;i++){int av=abs(sc[i]);if(av>smv)smv=av;}
+                    while(smv>0){sbp++;smv>>=1;} if(sbp==0)sbp=1;
+                    uint8_t *sbuf=(uint8_t*)malloc(st*6+4096);
+                    BacEnc se; bac_init_enc(&se,sbuf,st*6+4096);
+                    ebcot_encode_channel(&se,sc,sw,sh);
+                    int ssz=bac_flush_enc(&se);
+                    memset(sd,0,st*sizeof(int16_t));
+                    BacDec sdec; bac_init_dec(&sdec,sbuf,ssz);
+                    ebcot_decode_channel(&sdec,sd,sw,sh,sbp);
+                    unsigned f=0;
+                    for(int i=0;i<st;i++) if(sc[i]!=sd[i]) f++;
+                    if(f){total_fails++; printf("[BAC-SIZE %dx%d trial %d] %u mismatches\n",sw,sh,trial,f);}
+                    total_trials++;
+                    free(sbuf);
+                }
+                free(sc); free(sd);
             }
-            cdf97_forward_2d(tf, tw, th);
-            cdf97_inverse_2d(tf, tw, th);
-            float maxerr = 0;
-            for(int i = 0; i < tt; i++){ float e = fabsf(tf[i] - ts[i]); if(e > maxerr) maxerr = e; }
-            if(maxerr < 1.0f)
-                printf("[SELF-TEST WAVELET]  OK: 256x375 roundtrip, maxerr=%.4f\n", maxerr);
+            if (total_fails == 0)
+                printf("[SELF-TEST BAC-SIZES] OK: %d trials, %d sizes (%d..%d)\n",
+                    total_trials, (int)(sizeof(test_w)/sizeof(test_w[0])-1), test_w[0], test_w[(sizeof(test_w)/sizeof(test_w[0]))-2]);
             else
-                { printf("[SELF-TEST WAVELET]  FAIL: 256x375 maxerr=%.4f\n", maxerr); all_ok = 0; }
-            free(tf); free(ts);
+                { printf("[SELF-TEST BAC-SIZES] FAIL: %u/%u mismatches\n", total_fails, total_trials); all_ok = 0; }
+        }
+        /* Self-test: wavelet roundtrip - comprehensive edge-case coverage */
+        {
+            /* All sizes: odd, even, non-power-of-2, tiny, SIMD boundaries */
+            int test_sizes[][2] = {
+                {1,1},{1,2},{2,1},{2,2},{1,3},{3,1},{1,7},{7,1},
+                {3,3},{3,5},{5,3},{3,7},{7,3},
+                {4,4},{5,5},{6,6},{7,7},{8,8},{9,9},
+                {7,11},{11,7},{7,13},{13,7},{7,15},{15,7},
+                {8,7},{7,8},{9,8},{8,9},
+                {10,10},{11,11},{12,12},{13,13},{14,14},{15,15},
+                {16,16},{17,17},{18,18},{19,19},{20,20},
+                {21,21},{22,22},{23,23},{24,24},{25,25},
+                {26,26},{27,27},{28,28},{29,29},{30,30},{31,31},
+                {32,32},{33,33},{47,47},
+                {15,31},{31,15},{17,33},{33,17},{21,47},{47,21},
+                {31,47},{47,31},{33,65},{65,33},
+                {64,64},{63,65},{65,63},
+                {128,128},{127,129},{129,127},
+                {256,256},{255,257},{257,255},
+                {2,127},{127,2},{1,128},{128,1},
+                {511,511},
+                {0,0}
+            };
+            int n_sizes = 0, wfail = 0;
+            for (int ti = 0; test_sizes[ti][0] != 0; ti++) n_sizes++;
+            for (int ti = 0; test_sizes[ti][0] != 0; ti++) {
+                int tw = test_sizes[ti][0], th = test_sizes[ti][1];
+                int tt = tw * th;
+                float *tf = (float*)malloc(tt*sizeof(float));
+                float *ts = (float*)malloc(tt*sizeof(float));
+                unsigned rng = (unsigned)(tw * 65537 + th * 257 + ti * 17);
+                for (int i = 0; i < tt; i++) {
+                    rng = rng*1664525u + 1013904223u;
+                    tf[i] = (float)((int)(rng & 0xFF) - 128);
+                    ts[i] = tf[i];
+                }
+                cdf97_forward_2d(tf, tw, th);
+                cdf97_inverse_2d(tf, tw, th);
+                float maxerr = 0; int badidx = -1;
+                for (int i = 0; i < tt; i++) {
+                    float e = fabsf(tf[i] - ts[i]);
+                    if (e > maxerr) { maxerr = e; badidx = i; }
+                }
+                if (maxerr >= 1.0f) {
+                    printf("[SELF-TEST WAVELET]  FAIL: %dx%d maxerr=%.4f (idx=%d r=%d c=%d)\n",
+                        tw, th, maxerr, badidx, badidx/tw, badidx%tw);
+                    all_ok = 0; wfail++;
+                }
+                free(tf); free(ts);
+            }
+            if (wfail == 0)
+                printf("[SELF-TEST WAVELET]  OK: %d size combos (1x1 .. 511x511)\n", n_sizes);
         }
         /* Self-test: quantize roundtrip on non-square 256x375 */
         {
