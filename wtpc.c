@@ -124,7 +124,7 @@ static uint8_t *read_png(const char *path, int *w, int *h, int *has_alpha) {
 /*   def_tables_single, def_tables_t0, def_tables_t1 */
 /*   def_tables_single_420, def_tables_t0_420, def_tables_t1_420 */
 static void generate_tables(const char *dir_path) {
-    int q_levels[NUM_DEF_TABLES] = {400, 200, 100, 50, 20, 8, 3};
+    int q_levels[NUM_DEF_TABLES] = {665, 570, 474, 368, 244, 101, 78}; /* from mean_q= for each target after quantization tune */
 
     int64_t freq_single[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS];
     int64_t freq_t0[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS];
@@ -368,14 +368,14 @@ static const ParamCfg param_cfg[NPARAMS_MAIN] = {
     {"b6",           0.01f, 0.10f},
     {"b7(finest)",   0.01f, 0.20f},
     /* Chroma 4:4:4 bands */
-    {"cb0(coarsest)",0.01f, 0.6f},
-    {"cb1",          0.01f, 0.6f},
-    {"cb2",          0.01f, 0.6f},
-    {"cb3",          0.01f, 0.6f},
-    {"cb4",          0.01f, 0.6f},
-    {"cb5",          0.01f, 0.6f},
-    {"cb6",          0.01f, 0.7f},
-    {"cb7(finest)",  0.01f, 1.0f},
+    {"cb0(coarsest)",0.01f, 0.10f},
+    {"cb1",          0.01f, 0.10f},
+    {"cb2",          0.01f, 0.10f},
+    {"cb3",          0.01f, 0.10f},
+    {"cb4",          0.01f, 0.10f},
+    {"cb5",          0.01f, 0.10f},
+    {"cb6",          0.01f, 0.20f},
+    {"cb7(finest)",  0.01f, 0.40f},
     /* DZ */
     {"dz_luma",      0.01f, 0.05f},
     {"dz_chroma",    0.01f, 0.05f},
@@ -445,6 +445,7 @@ typedef struct {
     int *targets;
     int ntargets;
     int ntotal;            /* nimg * ntargets */
+    volatile int *guard_overshoot;  /* shared flag set by any thread on guard fail */
     /* per-target stats (allocated per thread, [ntargets]) */
     PerTargetStats *stats;
 } ThreadCtx;
@@ -457,7 +458,7 @@ static void *tune_worker(void *arg) {
         pthread_mutex_lock(ctx->mutex);
         int idx = (*ctx->next_idx)++;
         pthread_mutex_unlock(ctx->mutex);
-        if (idx >= ctx->ntotal) break;
+        if (idx >= ctx->ntotal || *ctx->guard_overshoot) break;
 
         /* Single chroma mode: idx -> (t, i) */
         int t    = idx / ctx->nimg;
@@ -467,14 +468,23 @@ static void *tune_worker(void *arg) {
         PreloadedImg *pimg = &ctx->images[i];
         int w = pimg->w, h = pimg->h;
         uint8_t *img = pimg->rgb;
-
+#define GUARD_SIZE 150
         wtpc_enc_info info;
-        unsigned char *enc = wtpc_encode_mem(img, &info, w, h, ctx->targets[t], 0, ctx->chroma_mode, 2, 0, pimg->has_alpha);
+        int guard_size = 0, exclude_guard_test = !strcmp(ctx->names[i], "sample-alpha-checker-400x300.png") || !strcmp(ctx->names[i], "sample-alpha-circle-400x300.png");
+        unsigned char *enc;
+        if (!exclude_guard_test) {
+            enc = wtpc_encode_mem(img, &info, w, h, 0, MAX_QUALITY, ctx->chroma_mode, 2, 0, pimg->has_alpha, 0);
+            guard_size = info.encoded_bytes;
+            free(enc);
+        }
+        enc = wtpc_encode_mem(img, &info, w, h, ctx->targets[t], 0, ctx->chroma_mode, 2, 0, pimg->has_alpha, 0);
         if (!enc) {
             fprintf(stderr, "[th%d] BAD ENCODE %s: %dx%dx%d\n", ctx->tid, ctx->names[i], w, h, pimg->has_alpha ? 4 : 3); continue;
         }
-        if (info.encoded_bytes > ctx->targets[t])
-            fprintf(stderr, "[th%d t=%d] ENCODE OVERSHOOT %s: %dx%dx%d size=%d\n", ctx->tid, ctx->targets[t], ctx->names[i], w, h, pimg->has_alpha ? 4 : 3, info.encoded_bytes);
+        if (info.encoded_bytes > ctx->targets[t] || guard_size > GUARD_SIZE) {
+            *ctx->guard_overshoot = 1;
+            fprintf(stderr, "[th%d t=%d] ENCODE OVERSHOOT %s: %dx%dx%d size=%d guard_size=%d\n", ctx->tid, ctx->targets[t], ctx->names[i], w, h, pimg->has_alpha ? 4 : 3, info.encoded_bytes, guard_size);
+        }
 
         int dw = 0, dh = 0, dq = 0, dcomp = 0;
         unsigned char *dec = wtpc_decode_mem(enc, info.encoded_bytes, &dw, &dh, &dq, &dcomp);
@@ -617,6 +627,7 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
         int _ntotal = nimg * ntargets; \
         int _nth = _ntotal < TUNE_THREADS ? _ntotal : TUNE_THREADS; \
         int _next_idx = 0; \
+        int _guard_overshoot = 0; \
         pthread_mutex_t _mutex = PTHREAD_MUTEX_INITIALIZER; \
         pthread_mutex_t _pmutex = PTHREAD_MUTEX_INITIALIZER; \
         PerTargetStats *_astats = calloc(_nth * ntargets, sizeof(PerTargetStats)); \
@@ -635,6 +646,7 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
             _ctx[_tid].targets     = targets; \
             _ctx[_tid].ntargets    = ntargets; \
             _ctx[_tid].ntotal      = _ntotal; \
+            _ctx[_tid].guard_overshoot = &_guard_overshoot; \
             _ctx[_tid].stats       = _astats + _tid * ntargets; \
             memset(_ctx[_tid].stats, 0, ntargets * sizeof(PerTargetStats)); \
             pthread_create(&_th[_tid], NULL, tune_worker, &_ctx[_tid]); \
@@ -642,6 +654,12 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
         for (int _tid = 0; _tid < _nth; _tid++) pthread_join(_th[_tid], NULL); \
         pthread_mutex_destroy(&_mutex); \
         pthread_mutex_destroy(&_pmutex); \
+        if (_guard_overshoot) { \
+            free(_astats); \
+            fprintf(stderr, "  %-15s %s = %6.3f  GUARD OVERSHOOT (%dB unreachable), step FAILED\n", pcfg->name, label, (val), GUARD_SIZE); \
+            *(ssim_out) = -9999.0f; \
+            break; \
+        } \
         /* Aggregate across threads, print per-target breakdown */ \
         double _sum_ssim2 = 0; int _count = 0; \
         int _overall_max_dev = 0; \
@@ -694,6 +712,7 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
 
         float best_val = center, best_ssim, ssim;
         TUNE_EVAL(center, &best_ssim, " C");
+        if (best_ssim < -9000.0f) { fprintf(stderr, "  Parameter %s: center %.3f fails guard, skipping.\n", pcfg->name, center); continue; }
 
         int pos_stop = 0, neg_stop = 0, pos_down = 0, neg_down = 0;
         float prev_pos = best_ssim, prev_neg = best_ssim;
@@ -714,7 +733,8 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
                 if (val <= 0.0f) { neg_stop = 1; skipped_neg = max_d - d + 1; }
                 else {
                     TUNE_EVAL(val, &ssim, " -");
-                    if (ssim > best_ssim) { best_ssim = ssim; best_val = val; neg_down = 0; }
+                    if (ssim < -9000.0f) { neg_stop = 1; skipped_neg = max_d - d; fprintf(stderr, "  Negative search stopped: guard overshoot at %.3f\n", val); }
+                    else if (ssim > best_ssim) { best_ssim = ssim; best_val = val; neg_down = 0; }
                     else {
                         neg_down++;
                         if (neg_down >= MAX_WORSE_STEPS || (prev_neg - ssim) > MAX_WORSE_SSIM) { neg_stop = 1; skipped_neg = max_d - d; fprintf(stderr, "  Negative search terminated.\n"); }
@@ -728,8 +748,8 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
         g_params[base_idx + p] = best_val;
         apply_params();
 
-        fprintf(stderr, "\n>>> BEST %s = %.3f (ssim2 = %.2f)\n", pcfg->name, best_val, best_ssim);
-        printf("# BEST_%s, %.3f, %.2f\n", pcfg->name, best_val, best_ssim);
+        fprintf(stderr, "\n>>> BEST %s = %.3f (ssim2 = %.6f)\n", pcfg->name, best_val, best_ssim);
+        printf("# BEST_%s, %.3f, %.6f\n", pcfg->name, best_val, best_ssim);
         print_all_params(chroma_mode);
         fprintf(stderr, "\n");
     }
@@ -835,7 +855,7 @@ int main(int argc, char **argv) {
             }
         }
         double t0 = now_ms();
-        int ret = wtpc_encode_file(output, img, &info, w, h, target_bytes, quality, chroma_420, huffman_mode, huf_extra_ctx, has_alpha);
+        int ret = wtpc_encode_file(output, img, &info, w, h, target_bytes, quality, chroma_420, huffman_mode, huf_extra_ctx, has_alpha, 0);
         double dt = now_ms() - t0;
         stbi_image_free(img);
         if (ret != 0) {
@@ -1077,8 +1097,8 @@ int main(int argc, char **argv) {
             for(int i = 0; i < tt; i++) {
                 rng = rng*1664525u + 1013904223u;
                 orig[i*3] = rng & 0xFF; orig[i*3 + 1] = (rng >> 8) & 0xFF; orig[i*3 + 2] = (rng >> 16) & 0xFF;
-                rgb_to_yuv(orig[i*3],orig[i*3 + 1],orig[i*3 + 2], &ty[i], &tu[i], &tv[i]);
             }
+            rgb_to_yuv_batch(orig, 0, 3, tw, th, ty, tu, tv, NULL);
             cdf97_forward_2d(ty, tw, th);
             cdf97_forward_2d(tu, tw, th);
             cdf97_forward_2d(tv, tw, th);
@@ -1088,8 +1108,7 @@ int main(int argc, char **argv) {
             cdf97_inverse_2d(ty, tw, th);
             cdf97_inverse_2d(tu, tw, th);
             cdf97_inverse_2d(tv, tw, th);
-            for(int i = 0; i < tt; i++)
-                yuv_to_rgb(ty[i], tu[i], tv[i], &dec[i*3], &dec[i*3+1], &dec[i*3+2]);
+            yuv_to_rgb_batch(ty, tu, tv, NULL, tw, th, dec, 0, 3);
             double mse=0;
             for(int i = 0; i < tt*3; i++){ double d = orig[i] - dec[i]; mse += d*d; }
             mse /= (tt*3);
@@ -1110,8 +1129,8 @@ int main(int argc, char **argv) {
             for(int i = 0; i < tt; i++){
                 rng = rng*1664525u + 1013904223u;
                 orig[i*3] = rng&0xFF; orig[i*3 + 1] = (rng >> 8) & 0xFF; orig[i*3 + 2] = (rng >> 16) & 0xFF;
-                rgb_to_yuv(orig[i*3], orig[i*3 + 1], orig[i*3 + 2], &ty[i], &tu[i], &tv[i]);
             }
+            rgb_to_yuv_batch(orig, 0, 3, tw, th, ty, tu, tv, NULL);
             cdf97_forward_2d(ty, tw, th);
             cdf97_forward_2d(tu, tw, th);
             cdf97_forward_2d(tv, tw, th);
@@ -1125,8 +1144,7 @@ int main(int argc, char **argv) {
             cdf97_inverse_2d(ty, tw, th);
             cdf97_inverse_2d(tu, tw, th);
             cdf97_inverse_2d(tv, tw, th);
-            for(int i = 0; i < tt; i++)
-                yuv_to_rgb(ty[i], tu[i], tv[i], &dec[i*3], &dec[i*3 + 1], &dec[i*3 + 2]);
+            yuv_to_rgb_batch(ty, tu, tv, NULL, tw, th, dec, 0, 3);
             mse = 0;
             for(int i = 0; i < tt*3; i++) { double d = orig[i] - dec[i]; mse += d*d; }
             mse /= (tt*3);

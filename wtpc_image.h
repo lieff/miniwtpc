@@ -20,10 +20,11 @@
 
    unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info,
        int w, int h, int target_bytes, int quality, int chroma_420,
-       int huffman_mode, int huf_extra_ctx, int has_alpha);
+       int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
      Encode an RGB/RGBA image in memory. Returns malloc'd WTPC bitstream,
      or NULL on error. Caller must free().
-       rgb           : input pixels, w*h*3 bytes (RGB) or w*h*4 (RGBA).
+       rgb           : input pixels, h rows of stride bytes each.
+                        Each row has w pixels, 3 bytes/pixel (RGB) or 4 (RGBA).
        info          : output struct, filled with encoding details (may be NULL).
        w, h          : image dimensions (>= 1).
        target_bytes  : desired output size in bytes. 0 = use 'quality' instead.
@@ -38,6 +39,8 @@
        huf_extra_ctx : 0 = single Huffman table (faster),
                        1 = two context-switched tables (slightly better).
        has_alpha     : 0 = RGB (3 channels), 1 = RGBA (4 channels).
+       stride        : bytes per row (0 = tightly packed = w * pixel_bytes).
+                        Allows BMP-like padded data without repacking.
 
    unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len,
        int *w, int *h, int *out_quality, int *out_comp);
@@ -51,7 +54,7 @@
 
    int wtpc_encode_file(const char *out_path, const unsigned char *rgb,
        wtpc_enc_info *info, int w, int h, int target_bytes, int quality,
-       int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha);
+       int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
      Same as wtpc_encode_mem but writes directly to a file.
      Returns 0 on success, -1 on error.
 
@@ -113,11 +116,11 @@ typedef struct {
 } Bitstream;
 
 
-unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha);
+unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
 unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, int *h, int *out_quality, int *out_comp);
 
 #ifndef WTPC_NO_STDIO
-int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha);
+int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
 unsigned char *wtpc_decode_file(const char *in_path, int *w, int *h, int *out_quality, int *out_comp);
 #endif  /* WTPC_NO_STDIO */
 
@@ -224,16 +227,16 @@ static uint32_t get_eg(Bitstream *bs) {
 /* wavelet LL does not accumulate a large DC bias (halves worst-case LL coeff, */
 /* improving int16 headroom on large images and giving symmetric dead-zone). */
 static inline void rgb_to_yuv(uint8_t r, uint8_t g, uint8_t b, float *y, float *u, float *v) {
-    *y =  0.299f * r + 0.587f * g + 0.114f * b - 128.0f;
-    *u = -0.1687f * r - 0.3313f * g + 0.5f * b;
-    *v =  0.5f * r - 0.4187f * g - 0.0813f * b;
+    *y =  0.299000f * r + 0.587000f * g + 0.114000f * b - 128.0f;
+    *u = -0.168736f * r - 0.331264f * g + 0.500000f * b;
+    *v =  0.500000f * r - 0.418688f * g - 0.081312f * b;
 }
 
 static inline void yuv_to_rgb(float y, float u, float v, uint8_t *r, uint8_t *g, uint8_t *b) {
     y += 128.0f;
-    float r_f = y + 1.402f * v;
+    float r_f = y + 1.40200f * v;
     float g_f = y - 0.34414f * u - 0.71414f * v;
-    float b_f = y + 1.772f * u;
+    float b_f = y + 1.77200f * u;
     *r = (uint8_t)(r_f < 0 ? 0 : (r_f > 255 ? 255 : roundf(r_f)));
     *g = (uint8_t)(g_f < 0 ? 0 : (g_f > 255 ? 255 : roundf(g_f)));
     *b = (uint8_t)(b_f < 0 ? 0 : (b_f > 255 ? 255 : roundf(b_f)));
@@ -878,6 +881,642 @@ WTPC_INV_VERT (inv_vert_neon,  simdn_f, SIMDN_W, simdn)
 #undef WTPC_INV_VERT
 
 /* ================================================================
+ * Batch YUV <-> RGB conversion (SIMD-accelerated, row-stride-aware)
+ *   line_stride   : bytes between consecutive rows. 0 => w * pixel_stride.
+ *   pixel_stride  : bytes between consecutive pixels (3=RGB, 4=RGBA).
+ *   w, h          : image dimensions in pixels.
+ *   a / a_src     : optional alpha plane (NULL = no alpha).
+ * ================================================================ */
+static void rgb_to_yuv_batch_c(const uint8_t *rgb, int line_stride, int pixel_stride,
+                                int w, int h, float *y, float *u, float *v, float *a) {
+    if (line_stride <= 0) line_stride = w * pixel_stride;
+    if (a) {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w, *da = a + row * w;
+            for (int x = 0; x < w; x++) {
+                rgb_to_yuv(src[x*4], src[x*4+1], src[x*4+2], &dy[x], &du[x], &dv[x]);
+                da[x] = (float)src[x*4+3] - 128.0f;
+            }
+        }
+    } else {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            for (int x = 0; x < w; x++)
+                rgb_to_yuv(src[x*pixel_stride], src[x*pixel_stride+1], src[x*pixel_stride+2], &dy[x], &du[x], &dv[x]);
+        }
+    }
+}
+
+static void yuv_to_rgb_batch_c(const float *y, const float *u, const float *v, const float *a,
+                                int w, int h, uint8_t *rgb, int line_stride, int pixel_stride) {
+    if (line_stride <= 0) line_stride = w * pixel_stride;
+    if (a) {
+        for (int row = 0; row < h; row++) {
+            const float *sy = y + row * w, *su = u + row * w, *sv = v + row * w, *sa = a + row * w;
+            uint8_t *dst = rgb + row * line_stride;
+            for (int x = 0; x < w; x++) {
+                yuv_to_rgb(sy[x], su[x], sv[x], &dst[x*4], &dst[x*4+1], &dst[x*4+2]);
+                int av = (int)(sa[x] + 128.5f); if (av < 0) av = 0; if (av > 255) av = 255;
+                dst[x*4+3] = (uint8_t)av;
+            }
+        }
+    } else {
+        for (int row = 0; row < h; row++) {
+            const float *sy = y + row * w, *su = u + row * w, *sv = v + row * w;
+            uint8_t *dst = rgb + row * line_stride;
+            for (int x = 0; x < w; x++)
+                yuv_to_rgb(sy[x], su[x], sv[x], &dst[x*pixel_stride], &dst[x*pixel_stride+1], &dst[x*pixel_stride+2]);
+        }
+    }
+}
+
+#ifdef WTPC_HAS_SSE2
+static void rgb_to_yuv_batch_sse2(const uint8_t *rgb, int line_stride, int pixel_stride,
+                                   int w, int h, float *y, float *u, float *v, float *a) {
+    if (line_stride <= 0) line_stride = w * pixel_stride;
+    const __m128 cy_r = _mm_set1_ps(0.299000f),  cy_g = _mm_set1_ps(0.587000f),  cy_b = _mm_set1_ps(0.114000f);
+    const __m128 cu_r = _mm_set1_ps(-0.168736f), cu_g = _mm_set1_ps(-0.331264f), cu_b = _mm_set1_ps(0.500000f);
+    const __m128 cv_r = _mm_set1_ps(0.500000f),  cv_g = _mm_set1_ps(-0.418688f), cv_b = _mm_set1_ps(-0.081312f);
+    const __m128 v128 = _mm_set1_ps(128.0f);
+    const __m128i z = _mm_setzero_si128();
+    if (a) {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            float *da = a + row * w;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                __m128i rgba = _mm_loadu_si128((const __m128i*)(src + x * 4));
+                __m128i lo16 = _mm_unpacklo_epi8(rgba, z);
+                __m128i hi16 = _mm_unpackhi_epi8(rgba, z);
+                __m128i p0 = _mm_unpacklo_epi16(lo16, z);
+                __m128i p1 = _mm_unpackhi_epi16(lo16, z);
+                __m128i p2 = _mm_unpacklo_epi16(hi16, z);
+                __m128i p3 = _mm_unpackhi_epi16(hi16, z);
+                __m128 p0f = _mm_cvtepi32_ps(p0), p1f = _mm_cvtepi32_ps(p1);
+                __m128 p2f = _mm_cvtepi32_ps(p2), p3f = _mm_cvtepi32_ps(p3);
+                __m128 t01 = _mm_movelh_ps(p0f, p1f);
+                __m128 t23 = _mm_movelh_ps(p2f, p3f);
+                __m128 r   = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(2,0,2,0));
+                __m128 g   = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(3,1,3,1));
+                __m128 b01 = _mm_movehl_ps(p1f, p0f), b23 = _mm_movehl_ps(p3f, p2f);
+                __m128 b   = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(2,0,2,0));
+                _mm_storeu_ps(dy + x, _mm_sub_ps(
+                    _mm_add_ps(_mm_add_ps(_mm_mul_ps(r,cy_r), _mm_mul_ps(g,cy_g)), _mm_mul_ps(b,cy_b)), v128));
+                _mm_storeu_ps(du + x, _mm_add_ps(
+                    _mm_add_ps(_mm_mul_ps(r,cu_r), _mm_mul_ps(g,cu_g)), _mm_mul_ps(b,cu_b)));
+                _mm_storeu_ps(dv + x, _mm_add_ps(
+                    _mm_add_ps(_mm_mul_ps(r,cv_r), _mm_mul_ps(g,cv_g)), _mm_mul_ps(b,cv_b)));
+                _mm_storeu_ps(da + x, _mm_sub_ps(
+                    _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(3,1,3,1)), v128));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*4], src[x*4+1], src[x*4+2],
+                           &dy[x], &du[x], &dv[x]);
+                da[x] = (float)src[x*4+3] - 128.0f;
+            }
+        }
+    } else if (pixel_stride == 4) {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                __m128i rgba = _mm_loadu_si128((const __m128i*)(src + x * 4));
+                __m128i lo16 = _mm_unpacklo_epi8(rgba, z);
+                __m128i hi16 = _mm_unpackhi_epi8(rgba, z);
+                __m128i p0 = _mm_unpacklo_epi16(lo16, z);
+                __m128i p1 = _mm_unpackhi_epi16(lo16, z);
+                __m128i p2 = _mm_unpacklo_epi16(hi16, z);
+                __m128i p3 = _mm_unpackhi_epi16(hi16, z);
+                __m128 p0f = _mm_cvtepi32_ps(p0), p1f = _mm_cvtepi32_ps(p1);
+                __m128 p2f = _mm_cvtepi32_ps(p2), p3f = _mm_cvtepi32_ps(p3);
+                __m128 t01 = _mm_movelh_ps(p0f, p1f);
+                __m128 t23 = _mm_movelh_ps(p2f, p3f);
+                __m128 r   = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(2,0,2,0));
+                __m128 g   = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(3,1,3,1));
+                __m128 b01 = _mm_movehl_ps(p1f, p0f), b23 = _mm_movehl_ps(p3f, p2f);
+                __m128 b   = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(2,0,2,0));
+                _mm_storeu_ps(dy + x, _mm_sub_ps(
+                    _mm_add_ps(_mm_add_ps(_mm_mul_ps(r,cy_r), _mm_mul_ps(g,cy_g)), _mm_mul_ps(b,cy_b)), v128));
+                _mm_storeu_ps(du + x, _mm_add_ps(
+                    _mm_add_ps(_mm_mul_ps(r,cu_r), _mm_mul_ps(g,cu_g)), _mm_mul_ps(b,cu_b)));
+                _mm_storeu_ps(dv + x, _mm_add_ps(
+                    _mm_add_ps(_mm_mul_ps(r,cv_r), _mm_mul_ps(g,cv_g)), _mm_mul_ps(b,cv_b)));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*4], src[x*4+1], src[x*4+2], &dy[x], &du[x], &dv[x]);
+            }
+        }
+    } else {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                int off = x * pixel_stride;
+                __m128i ri = _mm_set_epi32(src[off+3*pixel_stride], src[off+2*pixel_stride], src[off+pixel_stride], src[off]);
+                __m128i gi = _mm_set_epi32(src[off+3*pixel_stride+1], src[off+2*pixel_stride+1], src[off+pixel_stride+1], src[off+1]);
+                __m128i bi = _mm_set_epi32(src[off+3*pixel_stride+2], src[off+2*pixel_stride+2], src[off+pixel_stride+2], src[off+2]);
+                __m128 rf = _mm_cvtepi32_ps(ri), gf = _mm_cvtepi32_ps(gi), bf = _mm_cvtepi32_ps(bi);
+                _mm_storeu_ps(dy + x, _mm_sub_ps(
+                    _mm_add_ps(_mm_add_ps(_mm_mul_ps(rf,cy_r), _mm_mul_ps(gf,cy_g)), _mm_mul_ps(bf,cy_b)), v128));
+                _mm_storeu_ps(du + x, _mm_add_ps(
+                    _mm_add_ps(_mm_mul_ps(rf,cu_r), _mm_mul_ps(gf,cu_g)), _mm_mul_ps(bf,cu_b)));
+                _mm_storeu_ps(dv + x, _mm_add_ps(
+                    _mm_add_ps(_mm_mul_ps(rf,cv_r), _mm_mul_ps(gf,cv_g)), _mm_mul_ps(bf,cv_b)));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*pixel_stride], src[x*pixel_stride+1], src[x*pixel_stride+2],
+                           &dy[x], &du[x], &dv[x]);
+            }
+        }
+    }
+}
+
+static void yuv_to_rgb_batch_sse2(const float *y, const float *u, const float *v, const float *a,
+                                   int w, int h, uint8_t *rgb, int line_stride, int pixel_stride) {
+    if (line_stride <= 0) line_stride = w * pixel_stride;
+    const __m128 v128 = _mm_set1_ps(128.0f), v255 = _mm_set1_ps(255.0f), v0 = _mm_setzero_ps();
+    const __m128 cr_v = _mm_set1_ps(1.40200f);
+    const __m128 cg_u = _mm_set1_ps(-0.34414f), cg_v = _mm_set1_ps(-0.71414f);
+    const __m128 cb_u = _mm_set1_ps(1.77200f);
+    if (a) {
+        for (int row = 0; row < h; row++) {
+            const float *sy = y + row * w, *su = u + row * w, *sv = v + row * w;
+            const float *sa = a + row * w;
+            uint8_t *dst = rgb + row * line_stride;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                __m128 yv = _mm_add_ps(_mm_loadu_ps(sy + x), v128);
+                __m128 uv = _mm_loadu_ps(su + x);
+                __m128 vv = _mm_loadu_ps(sv + x);
+                __m128 rv = _mm_add_ps(yv, _mm_mul_ps(vv, cr_v));
+                __m128 gv = _mm_add_ps(yv, _mm_add_ps(_mm_mul_ps(uv, cg_u), _mm_mul_ps(vv, cg_v)));
+                __m128 bv = _mm_add_ps(yv, _mm_mul_ps(uv, cb_u));
+                __m128 av = _mm_add_ps(_mm_loadu_ps(sa + x), v128);
+                rv = _mm_min_ps(_mm_max_ps(rv, v0), v255);
+                gv = _mm_min_ps(_mm_max_ps(gv, v0), v255);
+                bv = _mm_min_ps(_mm_max_ps(bv, v0), v255);
+                av = _mm_min_ps(_mm_max_ps(av, v0), v255);
+                __m128i ri = _mm_cvtps_epi32(rv), gi = _mm_cvtps_epi32(gv), bi = _mm_cvtps_epi32(bv), ai = _mm_cvtps_epi32(av);
+                int r_[4], g_[4], b_[4], a_[4];
+                _mm_storeu_si128((__m128i*)r_, ri); _mm_storeu_si128((__m128i*)g_, gi); _mm_storeu_si128((__m128i*)b_, bi); _mm_storeu_si128((__m128i*)a_, ai);
+                for (int j = 0; j < 4; j++) {
+                    dst[(x+j)*4+0] = (uint8_t)r_[j];
+                    dst[(x+j)*4+1] = (uint8_t)g_[j];
+                    dst[(x+j)*4+2] = (uint8_t)b_[j];
+                    dst[(x+j)*4+3] = (uint8_t)a_[j];
+                }
+            }
+            for (; x < w; x++) {
+                yuv_to_rgb(sy[x], su[x], sv[x], &dst[x*4], &dst[x*4+1], &dst[x*4+2]);
+                int av = (int)(sa[x] + 128.5f); if (av < 0) av = 0; if (av > 255) av = 255;
+                dst[x*4+3] = (uint8_t)av;
+            }
+        }
+    } else {
+        for (int row = 0; row < h; row++) {
+            const float *sy = y + row * w, *su = u + row * w, *sv = v + row * w;
+            uint8_t *dst = rgb + row * line_stride;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                __m128 yv = _mm_add_ps(_mm_loadu_ps(sy + x), v128);
+                __m128 uv = _mm_loadu_ps(su + x);
+                __m128 vv = _mm_loadu_ps(sv + x);
+                __m128 rv = _mm_add_ps(yv, _mm_mul_ps(vv, cr_v));
+                __m128 gv = _mm_add_ps(yv, _mm_add_ps(_mm_mul_ps(uv, cg_u), _mm_mul_ps(vv, cg_v)));
+                __m128 bv = _mm_add_ps(yv, _mm_mul_ps(uv, cb_u));
+                rv = _mm_min_ps(_mm_max_ps(rv, v0), v255);
+                gv = _mm_min_ps(_mm_max_ps(gv, v0), v255);
+                bv = _mm_min_ps(_mm_max_ps(bv, v0), v255);
+                __m128i ri = _mm_cvtps_epi32(rv), gi = _mm_cvtps_epi32(gv), bi = _mm_cvtps_epi32(bv);
+                int r_[4], g_[4], b_[4];
+                _mm_storeu_si128((__m128i*)r_, ri); _mm_storeu_si128((__m128i*)g_, gi); _mm_storeu_si128((__m128i*)b_, bi);
+                for (int j = 0; j < 4; j++) {
+                    dst[(x+j)*pixel_stride+0] = (uint8_t)r_[j];
+                    dst[(x+j)*pixel_stride+1] = (uint8_t)g_[j];
+                    dst[(x+j)*pixel_stride+2] = (uint8_t)b_[j];
+                }
+            }
+            for (; x < w; x++) {
+                yuv_to_rgb(sy[x], su[x], sv[x], &dst[x*pixel_stride], &dst[x*pixel_stride+1], &dst[x*pixel_stride+2]);
+            }
+        }
+    }
+}
+#endif /* WTPC_HAS_SSE2 */
+
+#ifdef WTPC_HAS_AVX
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC push_options
+#pragma GCC target("avx")
+#endif
+static void rgb_to_yuv_batch_avx(const uint8_t *rgb, int line_stride, int pixel_stride,
+                                  int w, int h, float *y, float *u, float *v, float *a) {
+    if (line_stride <= 0) line_stride = w * pixel_stride;
+    const __m256 cy_r = _mm256_set1_ps(0.299000f),  cy_g = _mm256_set1_ps(0.587000f),  cy_b = _mm256_set1_ps(0.114000f);
+    const __m256 cu_r = _mm256_set1_ps(-0.168736f), cu_g = _mm256_set1_ps(-0.331264f), cu_b = _mm256_set1_ps(0.500000f);
+    const __m256 cv_r = _mm256_set1_ps(0.500000f),  cv_g = _mm256_set1_ps(-0.418688f), cv_b = _mm256_set1_ps(-0.081312f);
+    const __m256 v128 = _mm256_set1_ps(128.0f);
+    const __m128i z = _mm_setzero_si128();
+    if (a) {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            float *da = a + row * w;
+            int x = 0;
+            for (; x + 7 < w; x += 8) {
+                __m128 r0, g0, b0, r1, g1, b1, a0, a1;
+                {
+                    __m128i rgba = _mm_loadu_si128((const __m128i*)(src + x * 4));
+                    __m128i lo16 = _mm_unpacklo_epi8(rgba, z);
+                    __m128i hi16 = _mm_unpackhi_epi8(rgba, z);
+                    __m128 p0f = _mm_cvtepi32_ps(_mm_unpacklo_epi16(lo16, z));
+                    __m128 p1f = _mm_cvtepi32_ps(_mm_unpackhi_epi16(lo16, z));
+                    __m128 p2f = _mm_cvtepi32_ps(_mm_unpacklo_epi16(hi16, z));
+                    __m128 p3f = _mm_cvtepi32_ps(_mm_unpackhi_epi16(hi16, z));
+                    __m128 t01 = _mm_movelh_ps(p0f, p1f);
+                    __m128 t23 = _mm_movelh_ps(p2f, p3f);
+                    r0 = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(2,0,2,0));
+                    g0 = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(3,1,3,1));
+                    __m128 b01 = _mm_movehl_ps(p1f, p0f), b23 = _mm_movehl_ps(p3f, p2f);
+                    b0 = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(2,0,2,0));
+                    a0 = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(3,1,3,1));
+                }
+                {
+                    __m128i rgba = _mm_loadu_si128((const __m128i*)(src + (x+4) * 4));
+                    __m128i lo16 = _mm_unpacklo_epi8(rgba, z);
+                    __m128i hi16 = _mm_unpackhi_epi8(rgba, z);
+                    __m128 p0f = _mm_cvtepi32_ps(_mm_unpacklo_epi16(lo16, z));
+                    __m128 p1f = _mm_cvtepi32_ps(_mm_unpackhi_epi16(lo16, z));
+                    __m128 p2f = _mm_cvtepi32_ps(_mm_unpacklo_epi16(hi16, z));
+                    __m128 p3f = _mm_cvtepi32_ps(_mm_unpackhi_epi16(hi16, z));
+                    __m128 t01 = _mm_movelh_ps(p0f, p1f);
+                    __m128 t23 = _mm_movelh_ps(p2f, p3f);
+                    r1 = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(2,0,2,0));
+                    g1 = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(3,1,3,1));
+                    __m128 b01 = _mm_movehl_ps(p1f, p0f), b23 = _mm_movehl_ps(p3f, p2f);
+                    b1 = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(2,0,2,0));
+                    a1 = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(3,1,3,1));
+                }
+                __m256 r = _mm256_insertf128_ps(_mm256_castps128_ps256(r0), r1, 1);
+                __m256 g = _mm256_insertf128_ps(_mm256_castps128_ps256(g0), g1, 1);
+                __m256 b = _mm256_insertf128_ps(_mm256_castps128_ps256(b0), b1, 1);
+                __m256 a256 = _mm256_insertf128_ps(_mm256_castps128_ps256(a0), a1, 1);
+                _mm256_storeu_ps(da + x, _mm256_sub_ps(a256, v128));
+                _mm256_storeu_ps(dy + x, _mm256_sub_ps(
+                    _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(r,cy_r), _mm256_mul_ps(g,cy_g)), _mm256_mul_ps(b,cy_b)), v128));
+                _mm256_storeu_ps(du + x, _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(r,cu_r), _mm256_mul_ps(g,cu_g)), _mm256_mul_ps(b,cu_b)));
+                _mm256_storeu_ps(dv + x, _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(r,cv_r), _mm256_mul_ps(g,cv_g)), _mm256_mul_ps(b,cv_b)));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*4], src[x*4+1], src[x*4+2], &dy[x], &du[x], &dv[x]);
+                da[x] = (float)src[x*4+3] - 128.0f;
+            }
+        }
+    } else if (pixel_stride == 4) {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            int x = 0;
+            for (; x + 7 < w; x += 8) {
+                __m128 r0, g0, b0, r1, g1, b1;
+                {
+                    __m128i rgba = _mm_loadu_si128((const __m128i*)(src + x * 4));
+                    __m128i lo16 = _mm_unpacklo_epi8(rgba, z);
+                    __m128i hi16 = _mm_unpackhi_epi8(rgba, z);
+                    __m128 p0f = _mm_cvtepi32_ps(_mm_unpacklo_epi16(lo16, z));
+                    __m128 p1f = _mm_cvtepi32_ps(_mm_unpackhi_epi16(lo16, z));
+                    __m128 p2f = _mm_cvtepi32_ps(_mm_unpacklo_epi16(hi16, z));
+                    __m128 p3f = _mm_cvtepi32_ps(_mm_unpackhi_epi16(hi16, z));
+                    __m128 t01 = _mm_movelh_ps(p0f, p1f);
+                    __m128 t23 = _mm_movelh_ps(p2f, p3f);
+                    r0 = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(2,0,2,0));
+                    g0 = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(3,1,3,1));
+                    __m128 b01 = _mm_movehl_ps(p1f, p0f), b23 = _mm_movehl_ps(p3f, p2f);
+                    b0 = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(2,0,2,0));
+                }
+                {
+                    __m128i rgba = _mm_loadu_si128((const __m128i*)(src + (x+4) * 4));
+                    __m128i lo16 = _mm_unpacklo_epi8(rgba, z);
+                    __m128i hi16 = _mm_unpackhi_epi8(rgba, z);
+                    __m128 p0f = _mm_cvtepi32_ps(_mm_unpacklo_epi16(lo16, z));
+                    __m128 p1f = _mm_cvtepi32_ps(_mm_unpackhi_epi16(lo16, z));
+                    __m128 p2f = _mm_cvtepi32_ps(_mm_unpacklo_epi16(hi16, z));
+                    __m128 p3f = _mm_cvtepi32_ps(_mm_unpackhi_epi16(hi16, z));
+                    __m128 t01 = _mm_movelh_ps(p0f, p1f);
+                    __m128 t23 = _mm_movelh_ps(p2f, p3f);
+                    r1 = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(2,0,2,0));
+                    g1 = _mm_shuffle_ps(t01, t23, _MM_SHUFFLE(3,1,3,1));
+                    __m128 b01 = _mm_movehl_ps(p1f, p0f), b23 = _mm_movehl_ps(p3f, p2f);
+                    b1 = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(2,0,2,0));
+                }
+                __m256 r = _mm256_insertf128_ps(_mm256_castps128_ps256(r0), r1, 1);
+                __m256 g = _mm256_insertf128_ps(_mm256_castps128_ps256(g0), g1, 1);
+                __m256 b = _mm256_insertf128_ps(_mm256_castps128_ps256(b0), b1, 1);
+                _mm256_storeu_ps(dy + x, _mm256_sub_ps(
+                    _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(r,cy_r), _mm256_mul_ps(g,cy_g)), _mm256_mul_ps(b,cy_b)), v128));
+                _mm256_storeu_ps(du + x, _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(r,cu_r), _mm256_mul_ps(g,cu_g)), _mm256_mul_ps(b,cu_b)));
+                _mm256_storeu_ps(dv + x, _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(r,cv_r), _mm256_mul_ps(g,cv_g)), _mm256_mul_ps(b,cv_b)));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*4], src[x*4+1], src[x*4+2], &dy[x], &du[x], &dv[x]);
+            }
+        }
+    } else {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            int x = 0;
+            for (; x + 7 < w; x += 8) {
+                int o0 = x * pixel_stride, o1 = (x+4) * pixel_stride;
+                __m128i r0i = _mm_set_epi32(src[o0+3*pixel_stride], src[o0+2*pixel_stride], src[o0+pixel_stride], src[o0]);
+                __m128i g0i = _mm_set_epi32(src[o0+3*pixel_stride+1], src[o0+2*pixel_stride+1], src[o0+pixel_stride+1], src[o0+1]);
+                __m128i b0i = _mm_set_epi32(src[o0+3*pixel_stride+2], src[o0+2*pixel_stride+2], src[o0+pixel_stride+2], src[o0+2]);
+                __m128i r1i = _mm_set_epi32(src[o1+3*pixel_stride], src[o1+2*pixel_stride], src[o1+pixel_stride], src[o1]);
+                __m128i g1i = _mm_set_epi32(src[o1+3*pixel_stride+1], src[o1+2*pixel_stride+1], src[o1+pixel_stride+1], src[o1+1]);
+                __m128i b1i = _mm_set_epi32(src[o1+3*pixel_stride+2], src[o1+2*pixel_stride+2], src[o1+pixel_stride+2], src[o1+2]);
+                __m256 r = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(r0i)), _mm_cvtepi32_ps(r1i), 1);
+                __m256 g = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(g0i)), _mm_cvtepi32_ps(g1i), 1);
+                __m256 b = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(b0i)), _mm_cvtepi32_ps(b1i), 1);
+                _mm256_storeu_ps(dy + x, _mm256_sub_ps(
+                    _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(r,cy_r), _mm256_mul_ps(g,cy_g)), _mm256_mul_ps(b,cy_b)), v128));
+                _mm256_storeu_ps(du + x, _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(r,cu_r), _mm256_mul_ps(g,cu_g)), _mm256_mul_ps(b,cu_b)));
+                _mm256_storeu_ps(dv + x, _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(r,cv_r), _mm256_mul_ps(g,cv_g)), _mm256_mul_ps(b,cv_b)));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*pixel_stride], src[x*pixel_stride+1], src[x*pixel_stride+2],
+                           &dy[x], &du[x], &dv[x]);
+            }
+        }
+    }
+}
+
+static void yuv_to_rgb_batch_avx(const float *y, const float *u, const float *v, const float *a,
+                                  int w, int h, uint8_t *rgb, int line_stride, int pixel_stride) {
+    if (line_stride <= 0) line_stride = w * pixel_stride;
+    const __m256 v128 = _mm256_set1_ps(128.0f), v255 = _mm256_set1_ps(255.0f), v0 = _mm256_setzero_ps();
+    const __m256 cr_v = _mm256_set1_ps(1.40200f);
+    const __m256 cg_u = _mm256_set1_ps(-0.34414f), cg_v = _mm256_set1_ps(-0.71414f);
+    const __m256 cb_u = _mm256_set1_ps(1.77200f);
+    if (a) {
+        for (int row = 0; row < h; row++) {
+            const float *sy = y + row * w, *su = u + row * w, *sv = v + row * w;
+            const float *sa = a + row * w;
+            uint8_t *dst = rgb + row * line_stride;
+            int x = 0;
+            for (; x + 7 < w; x += 8) {
+                __m256 yv = _mm256_add_ps(_mm256_loadu_ps(sy + x), v128);
+                __m256 uv = _mm256_loadu_ps(su + x);
+                __m256 vv = _mm256_loadu_ps(sv + x);
+                __m256 rv = _mm256_add_ps(yv, _mm256_mul_ps(vv, cr_v));
+                __m256 gv = _mm256_add_ps(yv, _mm256_add_ps(_mm256_mul_ps(uv, cg_u), _mm256_mul_ps(vv, cg_v)));
+                __m256 bv = _mm256_add_ps(yv, _mm256_mul_ps(uv, cb_u));
+                __m256 av = _mm256_add_ps(_mm256_loadu_ps(sa + x), v128);
+                rv = _mm256_min_ps(_mm256_max_ps(rv, v0), v255);
+                gv = _mm256_min_ps(_mm256_max_ps(gv, v0), v255);
+                bv = _mm256_min_ps(_mm256_max_ps(bv, v0), v255);
+                av = _mm256_min_ps(_mm256_max_ps(av, v0), v255);
+                int r_[8], g_[8], b_[8], a_[8];
+                _mm256_storeu_si256((__m256i*)r_, _mm256_cvtps_epi32(rv));
+                _mm256_storeu_si256((__m256i*)g_, _mm256_cvtps_epi32(gv));
+                _mm256_storeu_si256((__m256i*)b_, _mm256_cvtps_epi32(bv));
+                _mm256_storeu_si256((__m256i*)a_, _mm256_cvtps_epi32(av));
+                for (int j = 0; j < 8; j++) {
+                    dst[(x+j)*4+0] = (uint8_t)r_[j];
+                    dst[(x+j)*4+1] = (uint8_t)g_[j];
+                    dst[(x+j)*4+2] = (uint8_t)b_[j];
+                    dst[(x+j)*4+3] = (uint8_t)a_[j];
+                }
+            }
+            for (; x < w; x++) {
+                yuv_to_rgb(sy[x], su[x], sv[x], &dst[x*4], &dst[x*4+1], &dst[x*4+2]);
+                int av = (int)(sa[x] + 128.5f); if (av < 0) av = 0; if (av > 255) av = 255;
+                dst[x*4+3] = (uint8_t)av;
+            }
+        }
+    } else {
+        for (int row = 0; row < h; row++) {
+            const float *sy = y + row * w, *su = u + row * w, *sv = v + row * w;
+            uint8_t *dst = rgb + row * line_stride;
+            int x = 0;
+            for (; x + 7 < w; x += 8) {
+                __m256 yv = _mm256_add_ps(_mm256_loadu_ps(sy + x), v128);
+                __m256 uv = _mm256_loadu_ps(su + x);
+                __m256 vv = _mm256_loadu_ps(sv + x);
+                __m256 rv = _mm256_add_ps(yv, _mm256_mul_ps(vv, cr_v));
+                __m256 gv = _mm256_add_ps(yv, _mm256_add_ps(_mm256_mul_ps(uv, cg_u), _mm256_mul_ps(vv, cg_v)));
+                __m256 bv = _mm256_add_ps(yv, _mm256_mul_ps(uv, cb_u));
+                rv = _mm256_min_ps(_mm256_max_ps(rv, v0), v255);
+                gv = _mm256_min_ps(_mm256_max_ps(gv, v0), v255);
+                bv = _mm256_min_ps(_mm256_max_ps(bv, v0), v255);
+                int r_[8], g_[8], b_[8];
+                _mm256_storeu_si256((__m256i*)r_, _mm256_cvtps_epi32(rv));
+                _mm256_storeu_si256((__m256i*)g_, _mm256_cvtps_epi32(gv));
+                _mm256_storeu_si256((__m256i*)b_, _mm256_cvtps_epi32(bv));
+                for (int j = 0; j < 8; j++) {
+                    dst[(x+j)*pixel_stride+0] = (uint8_t)r_[j];
+                    dst[(x+j)*pixel_stride+1] = (uint8_t)g_[j];
+                    dst[(x+j)*pixel_stride+2] = (uint8_t)b_[j];
+                }
+            }
+            for (; x < w; x++) {
+                yuv_to_rgb(sy[x], su[x], sv[x], &dst[x*pixel_stride], &dst[x*pixel_stride+1], &dst[x*pixel_stride+2]);
+            }
+        }
+    }
+}
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#endif
+#endif /* WTPC_HAS_AVX */
+
+/* --- NEON batch (4 pixels at a time) --- */
+#ifdef WTPC_HAS_NEON
+static void rgb_to_yuv_batch_neon(const uint8_t *rgb, int line_stride, int pixel_stride,
+                                   int w, int h, float *y, float *u, float *v, float *a) {
+    if (line_stride <= 0) line_stride = w * pixel_stride;
+    const float32x4_t cy_r = vdupq_n_f32(0.299000f),  cy_g = vdupq_n_f32(0.587000f),  cy_b = vdupq_n_f32(0.114000f);
+    const float32x4_t cu_r = vdupq_n_f32(-0.168736f), cu_g = vdupq_n_f32(-0.331264f), cu_b = vdupq_n_f32(0.500000f);
+    const float32x4_t cv_r = vdupq_n_f32(0.500000f),  cv_g = vdupq_n_f32(-0.418688f), cv_b = vdupq_n_f32(-0.081312f);
+    const float32x4_t v128 = vdupq_n_f32(128.0f);
+    if (a) {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            float *da = a + row * w;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                uint8x16x4_t rgba = vld4q_u8(src + x * 4);
+                float32x4_t rf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(rgba.val[0])))));
+                float32x4_t gf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(rgba.val[1])))));
+                float32x4_t bf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(rgba.val[2])))));
+                float32x4_t af = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(rgba.val[3])))));
+                vst1q_f32(dy + x, vsubq_f32(vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cy_r), gf,cy_g), bf,cy_b), v128));
+                vst1q_f32(du + x, vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cu_r), gf,cu_g), bf,cu_b));
+                vst1q_f32(dv + x, vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cv_r), gf,cv_g), bf,cv_b));
+                vst1q_f32(da + x, vsubq_f32(af, v128));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*4], src[x*4+1], src[x*4+2], &dy[x], &du[x], &dv[x]);
+                da[x] = (float)src[x*4+3] - 128.0f;
+            }
+        }
+    } else if (pixel_stride == 4) {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                uint8x16x4_t rgba = vld4q_u8(src + x * 4);
+                float32x4_t rf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(rgba.val[0])))));
+                float32x4_t gf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(rgba.val[1])))));
+                float32x4_t bf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(rgba.val[2])))));
+                vst1q_f32(dy + x, vsubq_f32(vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cy_r), gf,cy_g), bf,cy_b), v128));
+                vst1q_f32(du + x, vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cu_r), gf,cu_g), bf,cu_b));
+                vst1q_f32(dv + x, vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cv_r), gf,cv_g), bf,cv_b));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*4], src[x*4+1], src[x*4+2],
+                           &dy[x], &du[x], &dv[x]);
+            }
+        }
+    } else {
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = rgb + row * line_stride;
+            float *dy = y + row * w, *du = u + row * w, *dv = v + row * w;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                uint8_t r8[4], g8[4], b8[4];
+                for (int j = 0; j < 4; j++) {
+                    r8[j] = src[(x+j)*pixel_stride];
+                    g8[j] = src[(x+j)*pixel_stride+1];
+                    b8[j] = src[(x+j)*pixel_stride+2];
+                }
+                uint8x8_t rv8 = vld1_u8(r8), gv8 = vld1_u8(g8), bv8 = vld1_u8(b8);
+                float32x4_t rf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(rv8))));
+                float32x4_t gf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(gv8))));
+                float32x4_t bf = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(bv8))));
+                vst1q_f32(dy + x, vsubq_f32(vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cy_r), gf,cy_g), bf,cy_b), v128));
+                vst1q_f32(du + x, vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cu_r), gf,cu_g), bf,cu_b));
+                vst1q_f32(dv + x, vmlaq_f32(vmlaq_f32(vmulq_f32(rf,cv_r), gf,cv_g), bf,cv_b));
+            }
+            for (; x < w; x++) {
+                rgb_to_yuv(src[x*pixel_stride], src[x*pixel_stride+1], src[x*pixel_stride+2], &dy[x], &du[x], &dv[x]);
+            }
+        }
+    }
+}
+
+static void yuv_to_rgb_batch_neon(const float *y, const float *u, const float *v, const float *a,
+                                   int w, int h, uint8_t *rgb, int line_stride, int pixel_stride) {
+    if (line_stride <= 0) line_stride = w * pixel_stride;
+    const float32x4_t v128 = vdupq_n_f32(128.0f), v255 = vdupq_n_f32(255.0f), v0 = vdupq_n_f32(0.0f);
+    const float32x4_t cr_v = vdupq_n_f32(1.40200f);
+    const float32x4_t cg_u = vdupq_n_f32(-0.34414f), cg_v = vdupq_n_f32(-0.71414f);
+    const float32x4_t cb_u = vdupq_n_f32(1.77200f);
+    if (a) {
+        for (int row = 0; row < h; row++) {
+            const float *sy = y + row * w, *su = u + row * w, *sv = v + row * w;
+            const float *sa = a + row * w;
+            uint8_t *dst = rgb + row * line_stride;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                float32x4_t yv = vaddq_f32(vld1q_f32(sy + x), v128);
+                float32x4_t uv = vld1q_f32(su + x);
+                float32x4_t vv = vld1q_f32(sv + x);
+                float32x4_t rv = vmaxq_f32(vminq_f32(vmlaq_f32(yv, vv, cr_v), v255), v0);
+                float32x4_t gv = vmaxq_f32(vminq_f32(vmlaq_f32(vmlaq_f32(yv, uv, cg_u), vv, cg_v), v255), v0);
+                float32x4_t bv = vmaxq_f32(vminq_f32(vmlaq_f32(yv, uv, cb_u), v255), v0);
+                float32x4_t av = vmaxq_f32(vminq_f32(vaddq_f32(vld1q_f32(sa + x), v128), v255), v0);
+                int r_[4], g_[4], b_[4], a_[4];
+                vst1q_s32(r_, vcvtq_s32_f32(rv));
+                vst1q_s32(g_, vcvtq_s32_f32(gv));
+                vst1q_s32(b_, vcvtq_s32_f32(bv));
+                vst1q_s32(a_, vcvtq_s32_f32(av));
+                for (int j = 0; j < 4; j++) {
+                    dst[(x+j)*4+0] = (uint8_t)r_[j];
+                    dst[(x+j)*4+1] = (uint8_t)g_[j];
+                    dst[(x+j)*4+2] = (uint8_t)b_[j];
+                    dst[(x+j)*4+3] = (uint8_t)a_[j];
+                }
+            }
+            for (; x < w; x++) {
+                yuv_to_rgb(sy[x], su[x], sv[x], &dst[x*4], &dst[x*4+1], &dst[x*4+2]);
+                int av = (int)(sa[x] + 128.5f); if (av < 0) av = 0; if (av > 255) av = 255;
+                dst[x*4+3] = (uint8_t)av;
+            }
+        }
+    } else {
+        for (int row = 0; row < h; row++) {
+            const float *sy = y + row * w, *su = u + row * w, *sv = v + row * w;
+            uint8_t *dst = rgb + row * line_stride;
+            int x = 0;
+            for (; x + 3 < w; x += 4) {
+                float32x4_t yv = vaddq_f32(vld1q_f32(sy + x), v128);
+                float32x4_t uv = vld1q_f32(su + x);
+                float32x4_t vv = vld1q_f32(sv + x);
+                float32x4_t rv = vmaxq_f32(vminq_f32(vmlaq_f32(yv, vv, cr_v), v255), v0);
+                float32x4_t gv = vmaxq_f32(vminq_f32(vmlaq_f32(vmlaq_f32(yv, uv, cg_u), vv, cg_v), v255), v0);
+                float32x4_t bv = vmaxq_f32(vminq_f32(vmlaq_f32(yv, uv, cb_u), v255), v0);
+                int r_[4], g_[4], b_[4];
+                vst1q_s32(r_, vcvtq_s32_f32(rv));
+                vst1q_s32(g_, vcvtq_s32_f32(gv));
+                vst1q_s32(b_, vcvtq_s32_f32(bv));
+                for (int j = 0; j < 4; j++) {
+                    dst[(x+j)*pixel_stride+0] = (uint8_t)r_[j];
+                    dst[(x+j)*pixel_stride+1] = (uint8_t)g_[j];
+                    dst[(x+j)*pixel_stride+2] = (uint8_t)b_[j];
+                }
+            }
+            for (; x < w; x++) {
+                yuv_to_rgb(sy[x], su[x], sv[x], &dst[x*pixel_stride], &dst[x*pixel_stride+1], &dst[x*pixel_stride+2]);
+            }
+        }
+    }
+}
+#endif /* WTPC_HAS_NEON */
+
+static void rgb_to_yuv_batch(const uint8_t *rgb, int line_stride, int pixel_stride,
+                              int w, int h, float *y, float *u, float *v, float *a) {
+    wtpc_cpu_init_();
+#if defined(WTPC_HAS_AVX)
+    if (wtpc_cpu_flags_ & WTPC_CPU_AVX)  { rgb_to_yuv_batch_avx(rgb, line_stride, pixel_stride, w, h, y, u, v, a); return; }
+#endif
+#if defined(WTPC_HAS_SSE2)
+    if (wtpc_cpu_flags_ & WTPC_CPU_SSE2) { rgb_to_yuv_batch_sse2(rgb, line_stride, pixel_stride, w, h, y, u, v, a); return; }
+#endif
+#if defined(WTPC_HAS_NEON)
+    if (wtpc_cpu_flags_ & WTPC_CPU_NEON) { rgb_to_yuv_batch_neon(rgb, line_stride, pixel_stride, w, h, y, u, v, a); return; }
+#endif
+    rgb_to_yuv_batch_c(rgb, line_stride, pixel_stride, w, h, y, u, v, a);
+}
+
+static void yuv_to_rgb_batch(const float *y, const float *u, const float *v, const float *a,
+                              int w, int h, uint8_t *rgb, int line_stride, int pixel_stride) {
+    wtpc_cpu_init_();
+#if defined(WTPC_HAS_AVX)
+    if (wtpc_cpu_flags_ & WTPC_CPU_AVX)  { yuv_to_rgb_batch_avx(y, u, v, a, w, h, rgb, line_stride, pixel_stride); return; }
+#endif
+#if defined(WTPC_HAS_SSE2)
+    if (wtpc_cpu_flags_ & WTPC_CPU_SSE2) { yuv_to_rgb_batch_sse2(y, u, v, a, w, h, rgb, line_stride, pixel_stride); return; }
+#endif
+#if defined(WTPC_HAS_NEON)
+    if (wtpc_cpu_flags_ & WTPC_CPU_NEON) { yuv_to_rgb_batch_neon(y, u, v, a, w, h, rgb, line_stride, pixel_stride); return; }
+#endif
+    yuv_to_rgb_batch_c(y, u, v, a, w, h, rgb, line_stride, pixel_stride);
+}
+
+/* ================================================================
  * Top-level 2D transforms - one per variant
  * ================================================================ */
 #ifdef WTPC_HAS_SSE2
@@ -1224,17 +1863,31 @@ static void cdf97_inverse_2d(float *data, int width, int height) {
 #define WTPC_TABLES_CONST const
 #endif
 #define MAX_BANDS 8
+#ifndef WTPC_EXTERNAL_TABLES
 /* MAX_BANDS multipliers + 1 DZ at [MAX_BANDS] */
-static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS+1]    = {0.41f, 0.21f, 0.18f, 0.19f, 0.27f, 0.51f, 1.17f, 3.31f, 0.56f};
-static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS+1]    = {0.43f, 0.26f, 0.29f, 0.42f, 0.77f, 1.55f, 3.19f, 6.89f, 0.63f};
-static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS+1] = {0.20f, 0.17f, 0.20f, 0.29f, 0.53f, 1.10f, 2.16f, 4.21f, 0.61f};
+static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS+1]    = {0.37f, 0.18f, 0.16f, 0.17f, 0.24f, 0.46f, 1.10f, 3.16f, 0.55f};
+static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS+1]    = {0.37f, 0.20f, 0.25f, 0.38f, 0.65f, 1.29f, 2.61f, 6.41f, 0.66f};
+static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS+1] = {0.21f, 0.14f, 0.17f, 0.28f, 0.51f, 0.99f, 2.05f, 4.20f, 0.62f};
+#endif
 
+/* Quantization step base as a function of quality (1..MAX_QUALITY).               */
+/* Geometric (exponential) scale: base(q) = WTPC_BASE_MIN * r^(q-1), where         */
+/* r = (WTPC_BASE_MAX/WTPC_BASE_MIN)^(1/(MAX_QUALITY-1)).                          */
+/*   - base(1) < 1 gives head-room for high quality (fine steps at large targets). */
+/*   - base(MAX) is coarse enough to guarantee a small (<=180 B) guard encode      */
+/*     without inflating the quant tables.                                         */
+/*   - it is smooth, so find_quality_for_target() can invert it analytically.      */
+/* NOTE: this is part of the bitstream format -- quality is stored in the header   */
+/* and the decoder recovers the step via compute_base(). Changing these constants  */
+/* changes the format.                                                             */
+#define WTPC_BASE_MIN 0.45f
+#define WTPC_BASE_MAX 2000.0f
+/* Per-quality geometric ratio r. Computed once; ln(r) used by the inverse. */
+#define WTPC_BASE_LOG_RATIO (logf(WTPC_BASE_MAX / WTPC_BASE_MIN) / (float)(MAX_QUALITY - 1))
 static inline float compute_base(int quality) {
-    float q_eff;
-    if      (quality <= 30)  q_eff = 1.0f + (quality - 1) * 0.1f;
-    else if (quality <= 80)  q_eff = 4.0f + (quality - 31) * 0.2f;
-    else                     q_eff = 14.0f + (quality - 81) * 1.0f;
-    return q_eff;
+    if (quality < 1) quality = 1;
+    if (quality > MAX_QUALITY) quality = MAX_QUALITY;
+    return WTPC_BASE_MIN * expf((float)(quality - 1) * WTPC_BASE_LOG_RATIO);
 }
 
 /* Pre-compute LL sizes from coarsest (1x1) to finest (w h). */
@@ -1716,7 +2369,7 @@ static int measure_encode_bits_ctx(const int16_t *d, int sz,
 }
 
 /* ===================================================================== */
-/*  Default Huffman tables. Auto-generated from 2816 images. Quality levels: {400,200,100,50,20,8,3} */
+/*  Default Huffman tables. Auto-generated from 2816 images. Quality levels: see generate_tables() */
 /*  single table: for huf_extra_ctx=0 (all coefficients, 7 levels) */
 /*  t0 tables: prev-cat <= 2 (small coefficients, 3-bit selector) */
 /*  t1 tables: prev-cat > 2 (large coefficients, 7 levels, 3-bit selector) */
@@ -2178,9 +2831,8 @@ static int bac_decode(BacDec *d, BacModel *m) {
 #define CTX_REF 8
 #define TOTAL_CTX (CTX_SIG + CTX_SGN + CTX_REF)
 
-/* Per-coefficient state for EBCOT */
-/* We store significance as a bitmask: bit 0 = significant, bits 1-7 = unused */
-/* For simplicity use a uint8_t array: 0=not significant, 1=significant */
+/* Per-coefficient state: sig + neighbour count, merged for cache */
+typedef struct { uint8_t sig, nsig; } EbcotCtx;
 
 /* Encode one channel using EBCOT-lite into an existing BAC encoder. */
 /* Returns number of bit-planes (bp). */
@@ -2197,21 +2849,11 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
     while (max_val > 0) { bp++; max_val >>= 1; }
     if (bp == 0) bp = 1;
 
-    /* Context models */
     BacModel models[TOTAL_CTX];
     for (int i = 0; i < TOTAL_CTX; i++) bacm_init_ctx(&models[i], i);
 
-    /* Significance map */
-    uint8_t *sig = (uint8_t*)calloc((size_t)total, 1);
-    if (!sig) return 0;
-    /* Neighbour-significance counts, maintained incrementally: nsig[i] = number  */
-    /* of the 8 neighbours of i that are already significant. Significance is     */
-    /* monotone (0->1, never reset), so instead of rescanning the 3x3 window for  */
-    /* every coefficient of every bit-plane we bump the 8 neighbours' counts once */
-    /* when a coefficient becomes significant. Reading nsig[i] (clamped to 4) is  */
-    /* bit-identical to the old fresh sum. */
-    uint8_t *nsig = (uint8_t*)calloc((size_t)total, 1);
-    if (!nsig) { free(sig); return 0; }
+    EbcotCtx *ctx = (EbcotCtx*)calloc((size_t)total, sizeof(EbcotCtx));
+    if (!ctx) return 0;
 
     /* For each bit-plane (MSB first) */
     for (int b = bp - 1; b >= 0; b--) {
@@ -2220,33 +2862,33 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
             if (x == w) { x = 0; y++; }
             int16_t v = coeffs[i];
 
-            int ctx_sig = nsig[i];
+            int ctx_sig = ctx[i].nsig;
             if (ctx_sig > 4) ctx_sig = 4;
 
-            if (!sig[i]) {
+            if (!ctx[i].sig) {
                 /* Parent context: inter-scale correlation - coefficient at (x>>1,y>>1) */
                 /* in the next coarser subband. If parent is already significant, */
                 /* children are much more likely to become significant. */
                 int sctx = ctx_sig;
                 int px = x >> 1, py = y >> 1;
-                if ((x > 0 || y > 0) && sig[py * w + px]) sctx += 5;
+                if ((x > 0 || y > 0) && ctx[py * w + px].sig) sctx += 5;
                 int is_sig = (abs(v) & bit_mask) != 0;
                 bac_encode(e, is_sig, &models[sctx]);
                 if (is_sig) {
-                    sig[i] = 1;
+                    ctx[i].sig = 1;
                     /* Bump neighbour counts (monotone; in-bounds only, matching the */
                     /* old border-skipping fresh sum). */
                     int y0 = y > 0, y1 = y + 1 < h, x0 = x > 0, x1 = x + 1 < w;
-                    if (y0) { if (x0) nsig[i-w-1]++; nsig[i-w]++; if (x1) nsig[i-w+1]++; }
-                    if (x0) nsig[i-1]++;
-                    if (x1) nsig[i+1]++;
-                    if (y1) { if (x0) nsig[i+w-1]++; nsig[i+w]++; if (x1) nsig[i+w+1]++; }
+                    if (y0) { if (x0) ctx[i-w-1].nsig++; ctx[i-w].nsig++; if (x1) ctx[i-w+1].nsig++; }
+                    if (x0) ctx[i-1].nsig++;
+                    if (x1) ctx[i+1].nsig++;
+                    if (y1) { if (x0) ctx[i+w-1].nsig++; ctx[i+w].nsig++; if (x1) ctx[i+w+1].nsig++; }
                     int ctx_sgn = 2, sgn_sum = 0;
                     for (int dy = -1; dy <= 1; dy++) {
                         for (int dx = -1; dx <= 1; dx++) {
                             if (dx == 0 && dy == 0) continue;
                             int nx = x + dx, ny = y + dy;
-                            if (nx >= 0 && nx < w && ny >= 0 && ny < h && sig[ny * w + nx])
+                            if (nx >= 0 && nx < w && ny >= 0 && ny < h && ctx[ny * w + nx].sig)
                                 sgn_sum += (coeffs[ny * w + nx] > 0) ? 1 : -1;
                         }
                     }
@@ -2268,8 +2910,7 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
             }
         }
     }
-    free(sig);
-    free(nsig);
+    free(ctx);
     return (uint8_t)bp;
 }
 
@@ -2277,42 +2918,39 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
 /* coeffs: pre-allocated output (calloc'd), bp: number of bit-planes. */
 static void ebcot_decode_channel(BacDec *d, int16_t *coeffs, int w, int h, int bp) {
     int total = w * h;
-
+    if (total <= 0) return;
     BacModel models[TOTAL_CTX];
     for (int i = 0; i < TOTAL_CTX; i++) bacm_init_ctx(&models[i], i);
 
-    uint8_t *sig = (uint8_t*)calloc((size_t)(total > 0 ? total : 0), 1);
-    if (!sig) return;
-    /* Incremental neighbour-significance counts (see ebcot_encode_channel). */
-    uint8_t *nsig = (uint8_t*)calloc((size_t)(total > 0 ? total : 0), 1);
-    if (!nsig) { free(sig); return; }
+    EbcotCtx *ctx = (EbcotCtx*)calloc((size_t)total, sizeof(EbcotCtx));
+    if (!ctx) return;
 
     for (int b = bp - 1; b >= 0; b--) {
         int bit_mask = 1 << b;
         for (int i = 0, x = 0, y = 0; i < total; i++, x++) {
             if (x == w) { x = 0; y++; }
-            int ctx_sig = nsig[i];
+            int ctx_sig = ctx[i].nsig;
             if (ctx_sig > 4) ctx_sig = 4;
 
-            if (!sig[i]) {
+            if (!ctx[i].sig) {
                 /* Parent context: inter-scale correlation */
                 int sctx = ctx_sig;
                 int px = x >> 1, py = y >> 1;
-                if ((x > 0 || y > 0) && sig[py * w + px]) sctx += 5;
+                if ((x > 0 || y > 0) && ctx[py * w + px].sig) sctx += 5;
                 int is_sig = bac_decode(d, &models[sctx]);
                 if (is_sig) {
-                    sig[i] = 1;
+                    ctx[i].sig = 1;
                     int y0 = y > 0, y1 = y + 1 < h, x0 = x > 0, x1 = x + 1 < w;
-                    if (y0) { if (x0) nsig[i-w-1]++; nsig[i-w]++; if (x1) nsig[i-w+1]++; }
-                    if (x0) nsig[i-1]++;
-                    if (x1) nsig[i+1]++;
-                    if (y1) { if (x0) nsig[i+w-1]++; nsig[i+w]++; if (x1) nsig[i+w+1]++; }
+                    if (y0) { if (x0) ctx[i-w-1].nsig++; ctx[i-w].nsig++; if (x1) ctx[i-w+1].nsig++; }
+                    if (x0) ctx[i-1].nsig++;
+                    if (x1) ctx[i+1].nsig++;
+                    if (y1) { if (x0) ctx[i+w-1].nsig++; ctx[i+w].nsig++; if (x1) ctx[i+w+1].nsig++; }
                     int ctx_sgn = 2, sgn_sum = 0;
                     for (int dy = -1; dy <= 1; dy++) {
                         for (int dx = -1; dx <= 1; dx++) {
                             if (dx == 0 && dy == 0) continue;
                             int nx = x + dx, ny = y + dy;
-                            if (nx >= 0 && nx < w && ny >= 0 && ny < h && sig[ny * w + nx])
+                            if (nx >= 0 && nx < w && ny >= 0 && ny < h && ctx[ny * w + nx].sig)
                                 sgn_sum += (coeffs[ny * w + nx] > 0) ? 1 : -1;
                         }
                     }
@@ -2339,9 +2977,7 @@ static void ebcot_decode_channel(BacDec *d, int16_t *coeffs, int w, int h, int b
             }
         }
     }
-
-    free(sig);
-    free(nsig);
+    free(ctx);
 }
 
 /* ===================================================================== */
@@ -2474,14 +3110,9 @@ static uint8_t *ebcot_decode_mem(const uint8_t *data, int data_len, int pos, int
     uint8_t *out_img = (uint8_t*)malloc(total * comp);
     if (!out_img) { free(y_f); free(u_s); free(v_s); if (is_420) { free(u_f); free(v_f); } free(a_f); return NULL; }
     if (alpha) {
-        for (int i = 0; i < total; ++i) {
-            yuv_to_rgb(y_f[i], u_f[i], v_f[i], &out_img[i*4], &out_img[i*4+1], &out_img[i*4+2]);
-            int av = (int)(a_f[i] + 128.5f); if (av < 0) av = 0; if (av > 255) av = 255;
-            out_img[i*4+3] = (uint8_t)av;
-        }
+        yuv_to_rgb_batch(y_f, u_f, v_f, a_f, w, h, out_img, 0, 4);
     } else {
-        for (int i = 0; i < total; ++i)
-            yuv_to_rgb(y_f[i], u_f[i], v_f[i], &out_img[i*3], &out_img[i*3+1], &out_img[i*3+2]);
+        yuv_to_rgb_batch(y_f, u_f, v_f, NULL, w, h, out_img, 0, 3);
     }
 
     free(y_f); free(u_s); free(v_s); free(a_f);
@@ -2651,38 +3282,72 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         } \
     } while(0)
 
-    /* First-step estimate for the pseudo-linear q scale of compute_base().       */
-    /* size(q) is roughly a power law, but compute_base() is piecewise-linear     */
-    /* (kinks at q=30 and q=80), so a single q ~ C*size^B misfits the tails by    */
-    /* 20-400%. A 3-segment power-law fit (calibrated on the ~2800-image dataset, */
-    /* mean_q per target) lands within ~5% of optimum everywhere,                 */
-    /* which cuts the secant search to ~2-4 probes. Size scales sub-linearly with */
-    /* pixel count (~npix^0.35), so we normalize the target to 256x256 first.     */
-    /* Segments: [<=8K] shared; [8K..16K] and [>16K] differ per chroma mode       */
-    /* (4:2:0 needs a lower q at high rates since chroma is already halved).      */
+    /* First-step estimate for the geometric q scale of compute_base().            */
+    /* base(q) = BASE_MIN * exp((q-1)*LOG_RATIO), so q inverts from a target step   */
+    /* analytically. The empirical part is size(base): entropy coding makes it      */
+    /* slightly curved in log-log, so we model ln(base) as a quadratic in           */
+    /* ln(target) (calibrated on the ~2800-image 256x256 dataset, median q per      */
+    /* target), then invert to q. It lands within a few q of the optimum across the */
+    /* whole 200 B..36 KB range, cutting the secant search to a few probes. The     */
+    /* size(q) curve depends on both the chroma mode (4:2:0 halves the chroma, so   */
+    /* it hits a given size at a lower q, diverging from 4:4:4 by up to ~50 q at     */
+    /* high rates) and the entropy coder (Huffman produces larger files than EBCOT  */
+    /* at the same q, needing ~10-45 more q), so we keep a 2x2 table of fits. The    */
+    /* two Huffman table variants (single vs context-aware, -h) differ by <~2 q, so */
+    /* they share one fit. Size scales sub-linearly with pixel count (~npix^0.35),  */
+    /* so we normalize the target to 256x256 first.                                 */
     #define Q_REF_NPIX  65536.0f   /* 256x256 calibration resolution */
     float npix = (float)(w * h);
     float target_n = (float)target_bytes * powf(Q_REF_NPIX / npix, 0.35f);
     if (target_n < 1.0f) target_n = 1.0f;
-    float fit_c, fit_b;
-    if (target_n <= 8000.0f) {
-        fit_c = 6240.0f;      fit_b = -0.521f;   /* shared low segment */
-    } else if (target_n <= 16000.0f) {
-        if (chroma_420) { fit_c = 4.32e6f;  fit_b = -1.252f; }
-        else            { fit_c = 2.57e6f;  fit_b = -1.193f; }
-    } else {
-        if (chroma_420) { fit_c = 7.5e12f;  fit_b = -2.735f; }
-        else            { fit_c = 3.8e11f;  fit_b = -2.422f; }
-    }
-    int q = (int)(fit_c * powf(target_n, fit_b) + 0.5f);
+    /* Quadratic fit coefficients ln(base) = c2*lt^2 + c1*lt + c0, indexed by       */
+    /* [coder][is_420]. Coder rows: 0=EBCOT, 1=Huffman single-table, 2=Huffman       */
+    /* context-aware (huf_extra_ctx / -h 1). Context-aware tables compress a bit     */
+    /* better than the single table, so they hit a given size at a slightly lower q  */
+    /* (a few q, growing with rate), which is worth its own row. huffman_mode: 2 or  */
+    /* 0 = ebcot/auto (auto picks the smaller of ebcot/huffman, so its size tracks   */
+    /* ebcot); 1 = huffman (row chosen by huf_extra_ctx). */
+    static const float qfit[3][2][3] = {
+        /* EBCOT       */ { { -0.08283f, 0.04976f, 8.36937f },   /* 4:4:4 */
+                            { -0.11239f, 0.46221f, 6.95439f } }, /* 4:2:0 */
+        /* Huffman 1tbl */ { { -0.12201f, 0.75157f, 5.68944f },   /* 4:4:4 */
+                            { -0.10537f, 0.44125f, 6.92743f } }, /* 4:2:0 */
+        /* Huffman ctx  */ { { -0.09333f, 0.27103f, 7.52649f },   /* 4:4:4 */
+                            { -0.10756f, 0.46568f, 6.86235f } }, /* 4:2:0 */
+    };
+    int coder = (huffman_mode == 1) ? (huf_extra_ctx ? 2 : 1) : 0;
+    const float *fc = qfit[coder][chroma_420 ? 1 : 0];
+    /* ln(base) = c2*lt^2 + c1*lt + c0,  lt = ln(target_n) */
+    float lt = logf(target_n);
+    float ln_base = fc[0] * lt * lt + fc[1] * lt + fc[2];
+    /* Invert the geometric scale: base = BASE_MIN*exp((q-1)*LOG_RATIO). */
+    int q = (int)(1.0f + (ln_base - logf(WTPC_BASE_MIN)) / WTPC_BASE_LOG_RATIO + 0.5f);
     if (q < 1) q = 1;
     if (q > MAX_QUALITY) q = MAX_QUALITY;
+    /* Local model slope dq/d(ln size), used to seed the secant with a real second  */
+    /* point after the first probe instead of a blind bisection midpoint:           */
+    /*   q(ln_base) = 1 + (ln_base - ln(BASE_MIN))/LOG_RATIO                         */
+    /*   d(ln_base)/d(lt) = 2*c2*lt + c1                                             */
+    /* size grows ~1:1 with target here (npix normalization is a constant offset),  */
+    /* so d q / d(ln size) ~= (2*c2*lt + c1)/LOG_RATIO. It is negative (higher q =>  */
+    /* smaller size). Clamp away from ~0 so the extrapolation step stays sane.       */
+    float model_slope = (2.0f * fc[0] * lt + fc[1]) / WTPC_BASE_LOG_RATIO;
+    if (model_slope > -1.0f) model_slope = -1.0f;
     int steps = 0, best_q = q, best_dist = 99999999;
     unsigned char *best_data = NULL;
     wtpc_enc_info best_info = {0};
     int sizes[MAX_QUALITY + 1];
     memset(&sizes[0], 0, sizeof(sizes));
 
+    /* Size-equality tolerance for the best-candidate tie-break. size(q) is not     */
+    /* strictly monotone at the very fine end: at q=1 (finest step) entropy coding  */
+    /* can produce a slightly SMALLER file than q=2 for simple images, so a plain   */
+    /* "closest size wins" would pick q=2 and needlessly lose quality. When two     */
+    /* candidates are within TIE_EPS bytes we treat them as equal and prefer the    */
+    /* smaller q (finer quantization = better quality). Kept tiny so real targeting */
+    /* accuracy is unaffected. */
+    int tie_eps = target_bytes >> 9;   /* ~0.2% of target */
+    if (tie_eps < 4) tie_eps = 4;
     /* Helper: probe quality, update best if improved. Always sets *out_sz. */
 #ifdef WTPC_RC_ONLY_LESS_THAN_TARGET
     /* Only undershoot (size <= target). During tuning this avoids overshoot     */
@@ -2695,8 +3360,9 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         sizes[tq] = _sz; \
         if (_sz > target_bytes) { free(_d); break; } \
         int _dist = target_bytes - _sz; \
-        if (_dist < best_dist || (_dist == best_dist && tq < best_q)) { \
-            best_dist = _dist; best_q = tq; \
+        if (_dist < best_dist - tie_eps || (_dist <= best_dist + tie_eps && tq < best_q)) { \
+            if (_dist < best_dist) best_dist = _dist; \
+            best_q = tq; \
             free(best_data); \
             best_data = _d; best_info = _ti; best_info.result_q = tq; \
         } else { free(_d); } \
@@ -2709,8 +3375,9 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         if (_sz < 0) { free(_d); sizes[tq] = 0; break; } \
         sizes[tq] = _sz; \
         int _dist = abs(_sz - target_bytes); \
-        if (_dist < best_dist || (_dist == best_dist && tq < best_q)) { \
-            best_dist = _dist; best_q = tq; \
+        if (_dist < best_dist - tie_eps || (_dist <= best_dist + tie_eps && tq < best_q)) { \
+            if (_dist < best_dist) best_dist = _dist; \
+            best_q = tq; \
             free(best_data); \
             best_data = _d; best_info = _ti; best_info.result_q = tq; \
         } else { free(_d); } \
@@ -2723,11 +3390,31 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
     int lo = 1, hi = MAX_QUALITY;
     if (first_sz > target_bytes) lo = first_q; else hi = first_q;
 
+    /* Seed a second probe by a one-step Newton move along the calibrated model     */
+    /* slope, rather than a blind bisection of [1..MAX_QUALITY]. The first estimate  */
+    /* already lands within a few q of the target, so a slope step from the measured */
+    /* (first_q, first_sz) usually lands on/next to the answer, giving the secant    */
+    /* two nearby points instead of one point plus a far-away midpoint.              */
+    int pq = first_q, psz = first_sz;  /* previous probe */
+    if (first_sz > 0 && hi - lo > 1) {
+        float dln = logf((float)target_bytes) - logf((float)first_sz);
+        int nq = first_q + (int)(model_slope * dln + (dln < 0 ? -0.5f : 0.5f));
+        if (nq <= lo) nq = lo + 1;
+        if (nq >= hi) nq = hi - 1;
+        if (nq != q) {
+            pq = q; psz = sz;
+            q = nq;
+            TRY(q, &sz);
+            if (sz > 0) {
+                if (sz > target_bytes) { if (q > lo) lo = q; }
+                else                   { if (q < hi) hi = q; }
+            }
+        }
+    }
+
     /* Secant interpolation in log-log space. size(q) is monotone decreasing */
     /* and roughly a power law, so interpolating log(q) linearly in log(size) */
     /* converges very fast (typically 1-3 probes) once we bracket the target. */
-    int pq = first_q, psz = first_sz;  /* previous probe */
-
     for (int iter = 0; iter < 12; iter++) {
         if (hi - lo <= 1) break;
         int nq;
@@ -2793,7 +3480,7 @@ exit_error:
     return NULL;
 }
 
-unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha) {
+unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride) {
     memset(info, 0, sizeof(*info));
     if (w < 0 || w > 65536 || h < 0 || h > 65536 || (!target_bytes && (quality < 1 || quality > MAX_QUALITY))) return 0;
 
@@ -2802,17 +3489,15 @@ unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, in
     int cw = w, ch = h;
     if (chroma_420) { cw = (w+1)/2; ch = (h+1)/2; }
     int ctotal = cw * ch;
-    int stride = has_alpha ? 4 : 3;
+    int pixel_stride = has_alpha ? 4 : 3;
+    int line_stride = (stride > 0) ? stride : w * pixel_stride;
 
     float *y_w = malloc(total * sizeof(float));
     float *u_full = malloc(total * sizeof(float));
     float *v_full = malloc(total * sizeof(float));
     float *a_w = has_alpha ? malloc(total * sizeof(float)) : NULL;
     if (!y_w || !u_full || !v_full || (has_alpha && !a_w)) { free(y_w); free(u_full); free(v_full); free(a_w); return NULL; }
-    for (int i = 0; i < total; ++i) {
-        rgb_to_yuv(rgb[i*stride], rgb[i*stride+1], rgb[i*stride+2], &y_w[i], &u_full[i], &v_full[i]);
-        if (has_alpha) a_w[i] = (float)rgb[i*stride+3] - 128.0f;
-    }
+    rgb_to_yuv_batch(rgb, line_stride, pixel_stride, w, h, y_w, u_full, v_full, a_w);
 
     float *u_w, *v_w;
     if (chroma_420) {
@@ -2894,8 +3579,8 @@ unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, in
 }
 
 #ifndef WTPC_NO_STDIO
-int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha) {
-    unsigned char *data = wtpc_encode_mem(rgb, info, w, h, target_bytes, quality, chroma_420, huffman_mode, huf_extra_ctx, has_alpha);
+int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride) {
+    unsigned char *data = wtpc_encode_mem(rgb, info, w, h, target_bytes, quality, chroma_420, huffman_mode, huf_extra_ctx, has_alpha, stride);
     if (!data) return -1;
     FILE *f = fopen(out_path, "wb");
     if (!f) { free(data); return -1; }
@@ -3048,16 +3733,9 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     uint8_t *out_img = (uint8_t*)malloc(total * comp);
     if (!out_img) { free(q_y); free(q_u); free(q_v); free(q_a); free(y_f); free(u_s); free(v_s); free(a_f); if (is_420) { free(u_f); free(v_f); } return NULL; }
     if (alpha) {
-        for (int i = 0; i < total; ++i) {
-            yuv_to_rgb(y_f[i], u_f[i], v_f[i],
-                       &out_img[i * 4], &out_img[i * 4 + 1], &out_img[i * 4 + 2]);
-            int av = (int)(a_f[i] + 128.5f); if (av < 0) av = 0; if (av > 255) av = 255;
-            out_img[i * 4 + 3] = (uint8_t)av;
-        }
+        yuv_to_rgb_batch(y_f, u_f, v_f, a_f, *w, *h, out_img, 0, 4);
     } else {
-        for (int i = 0; i < total; ++i)
-            yuv_to_rgb(y_f[i], u_f[i], v_f[i],
-                       &out_img[i * 3], &out_img[i * 3 + 1], &out_img[i * 3 + 2]);
+        yuv_to_rgb_batch(y_f, u_f, v_f, NULL, *w, *h, out_img, 0, 3);
     }
 
     free(q_y); free(q_u); free(q_v); free(q_a);

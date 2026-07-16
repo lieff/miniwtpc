@@ -1,6 +1,6 @@
 # Small Wavelet Thumbnail & Preview Codec - WTPC
 
-A simple, drop-in image codec in the style of stb_image.
+A simple, drop-in image codec in the style of stb_image (single header library).
 It targets low sizes from 200 B to 36 KB at resolutions around 256x256.
 The main target for thumbnails is 1400 B -- designed to fit within one MTU
 packet, so the user sees *something* while the main preview downloads.
@@ -75,6 +75,7 @@ at low bitrates and the test dataset is relatively small (~3000 images).
      #define DEBUG_WAVELET        : dump wavelet coefficient images (needs stb).
      #define STANDARD_CDF97       : enable standard CDF 9/7 K-scaling.
      #define WTPC_TUNE_PARAMS     : mutable quantization tables for grid-search tuning.
+     #define WTPC_NO_SIMD         : do not use sse/avx/neon intrinsics.
      #define WTPC_RC_ONLY_LESS_THAN_TARGET : rate control never overshoots
                                     target_bytes (picks the largest size <= target
                                     instead of the closest). Implied by
@@ -181,8 +182,15 @@ Click any image to view full size.
 ## Interesting Links
 
  * https://github.com/nothings/stb
+ * https://github.com/kalcutter/gfwx
+ * https://github.com/Themaister/pyrowave
+ * https://github.com/MarcioPais/SQZ
  * https://github.com/josejuansanchez/bgp-image-format
  * https://github.com/LMP88959/Digital-Subband-Video-2
+ * https://themaister.net/blog/2025/06/16/i-designed-my-own-ridiculously-fast-game-streaming-video-codec-pyrowave/
+
+## Image Datasets
+
  * https://github.com/castano/image-datasets
  * https://jpegai.github.io/test_images/
  * https://github.com/EliSchwartz/imagenet-sample-images
