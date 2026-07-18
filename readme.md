@@ -85,6 +85,7 @@ at low bitrates and the test dataset is relatively small (~3000 images).
 You can retrain quantization parameters and Huffman tables on your own
 dataset. Enable `WTPC_TUNE_PARAMS`, set param ranges in `param_cfg`, and
 run tuning (`wtpc -T`) and/or Huffman table generation (`wtpc -G`).
+But note that format become incompatible with WTPC release version.
 
 ## Benchmark: WTPC vs JPEG vs JPEG 2000 vs JPEG XL
 
@@ -97,26 +98,26 @@ run tuning (`wtpc -T`) and/or Huffman table generation (`wtpc -G`).
 
 | Target | Best Codec         | Size   | PSNR   | ssimulacra2 |
 |--------|--------------------|--------|--------|-------------|
-| 200 B | WTPC 4:2:0 EBCOT | 200 B | 19.89 | -61.17 |
-| 400 B | WTPC 4:4:4 EBCOT | 400 B | 21.74 | -43.62 |
-| 600 B | WTPC 4:2:0 EBCOT | 603 B | 23.07 | -27.51 |
-| 800 B | WTPC 4:2:0 EBCOT | 798 B | 23.83 | -12.19 |
-| 1 KB | WTPC 4:2:0 EBCOT | 1404 B | 25.71 | 15.14 |
-| 2 KB | WTPC 4:2:0 EBCOT | 1996 B | 26.94 | 31.53 |
-| 3 KB | WTPC 4:2:0 EBCOT | 2990 B | 28.31 | 47.62 |
-| 4 KB | WTPC 4:2:0 EBCOT | 4047 B | 29.50 | 56.94 |
-| 5 KB | WTPC 4:2:0 EBCOT | 5073 B | 30.52 | 63.86 |
-| 6 KB | WTPC 4:2:0 EBCOT | 6119 B | 31.43 | 68.64 |
-| 8 KB | WTPC 4:4:4 EBCOT | 7951 B | 32.81 | 74.34 |
-| 10 KB | WTPC 4:4:4 EBCOT | 10082 B | 34.17 | 79.09 |
-| 13 KB | WTPC 4:4:4 EBCOT | 12899 B | 35.62 | 83.52 |
-| 15 KB | WTPC 4:4:4 EBCOT | 15000 B | 36.47 | 85.61 |
-| 18 KB | WTPC 4:4:4 EBCOT | 18025 B | 37.52 | 88.01 |
-| 22 KB | WTPC 4:4:4 EBCOT | 22143 B | 38.83 | 90.28 |
-| 28 KB | WTPC 4:4:4 EBCOT | 28343 B | 40.52 | 92.13 |
-| 36 KB | WTPC 4:4:4 EBCOT | 36739 B | 42.42 | 93.81 |
+| 200 B | WTPC 4:2:0 EBCOT | 199 B | 20.02 | -61.47 |
+| 400 B | WTPC 4:2:0 EBCOT | 405 B | 21.93 | -41.89 |
+| 600 B | WTPC 4:2:0 EBCOT | 603 B | 23.08 | -27.40 |
+| 800 B | WTPC 4:2:0 EBCOT | 804 B | 23.85 | -11.96 |
+| 1 KB | WTPC 4:2:0 EBCOT | 1399 B | 25.63 | 15.73 |
+| 2 KB | WTPC 4:2:0 EBCOT | 2001 B | 26.97 | 31.89 |
+| 3 KB | WTPC 4:2:0 EBCOT | 3005 B | 28.30 | 47.76 |
+| 4 KB | WTPC 4:2:0 EBCOT | 4005 B | 29.40 | 56.51 |
+| 5 KB | WTPC 4:2:0 EBCOT | 5013 B | 30.39 | 63.55 |
+| 6 KB | WTPC 4:2:0 EBCOT | 6008 B | 31.27 | 68.04 |
+| 8 KB | WTPC 4:4:4 EBCOT | 7992 B | 32.81 | 74.38 |
+| 10 KB | WTPC 4:4:4 EBCOT | 10017 B | 34.10 | 79.22 |
+| 13 KB | WTPC 4:4:4 EBCOT | 13010 B | 35.66 | 83.47 |
+| 15 KB | WTPC 4:4:4 EBCOT | 15035 B | 36.48 | 85.52 |
+| 18 KB | WTPC 4:4:4 EBCOT | 18040 B | 37.52 | 87.96 |
+| 22 KB | WTPC 4:4:4 EBCOT | 21985 B | 38.72 | 90.12 |
+| 28 KB | WTPC 4:4:4 EBCOT | 28003 B | 40.36 | 92.11 |
+| 36 KB | WTPC 4:4:4 EBCOT | 36089 B | 42.22 | 93.73 |
 
-### Speed Summary (lena 256x256, fixed q=20)
+### Speed Summary (lena 256x256, representative q=244)
 
 | Codec               | Encode (ms) | Decode (ms) |
 |---------------------|-------------|-------------|
@@ -125,7 +126,7 @@ run tuning (`wtpc -T`) and/or Huffman table generation (`wtpc -G`).
 | WTPC EBCOT 4:2:0 | 4 | 5 |
 | WTPC Huffman 4:2:0 | 2 | 1 |
 | JPEG 2000 | 16 | 5 |
-| JPEG XL | 117 | 4 |
+| JPEG XL | 104 | 3 |
 | JPEG | 4 | 3 |
 
 See [results.md](results.md) for the complete per-size breakdown, speed

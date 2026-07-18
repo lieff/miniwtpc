@@ -764,6 +764,208 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
     for (int i = 0; i < nimg; i++) { if (images[i].rgb) stbi_image_free(images[i].rgb); }
     free(images);
 }
+
+/* =====================================================================
+ *  qfit recalibration (-R)
+ *  Re-derives the quadratic size(q) model used by find_quality_for_target
+ *  for all 6 encoder combinations (ebcot/huffman/huffman-ctx x 444/420).
+ * ===================================================================== */
+
+/* One encoder configuration = a row/col of the qfit table. */
+typedef struct { const char *name; int huffman_mode; int huf_extra_ctx; int chroma_420; } CalibCfg;
+static const CalibCfg calib_cfgs[6] = {
+    {"EBCOT       4:4:4", 2, 0, 0},
+    {"EBCOT       4:2:0", 2, 0, 1},
+    {"Huffman1tbl 4:4:4", 1, 0, 0},
+    {"Huffman1tbl 4:2:0", 1, 0, 1},
+    {"Huffman ctx 4:4:4", 1, 1, 0},
+    {"Huffman ctx 4:2:0", 1, 1, 1},
+};
+
+typedef struct {
+    int tid;
+    int *next_idx;
+    pthread_mutex_t *mutex;
+    const CalibCfg *cfg;
+    PreloadedImg *images;
+    int nimg;
+    int *targets;
+    int ntargets;
+    int ntotal;
+    /* outputs (per work item, indexed [t*nimg + i]) */
+    float *out_lt;      /* ln(target_n) with npix normalization, or NAN if skipped */
+    float *out_lb;      /* ln(base(result_q)) */
+    int   *out_steps;   /* search_steps */
+    int   *out_dev;     /* abs(encoded_bytes - target) */
+} CalibCtx;
+
+#define CALIB_Q_REF_NPIX 65536.0f  /* must match find_quality_for_target */
+
+static void *calib_worker(void *arg) {
+    CalibCtx *ctx = (CalibCtx*)arg;
+    const CalibCfg *cfg = ctx->cfg;
+    while (1) {
+        pthread_mutex_lock(ctx->mutex);
+        int idx = (*ctx->next_idx)++;
+        pthread_mutex_unlock(ctx->mutex);
+        if (idx >= ctx->ntotal) break;
+        int t = idx / ctx->nimg, i = idx % ctx->nimg;
+        ctx->out_lt[idx] = NAN; ctx->out_lb[idx] = NAN; ctx->out_steps[idx] = 0; ctx->out_dev[idx] = -1;
+        PreloadedImg *pimg = &ctx->images[i];
+        if (!pimg->rgb || pimg->w <= 0 || pimg->h <= 0) continue;
+        wtpc_enc_info info;
+        unsigned char *enc = wtpc_encode_mem(pimg->rgb, &info, pimg->w, pimg->h,
+            ctx->targets[t], 0, cfg->chroma_420, cfg->huffman_mode, cfg->huf_extra_ctx, pimg->has_alpha, 0);
+        if (!enc) continue;
+        free(enc);
+        int dev = abs(info.encoded_bytes - ctx->targets[t]);
+        if (dev > 0 && info.encoded_bytes < ctx->targets[t] && info.result_q <= 1) dev = 0;
+        ctx->out_dev[idx] = dev;
+        if (info.result_q < 1) { ctx->out_steps[idx] = info.search_steps; continue; }
+        float npix = (float)(pimg->w * pimg->h);
+        float target_n = (float)ctx->targets[t] * powf(CALIB_Q_REF_NPIX / npix, 0.35f);
+        if (target_n < 1.0f) target_n = 1.0f;
+        ctx->out_lt[idx] = logf(target_n);
+        ctx->out_lb[idx] = logf(compute_base(info.result_q));
+        ctx->out_steps[idx] = info.search_steps;
+    }
+    return NULL;
+}
+
+/* Solve 3x3 normal equations (least squares quadratic) via Gaussian */
+/* elimination with partial pivoting. Fills out[3] = {c2, c1, c0}.   */
+static int solve_quad_lsq(const float *lt, const float *lb, int n, float out[3]) {
+    double A[3][4] = {{0}};
+    int used = 0;
+    for (int k = 0; k < n; k++) {
+        if (isnan(lt[k]) || isnan(lb[k])) continue;
+        double x = lt[k], y = lb[k];
+        double b[3] = { x*x, x, 1.0 };
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) A[r][c] += b[r]*b[c];
+            A[r][3] += b[r]*y;
+        }
+        used++;
+    }
+    if (used < 3) return 0;
+    for (int col = 0; col < 3; col++) {
+        int piv = col;
+        for (int r = col+1; r < 3; r++) if (fabs(A[r][col]) > fabs(A[piv][col])) piv = r;
+        if (fabs(A[piv][col]) < 1e-12) return 0;
+        if (piv != col) for (int c = 0; c < 4; c++) { double tmp = A[col][c]; A[col][c] = A[piv][c]; A[piv][c] = tmp; }
+        for (int r = 0; r < 3; r++) {
+            if (r == col) continue;
+            double f = A[r][col] / A[col][col];
+            for (int c = col; c < 4; c++) A[r][c] -= f * A[col][c];
+        }
+    }
+    out[0] = (float)(A[0][3] / A[0][0]);
+    out[1] = (float)(A[1][3] / A[1][1]);
+    out[2] = (float)(A[2][3] / A[2][2]);
+    return 1;
+}
+
+static void calibrate_qfit(const char *dir_path) {
+    int targets[] = {200, 400, 800, 1000, 2000, 4000, 8000, 16000, 32000, 36000};
+    int ntargets = sizeof(targets) / sizeof(targets[0]);
+
+    /* Collect + preload images (same as tune_grid). */
+    DIR *d = opendir(dir_path);
+    if (!d) { fprintf(stderr, "Cannot open: %s\n", dir_path); return; }
+    char **names = NULL; int nimg = 0, ncap = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *ext = strrchr(ent->d_name, '.');
+        if (!ext || (strcmp(ext, ".png") && strcmp(ext, ".jpg"))) continue;
+        if (nimg >= ncap) { ncap = ncap ? ncap*2 : 256; names = realloc(names, ncap * sizeof(char*)); }
+        names[nimg++] = strdup(ent->d_name);
+    }
+    closedir(d);
+    if (nimg == 0) { fprintf(stderr, "No images found\n"); return; }
+    PreloadedImg *images = malloc(nimg * sizeof(PreloadedImg));
+    if (!images) { fprintf(stderr, "OOM\n"); return; }
+    for (int i = 0; i < nimg; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir_path, names[i]);
+        const char *ext = strrchr(names[i], '.');
+        if (ext && strcmp(ext, ".png") == 0) images[i].rgb = read_png(path, &images[i].w, &images[i].h, &images[i].has_alpha);
+        else { int comp; images[i].rgb = stbi_load(path, &images[i].w, &images[i].h, &comp, 0); images[i].has_alpha = (comp == 4); }
+        if (!images[i].rgb) { images[i].w = images[i].h = 0; images[i].has_alpha = 0; }
+    }
+    fprintf(stderr, "Preloaded %d images\n", nimg);
+
+    int ntotal = nimg * ntargets;
+    float *lt = malloc(ntotal * sizeof(float));
+    float *lb = malloc(ntotal * sizeof(float));
+    int   *stp = malloc(ntotal * sizeof(int));
+    int   *dev = malloc(ntotal * sizeof(int));
+    float fits[6][3];
+
+    printf("    static const float qfit[3][2][3] = {\n");
+    double t_start = now_ms();
+    for (int cc = 0; cc < 6; cc++) {
+        const CalibCfg *cfg = &calib_cfgs[cc];
+        int next_idx = 0;
+        pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+        int nth = ntotal < TUNE_THREADS ? ntotal : TUNE_THREADS;
+        CalibCtx cx[TUNE_THREADS]; pthread_t th[TUNE_THREADS];
+        for (int k = 0; k < nth; k++) {
+            cx[k].tid = k; cx[k].next_idx = &next_idx; cx[k].mutex = &mutex; cx[k].cfg = cfg;
+            cx[k].images = images; cx[k].nimg = nimg; cx[k].targets = targets; cx[k].ntargets = ntargets;
+            cx[k].ntotal = ntotal; cx[k].out_lt = lt; cx[k].out_lb = lb; cx[k].out_steps = stp; cx[k].out_dev = dev;
+            pthread_create(&th[k], NULL, calib_worker, &cx[k]);
+        }
+        for (int k = 0; k < nth; k++) pthread_join(th[k], NULL);
+        pthread_mutex_destroy(&mutex);
+
+        /* Fit quadratic over the whole (lt, lb) cloud. */
+        int ok = solve_quad_lsq(lt, lb, ntotal, fits[cc]);
+        if (!ok) { fprintf(stderr, "[%s] fit FAILED (too few points)\n", cfg->name); fits[cc][0]=fits[cc][1]=fits[cc][2]=0; }
+
+        /* Emit the table row (grouped 3 rows of 2 cols: coder x chroma). */
+        int is444 = !cfg->chroma_420;
+        if (is444) printf("        /* %-12s */ { { %9.5ff, %9.5ff, %9.5ff },   /* 4:4:4 */\n",
+                          cfg->huffman_mode == 2 ? "EBCOT" : (cfg->huf_extra_ctx ? "Huffman ctx" : "Huffman 1tbl"),
+                          fits[cc][0], fits[cc][1], fits[cc][2]);
+        else       printf("                            { %9.5ff, %9.5ff, %9.5ff } }, /* 4:2:0 */\n",
+                          fits[cc][0], fits[cc][1], fits[cc][2]);
+
+        /* Per-target + overall step / deviation stats. */
+        int overall_max = 0; double overall_sum = 0; int overall_n = 0;
+        int overall_maxd = 0; double overall_devsum = 0; int overall_devn = 0;
+        fprintf(stderr, "--- %s ---\n", cfg->name);
+        for (int t = 0; t < ntargets; t++) {
+            int tmax = 0, tn = 0; double tsum = 0;
+            int tmaxd = 0, tdn = 0; double tdsum = 0;
+            for (int i = 0; i < nimg; i++) {
+                int s = stp[t*nimg + i];
+                if (s > 0) {
+                    tsum += s; tn++; if (s > tmax) tmax = s;
+                    overall_sum += s; overall_n++; if (s > overall_max) overall_max = s;
+                }
+                int dv = dev[t*nimg + i];
+                if (dv >= 0) {
+                    tdsum += dv; tdn++; if (dv > tmaxd) tmaxd = dv;
+                    overall_devsum += dv; overall_devn++; if (dv > overall_maxd) overall_maxd = dv;
+                }
+            }
+            fprintf(stderr, "  t=%-6d mean_steps=%.2f max_steps=%d  mean_dev=%.1f max_dev=%d\n",
+                    targets[t], tn ? tsum/tn : 0.0, tmax, tdn ? tdsum/tdn : 0.0, tmaxd);
+        }
+        fprintf(stderr, "  OVERALL mean_steps=%.2f max_steps=%d  mean_dev=%.1f max_dev=%d\n",
+                overall_n ? overall_sum/overall_n : 0.0, overall_max,
+                overall_devn ? overall_devsum/overall_devn : 0.0, overall_maxd);
+    }
+    printf("    };\n");
+    fflush(stdout);
+    fprintf(stderr, "\nCalibration done in %.1f min\n", (now_ms() - t_start) * 0.001 / 60.0);
+
+    free(lt); free(lb); free(stp); free(dev);
+    for (int i = 0; i < nimg; i++) free(names[i]);
+    free(names);
+    for (int i = 0; i < nimg; i++) if (images[i].rgb) stbi_image_free(images[i].rgb);
+    free(images);
+}
 #endif  /* WTPC_TUNE_PARAMS */
 
 int main(int argc, char **argv) {
@@ -795,6 +997,7 @@ int main(int argc, char **argv) {
 #endif
 #ifdef WTPC_TUNE_PARAMS
         else if (strcmp(argv[i], "-T") == 0) mode = 4;
+        else if (strcmp(argv[i], "-R") == 0) mode = 5;
         else if (strcmp(argv[i], "-S") == 0 && i+1 < argc) tune_start = atoi(argv[++i]);
         else if (strcmp(argv[i], "-v") == 0) g_tune_verbose = 1;
         else if (strcmp(argv[i], "-420") == 0) tune_420 = 1;
@@ -820,6 +1023,7 @@ int main(int argc, char **argv) {
 #endif
 #ifdef WTPC_TUNE_PARAMS
         printf("  -T  grid-search multipliers for tuning\n");
+        printf("  -R  recalibrate qfit rate-control model (prints qfit table + step stats)\n");
         printf("  -420  tune chroma 4:2:0 params (default: main luma+chroma444+DZ)\n");
         printf("  -S  start grid from param index (0..%d, default 0)\n", (tune_420 ? NPARAMS_420 : NPARAMS_MAIN)-1);
         printf("  -v  verbose: per-encode progress logging\n");
@@ -901,6 +1105,9 @@ int main(int argc, char **argv) {
             tune_grid(input, param_cfg_420, NPARAMS_420, P420_BAND0, 1, tune_start);
         else
             tune_grid(input, param_cfg, NPARAMS_MAIN, 0, 0, tune_start);
+    } else if (mode == 5) {
+        if (!input) { printf("Usage: wtpc -R <directory>\n"); return 1; }
+        calibrate_qfit(input);
 #endif
     } else {
         /* Self-test: Huffman encode/decode roundtrip */

@@ -65,7 +65,7 @@ bench_wtpc "W420_H" "huffman" "-c" "w420_h"
 # ---- WTPC timing grid: fixed q (no -b binary search) to measure raw codec speed ----
 echo "" | tee -a "$LOGFILE"
 echo "### WTPC_TIME ###" | tee -a "$LOGFILE"
-for q in 400 200 100 50 20 8 3; do
+for q in 665 570 474 369 244 101 78; do
     for v in "WTPC_E:ebcot:" "WTPC_H:huffman:" "W420_E:ebcot:-c" "W420_H:huffman:-c"; do
         label="${v%%:*}"; rest="${v#*:}"; mode="${rest%%:*}"; chroma="${rest#*:}"
         pre="wt_time_$(echo $label | tr 'A-Z' 'a-z')"
@@ -103,7 +103,7 @@ if [ "$FAST" = "0" ]; then
     ppm="$TMPD/_in.ppm"
     convert "$IMAGE" "$ppm" 2>/dev/null
     # High rates for very small files (stretch to ~70-800 B range)
-    j2k_rates="2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 36 40 44 48 52 56 60 64 68 72 76 80 84 88 92 96 100 104 108 112 120 128 132 140 148 156 168 180 192 208 224 240 256 284 320 360 400 450 500 600 800 1000 1200 1500 2000"
+    j2k_rates="2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 56 60 64 68 72 76 80 84 88 92 96 100 104 108 112 120 128 132 140 148 156 168 180 192 208 224 240 256 284 320 360 400 450 500 600 800 1000 1200 1500 2000"
     for r in $j2k_rates; do
         j2k="$TMPD/j2k_r${r}.jp2"; dec_bmp="$TMPD/j2k_r${r}_dec.bmp"; dec_png="$TMPD/j2k_r${r}_dec.png"
         t0=$(date +%s%N 2>/dev/null); opj_compress -i "$ppm" -o "$j2k" -r "$r" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
@@ -630,10 +630,10 @@ try:
         rl = replace_table_in_lines(rl, '### Best Codec by Target Size (by PSNR)', new_rows)
         print(f'  Updated Best Codec table ({len(new_rows)} rows)')
 
-    # ---- Speed Summary (fixed q=20) ----
+    # ---- Speed Summary (lena 256x256, representative q=244) ----
     idx = None
     for i, line in enumerate(rl):
-        if line.strip() == '### Speed Summary (lena 256x256, fixed q=20)':
+        if line.strip() == '### Speed Summary (lena 256x256, representative q=244)':
             idx = i
             break
     if idx is not None:
@@ -647,7 +647,7 @@ try:
         speed_rows = []
         for var in ['WTPC_E', 'WTPC_H', 'W420_E', 'W420_H']:
             if var in time_data:
-                entry = [e for e in time_data[var] if e[0] == 20]
+                entry = [e for e in time_data[var] if e[0] == 244]
                 if entry:
                     enc, dec = entry[0][2], entry[0][3]
                     speed_rows.append(f"| {wtpc_labels[var]} | {round(enc)} | {round(dec)} |")
@@ -670,7 +670,7 @@ try:
                 speed_rows.append(f"| JPEG | {round(enc)} | {round(dec) if dec > 0 else '-'} |")
                 break
 
-        rl = replace_table_in_lines(rl, '### Speed Summary (lena 256x256, fixed q=20)', speed_rows)
+        rl = replace_table_in_lines(rl, '### Speed Summary (lena 256x256, representative q=244)', speed_rows)
         print(f'  Updated Speed Summary table ({len(speed_rows)} rows)')
 
     with open(readmefile, 'w') as f:

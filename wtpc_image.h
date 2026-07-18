@@ -1865,9 +1865,9 @@ static void cdf97_inverse_2d(float *data, int width, int height) {
 #define MAX_BANDS 8
 #ifndef WTPC_EXTERNAL_TABLES
 /* MAX_BANDS multipliers + 1 DZ at [MAX_BANDS] */
-static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS+1]    = {0.37f, 0.18f, 0.16f, 0.17f, 0.24f, 0.46f, 1.10f, 3.16f, 0.55f};
-static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS+1]    = {0.37f, 0.20f, 0.25f, 0.38f, 0.65f, 1.29f, 2.61f, 6.41f, 0.66f};
-static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS+1] = {0.21f, 0.14f, 0.17f, 0.28f, 0.51f, 0.99f, 2.05f, 4.20f, 0.62f};
+static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS+1]    = {0.37f, 0.18f, 0.17f, 0.17f, 0.24f, 0.46f, 1.09f, 3.16f, 0.55f};
+static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS+1]    = {0.34f, 0.20f, 0.25f, 0.37f, 0.66f, 1.27f, 2.61f, 6.41f, 0.66f};
+static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS+1] = {0.15f, 0.13f, 0.16f, 0.24f, 0.48f, 0.97f, 1.99f, 4.20f, 0.63f};
 #endif
 
 /* Quantization step base as a function of quality (1..MAX_QUALITY).               */
@@ -1954,7 +1954,7 @@ static void save_wavelet_png(const float *data, int w, int h, const char *path) 
 #ifdef STANDARD_CDF97
 #define WT_GAIN_PER_LEVEL 2.0f
 #else
-#define WT_GAIN_PER_LEVEL 1.513f
+#define WT_GAIN_PER_LEVEL 1.5133f
 #endif
 /* Bands 4->0 = coarsest->finest (matching get_quant_mult / quant_band). */
 static void compute_safe_steps(float min_step[5], int w, int h) {
@@ -1972,7 +1972,7 @@ static void compute_safe_steps(float min_step[5], int w, int h) {
         if (bl < 1) bl = 1;
         float gain = 1.0f;
         for (int i = 0; i < bl; i++) gain *= WT_GAIN_PER_LEVEL;
-        min_step[b] = (510.0f * gain) / 32767.0f;
+        min_step[b] = (256.0f * gain) / 32767.0f;
         if (min_step[b] < 1.0f) min_step[b] = 1.0f;
     }
 }
@@ -2021,7 +2021,14 @@ static void quantize_coeffs(const float *wavelet, int16_t *quantized, int w, int
             for (; x < seg_end; x++, i++) {
                 float val = wavelet[i];
                 if (fabsf(val) < dz) { quantized[i] = 0; }
-                else { float v = val / step; quantized[i] = (int16_t)(int)(v + copysignf(0.5f, v)); }
+                else {
+                    float v = val / step;
+                    int vi = (int)(v + copysignf(0.5f, v));
+                    /* branchless saturate: compiler emits cmov */
+                    if (vi >  32767) vi =  32767;
+                    if (vi < -32768) vi = -32768;
+                    quantized[i] = (int16_t)vi;
+                }
             }
             if (k_x < MAX_BANDS) k_x++; else break;  /* seg_end==w reached end of row */
         }
@@ -2380,68 +2387,68 @@ static int measure_encode_bits_ctx(const int16_t *d, int sz,
 
 /* Single-table (huf_extra_ctx=0): all coefficients */
 static const uint8_t def_tables_single[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5},{0,1,2,4,5,6,6,0,0,0,0,0,0,0,0,3},{0,1,2,4,5,6,6,0,0,0,0,0,0,0,0,3}},
- {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,5,6,7,7,0,0,0,0,0,0,0,4},{0,1,2,3,5,6,7,7,0,0,0,0,0,0,0,4}},
- {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
- {{0,1,2,3,4,5,6,7,8,9,10,12,12,0,0,11},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8}},
+ {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5}},
+ {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
+ {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7}},
+ {{0,1,2,3,4,5,6,7,8,9,10,11,0,0,0,11},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8},{0,1,2,3,4,5,6,7,8,10,11,11,0,0,0,9}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10}},
- {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10}},
+ {{0,2,2,2,3,4,5,6,7,8,9,11,12,12,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10}},
  {{0,2,2,2,3,4,5,6,7,8,9,11,12,12,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10}}
 };
 
 /* t0 tables (prev-cat <= 2) */
 static const uint8_t def_tables_t0[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,1,2,3,4,6,6,0,0,0,0,0,0,0,0,5},{0,1,2,4,5,6,6,0,0,0,0,0,0,0,0,3},{0,1,2,4,5,6,6,0,0,0,0,0,0,0,0,3}},
- {{0,1,2,3,4,5,7,7,0,0,0,0,0,0,0,6},{0,1,2,3,5,6,7,7,0,0,0,0,0,0,0,4},{0,1,2,3,5,6,7,7,0,0,0,0,0,0,0,4}},
+ {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5}},
  {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
+ {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,7,8,9,10,10,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,10,10,0,0,0,0,6}},
  {{0,1,2,3,4,5,6,7,8,9,11,11,0,0,0,10},{0,1,2,3,4,5,6,8,9,10,11,11,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,11,11,0,0,0,7}},
- {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9}},
- {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9}},
+ {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,9,10,11,12,13,13,0,8},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9}},
+ {{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9}},
  {{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9}}
 };
 
 /* t1 tables (prev-cat > 2) */
 static const uint8_t def_tables_t1[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,2,2,2,3,5,6,6,0,0,0,0,0,0,0,4},{0,2,3,4,4,0,0,0,0,0,0,0,0,0,0,1},{0,2,3,4,5,5,0,0,0,0,0,0,0,0,0,1}},
- {{0,2,2,2,3,4,6,7,7,0,0,0,0,0,0,5},{0,2,2,3,4,5,5,0,0,0,0,0,0,0,0,2},{0,2,2,2,4,5,5,0,0,0,0,0,0,0,0,3}},
- {{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,6,7,7,0,0,0,0,0,0,5},{0,2,2,2,3,4,6,7,7,0,0,0,0,0,0,5}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,11,11,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,11,11,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,2,2,2,3,4,5,6,7,8,10,10,0,0,0,9}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,11,11,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,2,2,2,3,4,5,6,7,8,10,10,0,0,0,9}}
+ {{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,4,5,5,0,0,0,0,0,0,0,0,3},{0,2,2,2,4,5,5,0,0,0,0,0,0,0,0,3}},
+ {{0,2,2,2,3,4,5,6,8,8,0,0,0,0,0,7},{0,2,2,2,3,4,6,6,0,0,0,0,0,0,0,5},{0,2,2,2,3,4,6,7,7,0,0,0,0,0,0,5}},
+ {{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,3,4,5,7,8,8,0,0,0,0,0,6}},
+ {{0,3,2,2,3,3,4,5,6,7,9,9,0,0,0,8},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,2,2,2,3,4,5,6,7,8,10,10,0,0,0,9}},
+ {{0,3,3,2,2,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,2,2,2,3,4,5,6,7,8,10,10,0,0,0,9}}
 };
 
 /* 4:2:0 single-table (huf_extra_ctx=0): all coefficients */
 static const uint8_t def_tables_single_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5},{0,1,2,4,5,6,6,0,0,0,0,0,0,0,0,3},{0,1,2,4,5,6,6,0,0,0,0,0,0,0,0,3}},
- {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,5,6,7,7,0,0,0,0,0,0,0,4},{0,1,2,3,5,6,7,7,0,0,0,0,0,0,0,4}},
- {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
- {{0,1,2,3,4,5,6,7,8,9,10,12,12,0,0,11},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8}},
+ {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5}},
+ {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
+ {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,6,8,9,10,11,11,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,11,11,0,0,0,7}},
+ {{0,1,2,3,4,5,6,7,8,9,10,11,0,0,0,11},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9}},
- {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9}},
+ {{0,2,2,2,3,4,5,6,7,8,9,11,12,12,0,10},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9}},
  {{0,2,2,2,3,4,5,6,7,8,9,11,12,12,0,10},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9}}
 };
 
 /* 4:2:0 t0 tables (prev-cat <= 2) */
 static const uint8_t def_tables_t0_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,1,2,3,4,6,6,0,0,0,0,0,0,0,0,5},{0,1,2,4,5,6,6,0,0,0,0,0,0,0,0,3},{0,1,2,4,5,6,6,0,0,0,0,0,0,0,0,3}},
- {{0,1,2,3,4,5,7,7,0,0,0,0,0,0,0,6},{0,1,2,3,5,6,7,7,0,0,0,0,0,0,0,4},{0,1,2,3,5,6,7,7,0,0,0,0,0,0,0,4}},
+ {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5}},
  {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
- {{0,1,2,3,4,5,6,7,8,9,11,11,0,0,0,10},{0,1,2,3,4,5,6,8,9,10,11,11,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,11,11,0,0,0,7}},
+ {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,7,8,9,10,11,11,0,0,0,6},{0,1,2,3,4,5,6,8,9,10,11,11,0,0,0,7}},
+ {{0,1,2,3,4,5,6,7,8,9,11,11,0,0,0,10},{0,1,2,3,4,5,6,8,9,10,11,12,12,0,0,7},{0,1,2,3,4,5,6,8,9,10,11,12,12,0,0,7}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8}},
- {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8}},
+ {{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8}},
  {{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8}}
 };
 
 /* 4:2:0 t1 tables (prev-cat > 2) */
 static const uint8_t def_tables_t1_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,2,2,2,3,5,6,6,0,0,0,0,0,0,0,4},{0,2,3,4,4,0,0,0,0,0,0,0,0,0,0,1},{0,2,3,4,5,5,0,0,0,0,0,0,0,0,0,1}},
- {{0,2,2,2,3,4,6,7,7,0,0,0,0,0,0,5},{0,2,2,3,4,5,5,0,0,0,0,0,0,0,0,2},{0,2,2,3,4,5,5,0,0,0,0,0,0,0,0,2}},
- {{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,6,7,7,0,0,0,0,0,0,5},{0,2,2,2,3,4,6,7,7,0,0,0,0,0,0,5}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,11,11,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,11,11,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,11,11,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}}
+ {{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,4,5,5,0,0,0,0,0,0,0,0,3},{0,2,2,2,3,5,6,6,0,0,0,0,0,0,0,4}},
+ {{0,2,2,2,3,4,5,6,8,8,0,0,0,0,0,7},{0,2,2,2,3,4,6,6,0,0,0,0,0,0,0,5},{0,2,2,2,3,4,6,7,7,0,0,0,0,0,0,5}},
+ {{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,7,8,8,0,0,0,0,0,6},{0,2,2,2,3,4,5,7,8,8,0,0,0,0,0,6}},
+ {{0,3,2,2,3,3,4,5,6,7,9,9,0,0,0,8},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}},
+ {{0,3,3,2,2,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}}
 };
 
 static int measure_encode_bits(const int16_t *d, int sz, uint32_t *hc, int *cl) {
@@ -3246,6 +3253,11 @@ static unsigned char *huffman_pack(const int16_t *q_y, const int16_t *q_u, const
 }
 
 /* Auto-find quality for target size via binary search. */
+#ifdef WTPC_RC_DEBUG
+#define WTPC_RC_TRACE(tq, sz) fprintf(stderr, "  [rc step=%d] q=%d sz=%d (target=%d)\n", steps, (tq), (sz), target_bytes)
+#else
+#define WTPC_RC_TRACE(tq, sz) ((void)0)
+#endif
 static unsigned char *find_quality_for_target(const float *y_w, const float *u_w, const float *v_w, const float *a_w, wtpc_enc_info *info, int w, int h, int cw, int ch, int target_bytes, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha) {
     int total = w * h, ctotal = cw * ch;
     int16_t *q_y = malloc(total * sizeof(int16_t));
@@ -3282,7 +3294,7 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         } \
     } while(0)
 
-    /* First-step estimate for the geometric q scale of compute_base().            */
+    /* First-step estimate for the geometric q scale of compute_base().             */
     /* base(q) = BASE_MIN * exp((q-1)*LOG_RATIO), so q inverts from a target step   */
     /* analytically. The empirical part is size(base): entropy coding makes it      */
     /* slightly curved in log-log, so we model ln(base) as a quadratic in           */
@@ -3290,9 +3302,9 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
     /* target), then invert to q. It lands within a few q of the optimum across the */
     /* whole 200 B..36 KB range, cutting the secant search to a few probes. The     */
     /* size(q) curve depends on both the chroma mode (4:2:0 halves the chroma, so   */
-    /* it hits a given size at a lower q, diverging from 4:4:4 by up to ~50 q at     */
+    /* it hits a given size at a lower q, diverging from 4:4:4 by up to ~50 q at    */
     /* high rates) and the entropy coder (Huffman produces larger files than EBCOT  */
-    /* at the same q, needing ~10-45 more q), so we keep a 2x2 table of fits. The    */
+    /* at the same q, needing ~10-45 more q), so we keep a 2x2 table of fits. The   */
     /* two Huffman table variants (single vs context-aware, -h) differ by <~2 q, so */
     /* they share one fit. Size scales sub-linearly with pixel count (~npix^0.35),  */
     /* so we normalize the target to 256x256 first.                                 */
@@ -3300,7 +3312,7 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
     float npix = (float)(w * h);
     float target_n = (float)target_bytes * powf(Q_REF_NPIX / npix, 0.35f);
     if (target_n < 1.0f) target_n = 1.0f;
-    /* Quadratic fit coefficients ln(base) = c2*lt^2 + c1*lt + c0, indexed by       */
+    /* Quadratic fit coefficients ln(base) = c2*lt^2 + c1*lt + c0, indexed by        */
     /* [coder][is_420]. Coder rows: 0=EBCOT, 1=Huffman single-table, 2=Huffman       */
     /* context-aware (huf_extra_ctx / -h 1). Context-aware tables compress a bit     */
     /* better than the single table, so they hit a given size at a slightly lower q  */
@@ -3308,12 +3320,12 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
     /* 0 = ebcot/auto (auto picks the smaller of ebcot/huffman, so its size tracks   */
     /* ebcot); 1 = huffman (row chosen by huf_extra_ctx). */
     static const float qfit[3][2][3] = {
-        /* EBCOT       */ { { -0.08283f, 0.04976f, 8.36937f },   /* 4:4:4 */
-                            { -0.11239f, 0.46221f, 6.95439f } }, /* 4:2:0 */
-        /* Huffman 1tbl */ { { -0.12201f, 0.75157f, 5.68944f },   /* 4:4:4 */
-                            { -0.10537f, 0.44125f, 6.92743f } }, /* 4:2:0 */
-        /* Huffman ctx  */ { { -0.09333f, 0.27103f, 7.52649f },   /* 4:4:4 */
-                            { -0.10756f, 0.46568f, 6.86235f } }, /* 4:2:0 */
+        /* EBCOT        */ { {  -0.07175f,  -0.10383f,   8.86483f },   /* 4:4:4 */
+                            {  -0.08660f,   0.09983f,   8.17468f } },  /* 4:2:0 */
+        /* Huffman 1tbl */ { {  -0.07379f,  -0.02384f,   8.56934f },   /* 4:4:4 */
+                            {  -0.08836f,   0.17478f,   7.90562f } },  /* 4:2:0 */
+        /* Huffman ctx  */ { {  -0.07485f,  -0.01527f,   8.55850f },   /* 4:4:4 */
+                            {  -0.08956f,   0.18502f,   7.89044f } },  /* 4:2:0 */
     };
     int coder = (huffman_mode == 1) ? (huf_extra_ctx ? 2 : 1) : 0;
     const float *fc = qfit[coder][chroma_420 ? 1 : 0];
@@ -3326,11 +3338,11 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
     if (q > MAX_QUALITY) q = MAX_QUALITY;
     /* Local model slope dq/d(ln size), used to seed the secant with a real second  */
     /* point after the first probe instead of a blind bisection midpoint:           */
-    /*   q(ln_base) = 1 + (ln_base - ln(BASE_MIN))/LOG_RATIO                         */
-    /*   d(ln_base)/d(lt) = 2*c2*lt + c1                                             */
+    /*   q(ln_base) = 1 + (ln_base - ln(BASE_MIN))/LOG_RATIO                        */
+    /*   d(ln_base)/d(lt) = 2*c2*lt + c1                                            */
     /* size grows ~1:1 with target here (npix normalization is a constant offset),  */
-    /* so d q / d(ln size) ~= (2*c2*lt + c1)/LOG_RATIO. It is negative (higher q =>  */
-    /* smaller size). Clamp away from ~0 so the extrapolation step stays sane.       */
+    /* so d q / d(ln size) ~= (2*c2*lt + c1)/LOG_RATIO. It is negative (higher q => */
+    /* smaller size). Clamp away from ~0 so the extrapolation step stays sane.      */
     float model_slope = (2.0f * fc[0] * lt + fc[1]) / WTPC_BASE_LOG_RATIO;
     if (model_slope > -1.0f) model_slope = -1.0f;
     int steps = 0, best_q = q, best_dist = 99999999;
@@ -3356,6 +3368,7 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         int _sz; unsigned char *_d; wtpc_enc_info _ti; steps++; \
         PROBE(tq, &_d, &_ti, &_sz); \
         *(out_sz) = _sz; \
+        WTPC_RC_TRACE(tq, _sz); \
         if (_sz < 0) { free(_d); sizes[tq] = 0; break; } \
         sizes[tq] = _sz; \
         if (_sz > target_bytes) { free(_d); break; } \
@@ -3372,6 +3385,7 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         int _sz; unsigned char *_d; wtpc_enc_info _ti; steps++; \
         PROBE(tq, &_d, &_ti, &_sz); \
         *(out_sz) = _sz; \
+        WTPC_RC_TRACE(tq, _sz); \
         if (_sz < 0) { free(_d); sizes[tq] = 0; break; } \
         sizes[tq] = _sz; \
         int _dist = abs(_sz - target_bytes); \
@@ -3412,21 +3426,48 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         }
     }
 
-    /* Secant interpolation in log-log space. size(q) is monotone decreasing */
-    /* and roughly a power law, so interpolating log(q) linearly in log(size) */
-    /* converges very fast (typically 1-3 probes) once we bracket the target. */
+    /* Secant interpolation in log-log space. size(q) is monotone decreasing     */
+    /* and roughly a power law, so interpolating log(q) linearly in log(size)    */
+    /* converges very fast (typically 1-3 probes) once we bracket the target.    */
+    /* We also carry the sizes at the current bracket ends so we can stop early  */
+    /* once one end is already within tie_eps of the target: size(q) can be very */
+    /* flat (a few bytes over many q) at small targets, where shrinking the      */
+    /* bracket further cannot improve the hit and only wastes probes.            */
+#ifndef WTPC_RC_ONLY_LESS_THAN_TARGET
+    int sz_lo = (lo >= 1 && lo <= MAX_QUALITY) ? sizes[lo] : 0;  /* size at lo (>= target) */
+#endif
+    int sz_hi = (hi >= 1 && hi <= MAX_QUALITY) ? sizes[hi] : 0;  /* size at hi (<= target) */
     for (int iter = 0; iter < 12; iter++) {
         if (hi - lo <= 1) break;
+        /* Early exit once an accepted bracket end is within tie_eps of the target.  */
+        /* size(q) can be very flat, so further shrinking cannot improve the hit.    */
+        /* Only ends that CAN become the chosen result count: in undershoot-only     */
+        /* mode (WTPC_RC_ONLY_LESS_THAN_TARGET) the overshoot end (sz_lo) is never   */
+        /* selectable, so keying the exit off it would stop the search at a bad      */
+        /* far-undershoot best -- only the undershoot end (sz_hi) may trigger it.    */
+        if (sz_hi > 0 && sz_hi <= target_bytes && (target_bytes - sz_hi) <= tie_eps) break;
+#ifndef WTPC_RC_ONLY_LESS_THAN_TARGET
+        if (sz_lo > target_bytes && (sz_lo - target_bytes) <= tie_eps) break;
+#endif
         int nq;
+        int use_bisect = 1;
         if (psz > 0 && psz != sz && q != pq && sz > 0) {
-            float lt = logf((float)target_bytes);
+            float lt2 = logf((float)target_bytes);
             float l1 = logf((float)psz), l2 = logf((float)sz);
             float q1 = logf((float)pq), q2 = logf((float)q);
-            float lq = q1 + (q2 - q1) * (lt - l1) / (l2 - l1);
+            float lq = q1 + (q2 - q1) * (lt2 - l1) / (l2 - l1);
             nq = (int)(expf(lq) + 0.5f);
-        } else {
-            nq = (lo + hi) / 2;  /* fall back to bisection */
+            /* Trust the secant unless it extrapolates WELL outside the bracket. A    */
+            /* small overshoot past lo/hi is just a slightly-off estimate and is      */
+            /* clamped to the edge; but on sharp "elbow" size(q) curves the last two  */
+            /* probes sit on the same side and the estimate flies far past the        */
+            /* opposite end -- clamping that keeps re-probing a useless edge and       */
+            /* oscillates, so we bisect instead (guarantees ~log2(hi-lo)).            */
+            int span = hi - lo;
+            int margin = span >> 2;   /* tolerate up to 25% of the bracket outside */
+            if (nq > lo - margin && nq < hi + margin) use_bisect = 0;
         }
+        if (use_bisect) nq = (lo + hi) / 2;
         if (nq <= lo) nq = lo + 1;
         if (nq >= hi) nq = hi - 1;
         if (nq == q || nq == pq) nq = (lo + hi) / 2;  /* avoid stalling */
@@ -3436,8 +3477,12 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
         q = nq;
         TRY(q, &sz);
         if (sz < 0) break;
-        if (sz > target_bytes) { lo = q; }
-        else                   { hi = q; }
+        if (sz > target_bytes) {
+            lo = q;
+#ifndef WTPC_RC_ONLY_LESS_THAN_TARGET
+            sz_lo = sz;
+#endif
+        } else { hi = q; sz_hi = sz; }
     }
 
     /* Polish: probe -+1 around best_q to catch tiny non-monotonicities. */
