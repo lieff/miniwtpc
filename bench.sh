@@ -79,11 +79,11 @@ for q in 665 570 474 369 244 101 78; do
     done
 done
 
-# ---- JPEG (dense calibration, all q with step 1-3 around targets) ----
+# ---- JPEG (all q=1..100, every step for fine granularity) ----
 if [ "$FAST" = "0" ]; then
     echo "" | tee -a "$LOGFILE"
     echo "### JPEG ###" | tee -a "$LOGFILE"
-    for q in 1 2 3 4 5 6 8 10 11 13 15 17 20 23 26 28 31 35 40 45 48 52 55 58 61 65 70 78 83 88 92 93 94 95 98 100; do
+    for q in $(seq 1 100); do
         jpg="$TMPD/jpeg_q${q}.jpg"; dec_bmp="$TMPD/jpeg_q${q}_dec.bmp"; dec_png="$TMPD/jpeg_q${q}_dec.png"
         t0=$(date +%s%N 2>/dev/null); convert "$IMAGE" -quality "$q" "$jpg" 2>/dev/null; t1=$(date +%s%N 2>/dev/null)
         enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
@@ -95,17 +95,25 @@ if [ "$FAST" = "0" ]; then
     done
 fi
 
-# ---- JPEG2000 (full integer rates 6-32 + coarser above) ----
+# ---- JPEG2000 (int rates 2-52 + fractional 0.2-step around target gaps, + coarse for tiny sizes) ----
 if [ "$FAST" = "0" ]; then
     echo "" | tee -a "$LOGFILE"
     echo "### JPEG2000 ###" | tee -a "$LOGFILE"
-    # Integer rates 2-32 cover all targets from ~36 KB down to ~10 KB, coarser above
     ppm="$TMPD/_in.ppm"
     convert "$IMAGE" "$ppm" 2>/dev/null
-    # High rates for very small files (stretch to ~70-800 B range)
-    j2k_rates="2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 56 60 64 68 72 76 80 84 88 92 96 100 104 108 112 120 128 132 140 148 156 168 180 192 208 224 240 256 284 320 360 400 450 500 600 800 1000 1200 1500 2000"
+    # Dense integer rates 2..52 (covers ~10KB..36KB range)
+    # Fractional 0.2-step rates 3.0..8.0 (fills gaps like r=5..6..7 where file size jumps 4-8KB)
+    # Coarse rates for very small files (ultra-low bitrate)
+    j2k_rates=""
+    for r in $(seq 2 52); do j2k_rates="$j2k_rates $r"; done
+    # Fractional 0.2-step rates 3.0..7.8 fills gaps where integer rate jumps 4-8KB
+    for r in 3.0 3.2 3.4 3.6 3.8 4.0 4.2 4.4 4.6 4.8 5.0 5.2 5.4 5.6 5.8 6.0 6.2 6.4 6.6 6.8 7.0 7.2 7.4 7.6 7.8; do
+        j2k_rates="$j2k_rates $r"
+    done
+    j2k_rates="$j2k_rates 56 60 64 68 72 76 80 84 88 92 96 100 104 108 112 120 128 132 140 148 156 168 180 192 208 224 240 256 284 320 360 400 450 500 600 800 1000 1200 1500 2000"
     for r in $j2k_rates; do
-        j2k="$TMPD/j2k_r${r}.jp2"; dec_bmp="$TMPD/j2k_r${r}_dec.bmp"; dec_png="$TMPD/j2k_r${r}_dec.png"
+        rname=$(echo "$r" | tr '.' '_')
+        j2k="$TMPD/j2k_r${rname}.jp2"; dec_bmp="$TMPD/j2k_r${rname}_dec.bmp"; dec_png="$TMPD/j2k_r${rname}_dec.png"
         t0=$(date +%s%N 2>/dev/null); opj_compress -i "$ppm" -o "$j2k" -r "$r" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
         enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
         t0=$(date +%s%N 2>/dev/null); opj_decompress -i "$j2k" -o "$dec_bmp" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
@@ -128,7 +136,7 @@ if [ "$FAST" = "0" ]; then
     convert "$dec_pnm" "$dec_png" 2>/dev/null || true  # for readme samples
     sz=$(fsize "$jxl"); met=$(METRICS "$IMAGE" "$dec_pnm" 2>/dev/null)
     echo "JXL min | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
-    jxl_dist="30 25 20 18 14 11 8 5.5 4.5 3 2 1.5 1.2 1 0.9 0.7 0.5 0.4 0.38 0.35 0.3"
+    jxl_dist="30 25 20 18 16 14 12 11 10 9 8 7 6 5.5 5 4.5 4 3.5 3 2.8 2.5 2.3 2.2 2.1 2 1.9 1.8 1.7 1.6 1.5 1.4 1.3 1.2 1.1 1 0.95 0.9 0.85 0.8 0.75 0.7 0.65 0.6 0.57 0.55 0.52 0.5 0.48 0.45 0.42 0.4 0.38 0.36 0.35 0.34 0.32 0.3"
     for d in $jxl_dist; do
         jxl="$TMPD/jxl_d${d}.jxl"; dec_pnm="$TMPD/jxl_d${d}_dec.pnm"; dec_png="$TMPD/jxl_d${d}_dec.png"
         t0=$(date +%s%N 2>/dev/null); cjxl "$IMAGE" "$jxl" -d "$d" --quiet 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
@@ -275,7 +283,7 @@ md.append('# WTPC vs JPEG vs JPEG2000 vs JPEGXL - Benchmark')
 md.append('')
 md.append(f'**Test image:** `lena256.png` (256x256, 24-bit RGB)  ')
 md.append('**Target range:** 200 B - 36 KB (thumbnails / previews)  ')
-md.append('**Metrics:** PSNR (dB, higher is better), ssimulacra2 (0-100, lower is better)  ')
+**Metrics:** PSNR (dB, higher is better), ssimulacra2 (0-100, higher is better)
 md.append(f'**Date:** {date_str}')
 md.append('')
 

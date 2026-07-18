@@ -31,10 +31,11 @@ at low bitrates and the test dataset is relatively small (~3000 images).
 
    unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info,
        int w, int h, int target_bytes, int quality, int chroma_420,
-       int huffman_mode, int huf_extra_ctx, int has_alpha);
+       int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
      Encode an RGB/RGBA image in memory. Returns malloc'd WTPC bitstream,
      or NULL on error. Caller must free().
-       rgb           : input pixels, w*h*3 bytes (RGB) or w*h*4 (RGBA).
+       rgb           : input pixels, h rows of stride bytes each.
+                        Each row has w pixels, 3 bytes/pixel (RGB) or 4 (RGBA).
        info          : output struct, filled with encoding details (may be NULL).
        w, h          : image dimensions (>= 1).
        target_bytes  : desired output size in bytes. 0 = use 'quality' instead.
@@ -49,6 +50,8 @@ at low bitrates and the test dataset is relatively small (~3000 images).
        huf_extra_ctx : 0 = single Huffman table (faster),
                        1 = two context-switched tables (slightly better).
        has_alpha     : 0 = RGB (3 channels), 1 = RGBA (4 channels).
+       stride        : bytes per row (0 = tightly packed = w * pixel_bytes).
+                        Allows BMP-like padded data without repacking.
 
    unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len,
        int *w, int *h, int *out_quality, int *out_comp);
@@ -62,7 +65,7 @@ at low bitrates and the test dataset is relatively small (~3000 images).
 
    int wtpc_encode_file(const char *out_path, const unsigned char *rgb,
        wtpc_enc_info *info, int w, int h, int target_bytes, int quality,
-       int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha);
+       int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
      Same as wtpc_encode_mem but writes directly to a file.
      Returns 0 on success, -1 on error.
 
