@@ -283,7 +283,7 @@ md.append('# WTPC vs JPEG vs JPEG2000 vs JPEGXL - Benchmark')
 md.append('')
 md.append(f'**Test image:** `lena256.png` (256x256, 24-bit RGB)  ')
 md.append('**Target range:** 200 B - 36 KB (thumbnails / previews)  ')
-**Metrics:** PSNR (dB, higher is better), ssimulacra2 (0-100, higher is better)
+md.append('**Metrics:** PSNR (dB, higher is better), ssimulacra2 (0-100, higher is better)')
 md.append(f'**Date:** {date_str}')
 md.append('')
 

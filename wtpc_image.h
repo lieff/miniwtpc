@@ -109,8 +109,8 @@ typedef struct {
 
 typedef struct {
     uint8_t *data;
-    int byte_pos;
-    int buf_size;
+    size_t byte_pos;
+    size_t buf_size;
     uint32_t cache;
     int bits_in_cache;
 } Bitstream;
@@ -149,7 +149,7 @@ static __inline int msvc_clz32(unsigned int x) {
 #define __builtin_clz(x) msvc_clz32((unsigned int)(x))
 #endif
 
-static void bitstream_init(Bitstream *bs, const uint8_t *buffer, int buf_size) {
+static void bitstream_init(Bitstream *bs, const uint8_t *buffer, size_t buf_size) {
     bs->data = (uint8_t*)buffer;
     bs->byte_pos = 0;
     bs->buf_size = buf_size;
@@ -2285,9 +2285,9 @@ static int huffman_decode_symbol(Bitstream *bs, uint32_t *huff_codes, int *code_
 #define NUM_HUFF_SYMBOLS 16
 #define EOB_SYMBOL 15
 
-static void count_frequencies(const int16_t *d, int sz, int *freq) {
+static void count_frequencies(const int16_t *d, size_t sz, int *freq) {
     memset(freq, 0, NUM_HUFF_SYMBOLS * sizeof(int));
-    for (int i = 0; i < sz; i++) {
+    for (size_t i = 0; i < sz; i++) {
         if (d[i] == 0) continue;
         int cat = category_of(d[i]);
         if (cat < NUM_HUFF_SYMBOLS-1) freq[cat]++;
@@ -2296,10 +2296,10 @@ static void count_frequencies(const int16_t *d, int sz, int *freq) {
 }
 
 /* Write one channel: for each nonzero value emit (huffman_code, eg_run, extra_bits) */
-static void huffman_encode_runval(Bitstream *bs, const int16_t *d, int sz,
+static void huffman_encode_runval(Bitstream *bs, const int16_t *d, size_t sz,
                                    uint32_t *hc, int *cl) {
     int run = 0;
-    for (int i = 0; i < sz; i++) {
+    for (size_t i = 0; i < sz; i++) {
         if (d[i] == 0) { run++; continue; }
         int cat = category_of(d[i]);
         put_bits(bs, hc[cat], cl[cat]);
@@ -2312,14 +2312,14 @@ static void huffman_encode_runval(Bitstream *bs, const int16_t *d, int sz,
         put_bits(bs, hc[EOB_SYMBOL], cl[EOB_SYMBOL]);
 }
 
-static void huffman_decode_channel(Bitstream *bs, int16_t *o, int sz,
+static void huffman_decode_channel(Bitstream *bs, int16_t *o, size_t sz,
                       int *cl, uint32_t *hc) {
-    int i = 0;
+    size_t i = 0;
     while (i < sz) {
         int sym = huffman_decode_symbol(bs, hc, cl, NUM_HUFF_SYMBOLS);
         if (sym < 0 || sym == EOB_SYMBOL) { while (i < sz) o[i++] = 0; return; }
         int run = get_eg(bs);
-        int end = i + run; if (end > sz) end = sz;
+        size_t end = i + run; if (end > sz) end = sz;
         while (i < end) o[i++] = 0;
         if (i >= sz) break;
         uint32_t bits = get_bits(bs, sym);
@@ -2328,10 +2328,10 @@ static void huffman_decode_channel(Bitstream *bs, int16_t *o, int sz,
 }
 
 /* Context-aware Huffman: prev non-zero category selects between 2 tables */
-static void huffman_encode_ctx(Bitstream *bs, const int16_t *d, int sz,
+static void huffman_encode_ctx(Bitstream *bs, const int16_t *d, size_t sz,
                                 uint32_t *hc0, int *cl0, uint32_t *hc1, int *cl1) {
     int run = 0, last_cat = 0;
-    for (int i = 0; i < sz; i++) {
+    for (size_t i = 0; i < sz; i++) {
         if (d[i] == 0) { run++; continue; }
         int cat = category_of(d[i]);
         uint32_t *hc = (last_cat <= 2) ? hc0 : hc1;
@@ -2348,11 +2348,11 @@ static void huffman_encode_ctx(Bitstream *bs, const int16_t *d, int sz,
     }
 }
 
-static void count_frequencies_ctx(const int16_t *d, int sz, int *freq0, int *freq1) {
+static void count_frequencies_ctx(const int16_t *d, size_t sz, int *freq0, int *freq1) {
     memset(freq0, 0, NUM_HUFF_SYMBOLS * sizeof(int));
     memset(freq1, 0, NUM_HUFF_SYMBOLS * sizeof(int));
     int last_cat = 0;
-    for (int i = 0; i < sz; i++) {
+    for (size_t i = 0; i < sz; i++) {
         if (d[i] == 0) continue;
         int cat = category_of(d[i]);
         if (cat < NUM_HUFF_SYMBOLS-1) {
@@ -2363,9 +2363,9 @@ static void count_frequencies_ctx(const int16_t *d, int sz, int *freq0, int *fre
     freq0[EOB_SYMBOL] = 1; freq1[EOB_SYMBOL] = 1;
 }
 
-static int measure_encode_bits_ctx(const int16_t *d, int sz,
+static int measure_encode_bits_ctx(const int16_t *d, size_t sz,
                                     uint32_t *hc0, int *cl0, uint32_t *hc1, int *cl1) {
-    int buf_sz = sz * 3;
+    size_t buf_sz = sz * 3;
     uint8_t *tmp = (uint8_t*)calloc(1, buf_sz);
     Bitstream bs; bitstream_init(&bs, tmp, buf_sz);
     huffman_encode_ctx(&bs, d, sz, hc0, cl0, hc1, cl1);
@@ -2451,8 +2451,8 @@ static const uint8_t def_tables_t1_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
  {{0,3,3,2,2,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}}
 };
 
-static int measure_encode_bits(const int16_t *d, int sz, uint32_t *hc, int *cl) {
-    int buf_sz = sz * 3;  /* safe upper bound */
+static int measure_encode_bits(const int16_t *d, size_t sz, uint32_t *hc, int *cl) {
+    size_t buf_sz = sz * 3;  /* safe upper bound */
     uint8_t *tmp = (uint8_t*)calloc(1, buf_sz);
     Bitstream bs;
     bitstream_init(&bs, tmp, buf_sz);
@@ -2462,7 +2462,7 @@ static int measure_encode_bits(const int16_t *d, int sz, uint32_t *hc, int *cl) 
     return bitstream_bits(&bs);
 }
 
-static int pick_best_table(const int16_t *d, int sz, int *freq, int ch,
+static int pick_best_table(const int16_t *d, size_t sz, int *freq, int ch,
                            int *clo, uint32_t *hco, int *best_bits, int is_420) {
     int best_idx = 0, best_total = 99999999;
     int cl[NUM_HUFF_SYMBOLS]; uint32_t hc[NUM_HUFF_SYMBOLS];
@@ -2503,7 +2503,7 @@ static int pick_best_table(const int16_t *d, int sz, int *freq, int ch,
 /* Pick best pair of context tables (t0 for prev-cat<=2, t1 for prev-cat>2). */
 /* Returns codes in cl0/hc0 (table0) and cl1/hc1 (table1). */
 /* t0: 0..6=default, 7=custom.  t1: 0..6=default, NUM_DEF_T1=custom. */
-static void pick_best_tables_ctx(const int16_t *d, int sz, int ch, const int16_t *extra, int *t0_out, int *t1_out,
+static void pick_best_tables_ctx(const int16_t *d, size_t sz, int ch, const int16_t *extra, int *t0_out, int *t1_out,
                                  int *cl0, uint32_t *hc0, int *cl1, uint32_t *hc1, int *best_total, int is_420) {
     int freq0[NUM_HUFF_SYMBOLS], freq1[NUM_HUFF_SYMBOLS];
     count_frequencies_ctx(d, sz, freq0, freq1);
@@ -2602,16 +2602,16 @@ static void pick_best_tables_ctx(const int16_t *d, int sz, int ch, const int16_t
     if (best_total) *best_total = best_bits;
 }
 
-static void huffman_decode_ctx(Bitstream *bs, int16_t *o, int sz,
+static void huffman_decode_ctx(Bitstream *bs, int16_t *o, size_t sz,
                                 int *cl0, uint32_t *hc0, int *cl1, uint32_t *hc1) {
-    int i = 0, last_cat = 0;
+    size_t i = 0; int last_cat = 0;
     while (i < sz) {
         int *cl = (last_cat <= 2) ? cl0 : cl1;
         uint32_t *hc = (last_cat <= 2) ? hc0 : hc1;
         int sym = huffman_decode_symbol(bs, hc, cl, NUM_HUFF_SYMBOLS);
         if (sym < 0 || sym == EOB_SYMBOL) { while (i < sz) o[i++] = 0; return; }
         int run = get_eg(bs);
-        int end = i + run; if (end > sz) end = sz;
+        size_t end = i + run; if (end > sz) end = sz;
         while (i < end) o[i++] = 0;
         if (i >= sz) break;
         uint32_t bits = get_bits(bs, sym);
@@ -2700,11 +2700,11 @@ static void bacm_update(BacModel *m, int bit) {
 typedef struct {
     uint8_t *out;
     uint64_t low;        /* 64-bit - carries propagate to bits 32+ */
+    size_t   pos, sz;
     uint32_t range;
-    int      pos, sz;
-    uint8_t  cache;      /* most recent non-0xFF output byte            */
     int      cache_nff;  /* number of buffered 0xFF bytes (may carry)   */
     int      first;      /* first output byte not yet committed         */
+    uint8_t  cache;      /* most recent non-0xFF output byte            */
 } BacEnc;
 
 /* Shift one byte out of low with correct carry propagation. */
@@ -2729,7 +2729,7 @@ static void bac_shift_low(BacEnc *e) {
     e->low = (lo << 8) & 0xFFFFFFFFULL;
 }
 
-static void bac_init_enc(BacEnc *e, uint8_t *buf, int sz) {
+static void bac_init_enc(BacEnc *e, uint8_t *buf, size_t sz) {
 #ifdef BAC_USE_TABLE
     bac_recip_init();
 #endif
@@ -2786,10 +2786,10 @@ static int bac_flush_enc(BacEnc *e) {
 typedef struct {
     const uint8_t *in;
     uint32_t range, code;   /* code = 4-byte window into the bitstream */
-    int      pos, sz;
+    size_t   pos, sz;
 } BacDec;
 
-static void bac_init_dec(BacDec *d, const uint8_t *buf, int sz) {
+static void bac_init_dec(BacDec *d, const uint8_t *buf, size_t sz) {
 #ifdef BAC_USE_TABLE
     bac_recip_init();
 #endif
@@ -2844,11 +2844,11 @@ typedef struct { uint8_t sig, nsig; } EbcotCtx;
 /* Encode one channel using EBCOT-lite into an existing BAC encoder. */
 /* Returns number of bit-planes (bp). */
 static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int h) {
-    int total = w * h;
-    if (total <= 0) return 0;
+    size_t total = (size_t)w * h;
+    if (total == 0) return 0;
     /* Find max absolute value to determine bit-planes */
     int max_val = 0;
-    for (int i = 0; i < total; i++) {
+    for (size_t i = 0; i < total; i++) {
         int av = abs(coeffs[i]);
         if (av > max_val) max_val = av;
     }
@@ -2865,7 +2865,8 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
     /* For each bit-plane (MSB first) */
     for (int b = bp - 1; b >= 0; b--) {
         int bit_mask = 1 << b;
-        for (int i = 0, x = 0, y = 0; i < total; i++, x++) {
+        int x = 0, y = 0;
+        for (size_t i = 0; i < total; i++, x++) {
             if (x == w) { x = 0; y++; }
             int16_t v = coeffs[i];
 
@@ -2924,8 +2925,8 @@ static uint8_t ebcot_encode_channel(BacEnc *e, const int16_t *coeffs, int w, int
 /* Decode one channel from a shared BAC decoder. */
 /* coeffs: pre-allocated output (calloc'd), bp: number of bit-planes. */
 static void ebcot_decode_channel(BacDec *d, int16_t *coeffs, int w, int h, int bp) {
-    int total = w * h;
-    if (total <= 0) return;
+    size_t total = (size_t)w * h;
+    if (total == 0) return;
     BacModel models[TOTAL_CTX];
     for (int i = 0; i < TOTAL_CTX; i++) bacm_init_ctx(&models[i], i);
 
@@ -2934,7 +2935,8 @@ static void ebcot_decode_channel(BacDec *d, int16_t *coeffs, int w, int h, int b
 
     for (int b = bp - 1; b >= 0; b--) {
         int bit_mask = 1 << b;
-        for (int i = 0, x = 0, y = 0; i < total; i++, x++) {
+        int x = 0, y = 0;
+        for (size_t i = 0; i < total; i++, x++) {
             if (x == w) { x = 0; y++; }
             int ctx_sig = ctx[i].nsig;
             if (ctx_sig > 4) ctx_sig = 4;
@@ -3022,9 +3024,9 @@ static uint8_t *ebcot_pack(const int16_t *q_y, const int16_t *q_u, const int16_t
                             int quality, int chroma_420, int *out_size) {
     /* Worst case: 3 channels x (non-420) x 16 bits/coeff x 3 bytes margin */
     /*             = total coeffs x 48 bits -> 6 bytes/coeff. total*8 for safety. */
-    int buf_sz = w * h * 8 + 4096;
+    size_t buf_sz = (size_t)w * h * 8 + 4096;
     int hdr_sz = wtp_header_size(w, h, quality) + (q_a ? 3 : 2);  /* packed bp = 15 or 20 bits */
-    uint8_t *out = malloc(hdr_sz + buf_sz);
+    uint8_t *out = (uint8_t*)malloc(hdr_sz + buf_sz);
     if (!out) return NULL;
 
     BacEnc e;
@@ -3057,8 +3059,9 @@ static uint8_t *ebcot_pack(const int16_t *q_y, const int16_t *q_u, const int16_t
 }
 
 static uint8_t *ebcot_decode_mem(const uint8_t *data, int data_len, int pos, int w, int h, int quality, int is_420, int alpha) {
-    int total = w * h;
-    int cw = is_420 ? (w+1)/2 : w, ch = is_420 ? (h+1)/2 : h, ctotal = cw * ch;
+    size_t total = (size_t)w * h;
+    int cw = is_420 ? (w+1)/2 : w, ch = is_420 ? (h+1)/2 : h;
+    size_t ctotal = (size_t)cw * ch;
 
     /* Read packed bp: 5 bits each from 2 or 3 bytes */
     uint8_t bp_y, bp_u, bp_v, bp_a = 0;
@@ -3131,7 +3134,7 @@ static uint8_t *ebcot_decode_mem(const uint8_t *data, int data_len, int pos, int
 static unsigned char *huffman_pack(const int16_t *q_y, const int16_t *q_u, const int16_t *q_v, const int16_t *q_a, wtpc_enc_info *info,
                                     int w, int h, int cw, int ch,
                                     int quality, int chroma_420, int huf_extra_ctx, int *out_size) {
-    int total = w * h, ctotal = cw * ch;
+    size_t total = (size_t)w * h, ctotal = (size_t)cw * ch;
     int has_alpha = (q_a != NULL);
     int hdr_sz = wtp_header_size(w, h, quality) + 1 + (huf_extra_ctx ? 1 : 0);  /* +1=tables, +1=extra_tables */
     unsigned char *out = (unsigned char*)malloc(total * 4 * 3 + 4096);
@@ -3231,7 +3234,7 @@ static unsigned char *huffman_pack(const int16_t *q_y, const int16_t *q_u, const
     bitstream_flush(&bs);
     int stream_len = bitstream_bytes(&bs);
 
-    int total_sz = hdr_sz + stream_len;
+    int packed_sz = hdr_sz + stream_len;
     uint8_t flags = 0;
     if (shared_v)       flags |= 1 << 5;
     if (huf_extra_ctx)  flags |= 1 << 6;
@@ -3242,10 +3245,10 @@ static unsigned char *huffman_pack(const int16_t *q_y, const int16_t *q_u, const
     if (huf_extra_ctx)
         out[pos++] = (uint8_t)((t_y1 & 3) | ((t_u1 & 7) << 2) | ((t_v1 & 7) << 5));
 
-    unsigned char *shrunk = (unsigned char*)realloc(out, total_sz); if (shrunk) out = shrunk;
-    if (out_size) *out_size = total_sz;
+    unsigned char *shrunk = (unsigned char*)realloc(out, packed_sz); if (shrunk) out = shrunk;
+    if (out_size) *out_size = packed_sz;
     if (info) {
-        info->ebcot = 0; info->encoded_bytes = total_sz; info->result_q = quality;
+        info->ebcot = 0; info->encoded_bytes = packed_sz; info->result_q = quality;
         info->huffman_y_size = t_y_size; info->huffman_u_size = t_u_size; info->huffman_v_size = t_v_size;
         info->huffman_y_table = t_y0; info->huffman_u_table = t_u0; info->huffman_v_table = t_v0;
     }
@@ -3259,7 +3262,7 @@ static unsigned char *huffman_pack(const int16_t *q_y, const int16_t *q_u, const
 #define WTPC_RC_TRACE(tq, sz) ((void)0)
 #endif
 static unsigned char *find_quality_for_target(const float *y_w, const float *u_w, const float *v_w, const float *a_w, wtpc_enc_info *info, int w, int h, int cw, int ch, int target_bytes, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha) {
-    int total = w * h, ctotal = cw * ch;
+    size_t total = (size_t)w * h, ctotal = (size_t)cw * ch;
     int16_t *q_y = malloc(total * sizeof(int16_t));
     int16_t *q_u = malloc(ctotal * sizeof(int16_t));
     int16_t *q_v = malloc(ctotal * sizeof(int16_t));
@@ -3527,13 +3530,24 @@ exit_error:
 
 unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride) {
     memset(info, 0, sizeof(*info));
-    if (w < 0 || w > 65536 || h < 0 || h > 65536 || (!target_bytes && (quality < 1 || quality > MAX_QUALITY))) return 0;
+    if (!target_bytes && (quality < 1 || quality > MAX_QUALITY)) return 0;
+    /* Platform-aware max dimension (format caps w,h at 65536) plus
+       peak-memory SIZE_MAX check. Peak simultaneous allocations:
+        4:4:4 no alpha: 18 bytes/px (y+u+v float*3 + q_y+u+v int16*3)
+        4:4:4 alpha:    24       (+a float + q_a int16)
+        4:2:0 no alpha: 14       (y+u_full+v_full+u+v float during downsample)
+        4:2:0 alpha:    18       (+a float)
+       SIZE_MAX / peak_factor gives max safe w*h for the platform. */
+    int max_dim = sizeof(size_t) >= 8 ? 65536 : 32768;
+    if (w < 1 || w > max_dim || h < 1 || h > max_dim) return 0;
+    size_t peak = chroma_420 ? (has_alpha ? 18 : 14) : (has_alpha ? 24 : 18);
+    if (peak > 0 && (size_t)w * h > SIZE_MAX / peak) return 0;
 
     /* Pre-compute wavelet coefficients (quality-independent, shared by all paths) */
-    int total = w * h;
+    size_t total = (size_t)w * h;
     int cw = w, ch = h;
     if (chroma_420) { cw = (w+1)/2; ch = (h+1)/2; }
-    int ctotal = cw * ch;
+    size_t ctotal = (size_t)cw * ch;
     int pixel_stride = has_alpha ? 4 : 3;
     int line_stride = (stride > 0) ? stride : w * pixel_stride;
 
@@ -3661,6 +3675,12 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     /* Extended dimensions: hi bytes of (w-1) and (h-1) */
     if (wh_hi) { *w = ((*w - 1) | ((uint32_t)data[pos] << 8)) + 1; pos++; *h = ((*h - 1) | ((uint32_t)data[pos] << 8)) + 1; pos++; }
 
+    /* Validate decoded dimensions against platform limits (same as encoder) */
+    int max_dim = sizeof(size_t) >= 8 ? 65536 : 32768;
+    if (*w < 1 || *w > max_dim || *h < 1 || *h > max_dim) return NULL;
+    size_t peak = is_420 ? (alpha ? 18 : 14) : (alpha ? 24 : 18);
+    if (peak > 0 && (size_t)(*w) * (*h) > SIZE_MAX / peak) return NULL;
+
     if (is_ebcot)
         return ebcot_decode_mem(data, data_len, pos, *w, *h, quality, is_420, alpha);
 
@@ -3676,8 +3696,9 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     }
 
     /* Huffman decode path - context-based: 2 tables/channel, prev-cat <=2 vs >2 */
-    int total = (*w) * (*h);
-    int cw = is_420 ? ((*w)+1)/2 : (*w), ch = is_420 ? ((*h)+1)/2 : (*h), ctotal = cw * ch;
+    size_t total = (size_t)(*w) * (*h);
+    int cw = is_420 ? ((*w)+1)/2 : (*w), ch = is_420 ? ((*h)+1)/2 : (*h);
+    size_t ctotal = (size_t)cw * ch;
     int16_t *q_y = (int16_t*)calloc(total, sizeof(int16_t));
     int16_t *q_u = (int16_t*)calloc(ctotal, sizeof(int16_t));
     int16_t *q_v = (int16_t*)calloc(ctotal, sizeof(int16_t));

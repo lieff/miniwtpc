@@ -123,6 +123,37 @@ static uint8_t *read_png(const char *path, int *w, int *h, int *has_alpha) {
 /* Produces three table sets for 4:4:4 + three for 4:2:0: */
 /*   def_tables_single, def_tables_t0, def_tables_t1 */
 /*   def_tables_single_420, def_tables_t0_420, def_tables_t1_420 */
+static void put(int64_t f[NUM_HUFF_SYMBOLS]) {
+    int fi[NUM_HUFF_SYMBOLS];
+    for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) {
+        int64_t v = f[s];
+        fi[s] = (int)(v > INT_MAX ? INT_MAX : v);
+    }
+    if (fi[EOB_SYMBOL] == 0) fi[EOB_SYMBOL] = 1;
+    int cl[NUM_HUFF_SYMBOLS];
+    build_huffman_codes(fi, NUM_HUFF_SYMBOLS, cl);
+    printf("{");
+    for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) {
+        printf("%d", cl[s]);
+        if (s < NUM_HUFF_SYMBOLS - 1) printf(",");
+    }
+    printf("}");
+}
+
+static void put_set(int64_t freq[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS]) {
+    for (int lev = 0; lev < NUM_DEF_TABLES; lev++) {
+        printf(" {");
+        for (int ch = 0; ch < 3; ch++) {
+            int64_t f[NUM_HUFF_SYMBOLS];
+            for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) f[s] = freq[lev][ch][s];
+            put(f);
+            if (ch < 2) printf(",");
+        }
+        printf("}");
+        if (lev < NUM_DEF_TABLES - 1) printf(",\n"); else printf("\n");
+    }
+}
+
 static void generate_tables(const char *dir_path) {
     int q_levels[NUM_DEF_TABLES] = {665, 570, 474, 368, 244, 101, 78}; /* from mean_q= for each target after quantization tune */
 
@@ -162,7 +193,7 @@ static void generate_tables(const char *dir_path) {
         }
         if (!rgb) continue;
 
-        int total = w * h, stride = has_alpha ? 4 : 3;
+        size_t total = (size_t)w * h; int stride = has_alpha ? 4 : 3;
         float *y_w = malloc(total * sizeof(float));
         float *u_w = malloc(total * sizeof(float));
         float *v_w = malloc(total * sizeof(float));
@@ -180,10 +211,10 @@ static void generate_tables(const char *dir_path) {
             free(a_w); free(q_a);
             free(rgb); continue;
         }
-        for (int i = 0; i < total; ++i)
+        for (size_t i = 0; i < total; ++i)
             rgb_to_yuv(rgb[i*stride], rgb[i*stride+1], rgb[i*stride+2], &y_w[i], &u_w[i], &v_w[i]);
         if (has_alpha) {
-            for (int i = 0; i < total; i++) a_w[i] = (float)rgb[i*4 + 3] - 128.0f;
+            for (size_t i = 0; i < total; i++) a_w[i] = (float)rgb[i*4 + 3] - 128.0f;
         }
         free(rgb);
 
@@ -275,37 +306,6 @@ static void generate_tables(const char *dir_path) {
     closedir(d);
     fprintf(stderr, "\nTotal: %d images\n", img_count);
     if (img_count == 0) return;
-
-    /* Helper: output one table level */
-    void put(int64_t f[NUM_HUFF_SYMBOLS]) {
-        int fi[NUM_HUFF_SYMBOLS];
-        for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) {
-            int64_t v = f[s];
-            fi[s] = (int)(v > INT_MAX ? INT_MAX : v);
-        }
-        if (fi[EOB_SYMBOL] == 0) fi[EOB_SYMBOL] = 1;
-        int cl[NUM_HUFF_SYMBOLS];
-        build_huffman_codes(fi, NUM_HUFF_SYMBOLS, cl);
-        printf("{");
-        for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) {
-            printf("%d", cl[s]);
-            if (s < NUM_HUFF_SYMBOLS - 1) printf(",");
-        }
-        printf("}");
-    }
-    void put_set(int64_t freq[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS]) {
-        for (int lev = 0; lev < NUM_DEF_TABLES; lev++) {
-            printf(" {");
-            for (int ch = 0; ch < 3; ch++) {
-                int64_t f[NUM_HUFF_SYMBOLS];
-                for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) f[s] = freq[lev][ch][s];
-                put(f);
-                if (ch < 2) printf(",");
-            }
-            printf("}");
-            if (lev < NUM_DEF_TABLES - 1) printf(",\n"); else printf("\n");
-        }
-    }
 
     printf("// Auto-generated Huffman tables from %d images\n", img_count);
     printf("// Quality levels: {%d,%d,%d,%d,%d,%d,%d}\n",
@@ -1054,7 +1054,7 @@ int main(int argc, char **argv) {
 #endif
             {
                 img = stbi_load(input, &w, &h, &comp, 0);
-                if (!img) { printf("Cannot load: %s\n", input); return 1; }
+                if (!img) { printf("Cannot load: %s, reason: %s\n", input, stbi_failure_reason()); return 1; }
                 has_alpha = (comp == 4);
             }
         }
