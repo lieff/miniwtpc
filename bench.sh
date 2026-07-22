@@ -89,7 +89,7 @@ if [ "$FAST" = "0" ]; then
         enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
         t0=$(date +%s%N 2>/dev/null); convert "$jpg" "$dec_bmp" 2>/dev/null; t1=$(date +%s%N 2>/dev/null)
         dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
-        convert "$dec_bmp" "$dec_png" 2>/dev/null || true  # for ssimulacra2 (doesn't support BMP)
+        convert "$dec_bmp" -strip "$dec_png" 2>/dev/null || true  # for ssimulacra2 (doesn't support BMP)
         sz=$(fsize "$jpg"); met=$(METRICS "$IMAGE" "$dec_png" 2>/dev/null)
         echo "JPEG q=$q | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
     done
@@ -118,7 +118,7 @@ if [ "$FAST" = "0" ]; then
         enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
         t0=$(date +%s%N 2>/dev/null); opj_decompress -i "$j2k" -o "$dec_bmp" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
         dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
-        convert "$dec_bmp" "$dec_png" 2>/dev/null || true  # for ssimulacra2
+        convert "$dec_bmp" -strip "$dec_png" 2>/dev/null || true  # for ssimulacra2
         sz=$(fsize "$j2k"); met=$(METRICS "$IMAGE" "$dec_png" 2>/dev/null)
         echo "J2K r=$r | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
     done
@@ -133,7 +133,7 @@ if [ "$FAST" = "0" ]; then
     enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
     t0=$(date +%s%N 2>/dev/null); djxl "$jxl" "$dec_pnm" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
     dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
-    convert "$dec_pnm" "$dec_png" 2>/dev/null || true  # for readme samples
+    convert "$dec_pnm" -strip "$dec_png" 2>/dev/null || true  # for readme samples
     sz=$(fsize "$jxl"); met=$(METRICS "$IMAGE" "$dec_pnm" 2>/dev/null)
     echo "JXL min | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
     jxl_dist="30 25 20 18 16 14 12 11 10 9 8 7 6 5.5 5 4.5 4 3.5 3 2.8 2.5 2.3 2.2 2.1 2 1.9 1.8 1.7 1.6 1.5 1.4 1.3 1.2 1.1 1 0.95 0.9 0.85 0.8 0.75 0.7 0.65 0.6 0.57 0.55 0.52 0.5 0.48 0.45 0.42 0.4 0.38 0.36 0.35 0.34 0.32 0.3"
@@ -143,7 +143,7 @@ if [ "$FAST" = "0" ]; then
         enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
         t0=$(date +%s%N 2>/dev/null); djxl "$jxl" "$dec_pnm" 2>/dev/null || true; t1=$(date +%s%N 2>/dev/null)
         dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
-        convert "$dec_pnm" "$dec_png" 2>/dev/null || true  # for readme samples
+        convert "$dec_pnm" -strip "$dec_png" 2>/dev/null || true  # for readme samples
         sz=$(fsize "$jxl"); met=$(METRICS "$IMAGE" "$dec_pnm" 2>/dev/null)
         echo "JXL d=$d | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
     done
@@ -215,6 +215,86 @@ for f in "$SAMPLES"/*; do
     echo "  $(basename "$f"): $(fsize "$f") bytes" | tee -a "$LOGFILE"
 done
 
+# ---- AVIF: pre-tuned q values for each target at each speed ----
+if [ "$FAST" = "0" ]; then
+    # Pre-tuned q values per speed (empirically closest to targets 1K..36K on lena256.png)
+    # plus q=0 (worst quality) for reference
+    avif_q_s0="0 3 10 17 36 54 76 85 90"
+    avif_q_s6="0 3 10 19 36 55 76 88 92"
+    avif_q_s10="0 3 9 16 33 51 72 86 90"
+
+    for speed in 0 6 10; do
+        echo "" | tee -a "$LOGFILE"
+        echo "### AVIF --speed $speed ###" | tee -a "$LOGFILE"
+        eval "ql=\$avif_q_s${speed}"
+        for q in $ql; do
+            avif="$TMPD/avif_s${speed}_q${q}.avif"
+            dec_y4m="$TMPD/avif_s${speed}_q${q}_dec.y4m"
+            dec_png="$TMPD/avif_s${speed}_q${q}_dec.png"
+            t0=$(date +%s%N 2>/dev/null)
+            avifenc -q "$q" --speed "$speed" "$IMAGE" "$avif" 2>/dev/null || true
+            t1=$(date +%s%N 2>/dev/null)
+            enc_ms=$(( (t1 - t0) / 1000000 )); [ -z "$enc_ms" ] && enc_ms=0
+            t0=$(date +%s%N 2>/dev/null)
+            avifdec -r "$avif" "$dec_y4m" 2>/dev/null || true
+            t1=$(date +%s%N 2>/dev/null)
+            dec_ms=$(( (t1 - t0) / 1000000 )); [ -z "$dec_ms" ] && dec_ms=0
+            ffmpeg -y -i "$dec_y4m" -map_metadata -1 "$dec_png" 2>/dev/null || true
+            rm -f "$dec_y4m"
+            sz=$(fsize "$avif"); met=$(METRICS "$IMAGE" "$dec_png" 2>/dev/null)
+            echo "AVIF s=$speed q=$q | $sz | $met | enc=$enc_ms dec=$dec_ms" | tee -a "$LOGFILE"
+
+            # Encode WTPC EBCOT 4:4:4 at same size as this AVIF file
+            wf="$TMPD/avif_wtpc_e_s${speed}_q${q}.wtpc"
+            wdec="$TMPD/avif_wtpc_e_s${speed}_q${q}_dec.png"
+            # First pass: -b to find quality
+            out=$(./wtpc -e "$IMAGE" -o "$wf" -b "$sz" -m "ebcot" 2>&1)
+            wq=$(echo "$out" | grep -o 'q=[0-9]*' | grep -o '[0-9]*' | head -1); [ -z "$wq" ] && wq=1
+            # Second pass: -q, capture internal timing from WTPC output (no date overhead)
+            out=$(./wtpc -e "$IMAGE" -o "$wf" -q "$wq" -m "ebcot" 2>&1)
+            enc_w=$(echo "$out" | grep -o 'in [0-9.]* ms' | grep -o '[0-9.]*'); [ -z "$enc_w" ] && enc_w=0
+            out2=$(./wtpc -d "$wf" -o "$wdec" 2>&1)
+            dec_w=$(echo "$out2" | grep -o 'in [0-9.]* ms' | grep -o '[0-9.]*'); [ -z "$dec_w" ] && dec_w=0
+            wsz=$(fsize "$wf"); wmet=$(METRICS "$IMAGE" "$wdec" 2>/dev/null)
+            echo "AVIF_WTPC_E s=$speed q=$q wq=$wq | $wsz | $wmet | enc=$enc_w dec=$dec_w" | tee -a "$LOGFILE"
+
+            # Encode WTPC EBCOT 4:2:0 at same size as this AVIF file
+            wf420="$TMPD/avif_w420_e_s${speed}_q${q}.wtpc"
+            wdec420="$TMPD/avif_w420_e_s${speed}_q${q}_dec.png"
+            out=$(./wtpc -e "$IMAGE" -o "$wf420" -b "$sz" -m "ebcot" -c 2>&1)
+            wq420=$(echo "$out" | grep -o 'q=[0-9]*' | grep -o '[0-9]*' | head -1); [ -z "$wq420" ] && wq420=1
+            out=$(./wtpc -e "$IMAGE" -o "$wf420" -q "$wq420" -m "ebcot" -c 2>&1)
+            enc_w=$(echo "$out" | grep -o 'in [0-9.]* ms' | grep -o '[0-9.]*'); [ -z "$enc_w" ] && enc_w=0
+            out2=$(./wtpc -d "$wf420" -o "$wdec420" 2>&1)
+            dec_w=$(echo "$out2" | grep -o 'in [0-9.]* ms' | grep -o '[0-9.]*'); [ -z "$dec_w" ] && dec_w=0
+            wsz=$(fsize "$wf420"); wmet=$(METRICS "$IMAGE" "$wdec420" 2>/dev/null)
+            echo "AVIF_W420_E s=$speed q=$q wq=$wq420 | $wsz | $wmet | enc=$enc_w dec=$dec_w" | tee -a "$LOGFILE"
+        done
+    done
+fi
+
+# AVIF --speed 6 vs best WTPC comparison samples
+echo "" | tee -a "$LOGFILE"
+echo "=== Saving AVIF comparison samples ===" | tee -a "$LOGFILE"
+cp "$TMPD/avif_s6_q0_dec.png"   "$SAMPLES/AVIF_S6_726b.png"    2>/dev/null || true
+cp "$TMPD/avif_s6_q3_dec.png"   "$SAMPLES/AVIF_S6_1kb.png"     2>/dev/null || true
+cp "$TMPD/avif_s6_q10_dec.png"  "$SAMPLES/AVIF_S6_1.4kb.png"   2>/dev/null || true
+cp "$TMPD/avif_s6_q19_dec.png"  "$SAMPLES/AVIF_S6_2kb.png"     2>/dev/null || true
+cp "$TMPD/avif_s6_q36_dec.png"  "$SAMPLES/AVIF_S6_4kb.png"     2>/dev/null || true
+cp "$TMPD/avif_s6_q76_dec.png"  "$SAMPLES/AVIF_S6_16kb.png"    2>/dev/null || true
+cp "$TMPD/avif_s6_q92_dec.png"  "$SAMPLES/AVIF_S6_36kb.png"    2>/dev/null || true
+# Best WTPC by ssim2 at matching AVIF sizes (speed 6)
+cp "$TMPD/avif_w420_e_s6_q0_dec.png"   "$SAMPLES/WTPC_vs_AVIF_726b.png"   2>/dev/null || true
+cp "$TMPD/avif_w420_e_s6_q3_dec.png"   "$SAMPLES/WTPC_vs_AVIF_1kb.png"    2>/dev/null || true
+cp "$TMPD/avif_w420_e_s6_q10_dec.png"  "$SAMPLES/WTPC_vs_AVIF_1.4kb.png"  2>/dev/null || true
+cp "$TMPD/avif_wtpc_e_s6_q19_dec.png"  "$SAMPLES/WTPC_vs_AVIF_2kb.png"    2>/dev/null || true
+cp "$TMPD/avif_wtpc_e_s6_q36_dec.png"  "$SAMPLES/WTPC_vs_AVIF_4kb.png"    2>/dev/null || true
+cp "$TMPD/avif_wtpc_e_s6_q76_dec.png"  "$SAMPLES/WTPC_vs_AVIF_16kb.png"   2>/dev/null || true
+cp "$TMPD/avif_wtpc_e_s6_q92_dec.png"  "$SAMPLES/WTPC_vs_AVIF_36kb.png"   2>/dev/null || true
+for f in "$SAMPLES"/AVIF_S6* "$SAMPLES"/WTPC_vs_AVIF*; do
+    [ -f "$f" ] && echo "  $(basename "$f"): $(fsize "$f") bytes" | tee -a "$LOGFILE"
+done
+
 # ============================================================
 # Generate results.md from log data via embedded Python
 # ============================================================
@@ -233,6 +313,8 @@ date_str = sys.argv[4]
 data = {}
 order = []
 time_data = {}  # W_TIME entries: variant -> list of (q, size, enc_ms, dec_ms)
+avif_wtpc = {}  # (speed,q) -> (size,psnr,ssim,enc,dec) for WTPC 444 at AVIF size
+avif_w420 = {}  # (speed,q) -> (size,psnr,ssim,enc,dec) for WTPC 420 at AVIF size
 with open(logfile) as f:
     for line in f:
         line = line.strip()
@@ -242,6 +324,29 @@ with open(logfile) as f:
             var, q, sz, psnr, ssim, enc, dec = tm.groups()
             if var not in time_data: time_data[var] = []
             time_data[var].append((int(q), int(sz), float(enc), float(dec)))
+            continue
+        m = re.match(r'AVIF s=(\d+) q=(\d+)\s*\|\s*(\d+)\s*\|\s*(-?[\d.]+)\s+(-?[\d.]+)\s*\|\s*enc=([\d.]+)\s+dec=([\d.]+)', line)
+        if m:
+            speed, q, size, psnr, ssim, enc_ms, dec_ms = m.groups()
+            codec = f'AVIF_S{speed}'
+            param = f'q={q}'
+            size_i, psnr_f, ssim_f = int(size), float(psnr), float(ssim)
+            enc_f, dec_f = float(enc_ms), float(dec_ms)
+            if psnr_f >= 10:
+                entry = (param, size_i, psnr_f, ssim_f, enc_f, dec_f)
+                if codec not in data:
+                    data[codec] = []
+                data[codec].append(entry)
+            continue
+        m = re.match(r'AVIF_WTPC_E s=(\d+) q=(\d+) wq=(\d+)\s*\|\s*(\d+)\s*\|\s*(-?[\d.]+)\s+(-?[\d.]+)\s*\|\s*enc=([\d.]+)\s+dec=([\d.]+)', line)
+        if m:
+            speed, q, wq, size, psnr, ssim, enc_ms, dec_ms = m.groups()
+            avif_wtpc[(int(speed), int(q))] = (int(wq), int(size), float(psnr), float(ssim), float(enc_ms), float(dec_ms))
+            continue
+        m = re.match(r'AVIF_W420_E s=(\d+) q=(\d+) wq=(\d+)\s*\|\s*(\d+)\s*\|\s*(-?[\d.]+)\s+(-?[\d.]+)\s*\|\s*enc=([\d.]+)\s+dec=([\d.]+)', line)
+        if m:
+            speed, q, wq, size, psnr, ssim, enc_ms, dec_ms = m.groups()
+            avif_w420[(int(speed), int(q))] = (int(wq), int(size), float(psnr), float(ssim), float(enc_ms), float(dec_ms))
             continue
         m = re.match(r'(W420_H|W420_E|WTPC_H|WTPC_E|JPEG|J2K|JXL)\s+(\S+)\s*\|\s*(\d+)\s*\|\s*(-?[\d.]+)\s+(-?[\d.]+)\s*\|\s*enc=([\d.]+)\s+dec=([\d.]+)', line)
         if not m:
@@ -546,6 +651,75 @@ if time_data:
     md.append('')
     md.append(f'> Encode at fixed q (no binary search). File sizes: ~{q_levels[-1]}->{q_levels[0]} q.')
 
+# ---- AVIF comparison tables ----
+if any(k.startswith('AVIF_S') for k in data):
+    md.append('')
+    md.append('## Compare with avif')
+    md.append('')
+    md.append('Since avif have rough quantization steps it goes to separate table.')
+    md.append('First step avifenc -q 0 --speed 0 and then closest to our targets.')
+    md.append('WTPC uses -b to match avif sizes.')
+    md.append('')
+
+    avif_targets = [1000, 1400, 2000, 4000, 8000, 16000, 26000, 36000]
+    avif_header = '| Target | AVIF q | EBCOT 444 q | EBCOT 420 q | AVIF B | EBCOT 444 B | EBCOT 420 B | AVIF enc | EBCOT 444 enc | EBCOT 420 enc | AVIF dec | EBCOT 444 dec | EBCOT 420 dec | AVIF PSNR | EBCOT 444 PSNR | EBCOT 420 PSNR | AVIF ssim2 | EBCOT 444 ssim2 | EBCOT 420 ssim2 |'
+    avif_sep    = '|--------|--------|-------------|-------------|--------|-------------|-------------|---------|---------------|---------------|---------|---------------|---------------|----------|----------------|----------------|-----------|------------------|-------------------|'
+
+    for speed in ['0', '6', '10']:
+        avif_key = f'AVIF_S{speed}'
+        if avif_key not in data or not data[avif_key]:
+            continue
+        md.append(f'### AVIF --speed {speed} vs WTPC')
+        md.append('')
+        md.append(avif_header)
+        md.append(avif_sep)
+
+        # Emit q=0 row first (minimum quality / worst size)
+        q0_entries = [e for e in data[avif_key] if e[0] == 'q=0']
+        if q0_entries:
+            aq, asz, apsnr, assim, aenc, adec = q0_entries[0]
+            t_label = f'{asz} B' if asz < 1000 else f'{asz // 1000} KB'
+            # Use matched WTPC encode at same AVIF size
+            we_key = (int(speed), 0)
+            if we_key in avif_wtpc:
+                wq, wsz, wpsnr, wssim, wenc, wdec = avif_wtpc[we_key]
+            else:
+                wq, wsz, wpsnr, wssim, wenc, wdec = (0, asz, 0, 0, 0, 0)
+            if we_key in avif_w420:
+                w4q, w4sz, w4psnr, w4ssim, w4enc, w4dec = avif_w420[we_key]
+            else:
+                w4q, w4sz, w4psnr, w4ssim, w4enc, w4dec = (0, asz, 0, 0, 0, 0)
+            md.append(
+                f'| ~{t_label} | {aq} | {wq} | {w4q} | {asz} | {wsz} | {w4sz} | {aenc:.0f} | {wenc:.0f} | {w4enc:.0f} | {adec:.0f} | {wdec:.0f} | {w4dec:.0f} | {apsnr:.2f} | {wpsnr:.2f} | {w4psnr:.2f} | {assim:.2f} | {wssim:.2f} | {w4ssim:.2f} |')
+
+        # Emit rows for each target
+        for t in avif_targets:
+            t_label = f'{t} B' if t < 1000 else (f'{t//1000} KB' if t % 1000 == 0 else f'{t/1000:.1f} KB')
+            avif_closest = min(data[avif_key], key=lambda e: abs(e[1] - t))
+            aq, asz, apsnr, assim, aenc, adec = avif_closest
+            # Use matched WTPC encode at same AVIF size
+            aq_num = int(aq.replace('q=', ''))
+            we_key = (int(speed), aq_num)
+            if we_key in avif_wtpc:
+                wq, wsz, wpsnr, wssim, wenc, wdec = avif_wtpc[we_key]
+            else:
+                wq, wsz, wpsnr, wssim, wenc, wdec = (0, asz, 0, 0, 0, 0)
+            if we_key in avif_w420:
+                w4q, w4sz, w4psnr, w4ssim, w4enc, w4dec = avif_w420[we_key]
+            else:
+                w4q, w4sz, w4psnr, w4ssim, w4enc, w4dec = (0, asz, 0, 0, 0, 0)
+            md.append(
+                f'| {t_label} | {aq} | {wq} | {w4q} | {asz} | {wsz} | {w4sz} | {aenc:.0f} | {wenc:.0f} | {w4enc:.0f} | {adec:.0f} | {wdec:.0f} | {w4dec:.0f} | {apsnr:.2f} | {wpsnr:.2f} | {w4psnr:.2f} | {assim:.2f} | {wssim:.2f} | {w4ssim:.2f} |')
+        md.append('')
+        # Per-speed summary
+        if speed == '0':
+            md.append('> **Speed 0:** AVIF wins on ssim2 from 1.4 KB to 26 KB, but encoding is up to 370x slower than WTPC.')
+        elif speed == '6':
+            md.append('> **Speed 6:** AVIF wins on ssim2 from 2 KB to 16 KB and the gap narrows, but encoding is still up to 8x slower than WTPC.')
+        elif speed == '10':
+            md.append('> **Speed 10:** AVIF loses on ssim2 at all sizes, but encoding speed is now comparable (though slightly slower than WTPC).')
+        md.append('')
+
 md.append('')
 md.append('---')
 md.append('')
@@ -614,6 +788,7 @@ try:
             # For each codec find the CLOSEST entry to target
             closest_per_codec = {}
             for codec in data:
+                if codec.startswith('AVIF'): continue
                 closest = None; closest_dist = 999999
                 for param, sz, psnr, ssim, _enc, _dec in data[codec]:
                     if lo <= sz <= hi:

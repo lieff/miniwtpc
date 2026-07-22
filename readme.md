@@ -77,7 +77,11 @@ at low bitrates and the test dataset is relatively small (~3000 images).
      #define WTPC_NO_STDIO        : exclude file I/O functions.
      #define DEBUG_WAVELET        : dump wavelet coefficient images (needs stb).
      #define STANDARD_CDF97       : enable standard CDF 9/7 K-scaling.
+     #define BAC_USE_TABLE        : use 64 KB reciprocal lookup table for
+                                    BAC division (~+1-3% speed, 64 KB memory).
+                                    Default: 64-bit integer division.
      #define WTPC_TUNE_PARAMS     : mutable quantization tables for grid-search tuning.
+     #define WTPC_TUNE_CTX        : tune ebcot contexts
      #define WTPC_NO_SIMD         : do not use sse/avx/neon intrinsics.
      #define WTPC_RC_ONLY_LESS_THAN_TARGET : rate control never overshoots
                                     target_bytes (picks the largest size <= target
@@ -101,24 +105,24 @@ But note that format become incompatible with WTPC release version.
 
 | Target | Best Codec         | Size   | PSNR   | ssimulacra2 |
 |--------|--------------------|--------|--------|-------------|
-| 200 B | WTPC 4:2:0 EBCOT | 199 B | 20.02 | -61.47 |
-| 400 B | WTPC 4:2:0 EBCOT | 405 B | 21.93 | -41.89 |
-| 600 B | WTPC 4:2:0 EBCOT | 603 B | 23.08 | -27.40 |
-| 800 B | WTPC 4:2:0 EBCOT | 804 B | 23.85 | -11.96 |
-| 1 KB | WTPC 4:2:0 EBCOT | 1399 B | 25.63 | 15.73 |
-| 2 KB | WTPC 4:2:0 EBCOT | 2001 B | 26.97 | 31.89 |
-| 3 KB | WTPC 4:2:0 EBCOT | 3005 B | 28.30 | 47.76 |
-| 4 KB | WTPC 4:2:0 EBCOT | 4005 B | 29.40 | 56.51 |
-| 5 KB | WTPC 4:2:0 EBCOT | 5013 B | 30.39 | 63.55 |
-| 6 KB | WTPC 4:2:0 EBCOT | 6008 B | 31.27 | 68.04 |
-| 8 KB | WTPC 4:4:4 EBCOT | 7992 B | 32.81 | 74.38 |
-| 10 KB | WTPC 4:4:4 EBCOT | 10017 B | 34.10 | 79.22 |
-| 13 KB | WTPC 4:4:4 EBCOT | 13010 B | 35.66 | 83.47 |
-| 15 KB | WTPC 4:4:4 EBCOT | 15035 B | 36.48 | 85.52 |
-| 18 KB | WTPC 4:4:4 EBCOT | 18040 B | 37.52 | 87.96 |
-| 22 KB | WTPC 4:4:4 EBCOT | 21985 B | 38.72 | 90.12 |
-| 28 KB | WTPC 4:4:4 EBCOT | 28003 B | 40.36 | 92.11 |
-| 36 KB | WTPC 4:4:4 EBCOT | 36089 B | 42.22 | 93.73 |
+| 200 B | WTPC 4:2:0 EBCOT | 201 B | 19.62 | -60.88 |
+| 400 B | WTPC 4:2:0 EBCOT | 401 B | 22.02 | -40.36 |
+| 600 B | WTPC 4:2:0 EBCOT | 600 B | 23.10 | -24.06 |
+| 800 B | WTPC 4:2:0 EBCOT | 806 B | 23.92 | -9.82 |
+| 1 KB | WTPC 4:2:0 EBCOT | 1406 B | 25.85 | 18.31 |
+| 2 KB | WTPC 4:4:4 EBCOT | 2002 B | 27.09 | 33.86 |
+| 3 KB | WTPC 4:2:0 EBCOT | 3008 B | 28.43 | 49.49 |
+| 4 KB | WTPC 4:4:4 EBCOT | 4002 B | 29.53 | 57.75 |
+| 5 KB | WTPC 4:2:0 EBCOT | 4996 B | 30.51 | 64.06 |
+| 6 KB | WTPC 4:4:4 EBCOT | 5990 B | 31.43 | 68.88 |
+| 8 KB | WTPC 4:4:4 EBCOT | 8000 B | 33.03 | 74.84 |
+| 10 KB | WTPC 4:4:4 EBCOT | 10014 B | 34.32 | 79.55 |
+| 13 KB | WTPC 4:4:4 EBCOT | 13017 B | 35.85 | 83.84 |
+| 15 KB | WTPC 4:4:4 EBCOT | 15002 B | 36.61 | 85.84 |
+| 18 KB | WTPC 4:4:4 EBCOT | 17985 B | 37.67 | 88.32 |
+| 22 KB | WTPC 4:4:4 EBCOT | 22061 B | 38.95 | 90.20 |
+| 28 KB | WTPC 4:4:4 EBCOT | 27981 B | 40.57 | 92.20 |
+| 36 KB | WTPC 4:4:4 EBCOT | 36122 B | 42.43 | 93.83 |
 
 ### Speed Summary (lena 256x256, representative q=244)
 
@@ -126,10 +130,10 @@ But note that format become incompatible with WTPC release version.
 |---------------------|-------------|-------------|
 | WTPC EBCOT 4:4:4 | 7 | 7 |
 | WTPC Huffman 4:4:4 | 3 | 1 |
-| WTPC EBCOT 4:2:0 | 4 | 5 |
+| WTPC EBCOT 4:2:0 | 5 | 5 |
 | WTPC Huffman 4:2:0 | 2 | 1 |
 | JPEG 2000 | 16 | 5 |
-| JPEG XL | 104 | 3 |
+| JPEG XL | 104 | 4 |
 | JPEG | 4 | 3 |
 
 See [results.md](results.md) for the complete per-size breakdown, speed
@@ -174,14 +178,17 @@ Click any image to view full size.
 | 1000 B | ![](samples/WTPC_1000b.png) | ![](samples/JP2K_1000b.png) | ![](samples/JPEG_1000b.jpg) |
 | 1200 B | ![](samples/WTPC_1200b.png) | ![](samples/JP2K_1200b.png) | ![](samples/JPEG_1200b.jpg) |
 
-**4:2:0 chroma subsampling** -- saves bits at low sizes, softer color
+**AVIF --speed 6 vs WTPC (best ssim2)** — mid-speed AVIF vs best WTPC at equal file sizes
 
-| Size | WTPC 4:2:0 EBCOT | WTPC 4:2:0 Huffman |
-|:----:|:----------------:|:------------------:|
-| 1.4 KB | ![](samples/W420_E_worst_1.4kb.png) | ![](samples/W420_H_worst_1.4kb.png) |
-| 6 KB | ![](samples/W420_E_mid_6kb.png) | ![](samples/W420_H_mid_6kb.png) |
-| 13 KB | ![](samples/W420_E_good_13kb.png) | ![](samples/W420_H_good_13kb.png) |
-| 36 KB | ![](samples/W420_E_best_36kb.png) | ![](samples/W420_H_best_36kb.png) |
+| Size | AVIF (--speed 6) | WTPC (best by ssim2) |
+|:----:|:----------------:|:--------------------:|
+| ~726 B | ![](samples/AVIF_S6_726b.png) | ![](samples/WTPC_vs_AVIF_726b.png) |
+| 1 KB | ![](samples/AVIF_S6_1kb.png) | ![](samples/WTPC_vs_AVIF_1kb.png) |
+| 1.4 KB | ![](samples/AVIF_S6_1.4kb.png) | ![](samples/WTPC_vs_AVIF_1.4kb.png) |
+| 2 KB | ![](samples/AVIF_S6_2kb.png) | ![](samples/WTPC_vs_AVIF_2kb.png) |
+| 4 KB | ![](samples/AVIF_S6_4kb.png) | ![](samples/WTPC_vs_AVIF_4kb.png) |
+| 16 KB | ![](samples/AVIF_S6_16kb.png) | ![](samples/WTPC_vs_AVIF_16kb.png) |
+| 36 KB | ![](samples/AVIF_S6_36kb.png) | ![](samples/WTPC_vs_AVIF_36kb.png) |
 
 ## Interesting Links
 
