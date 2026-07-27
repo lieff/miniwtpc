@@ -11,6 +11,8 @@ Despite its simplicity, WTPC outperforms JPEG 2000 and JPEG XL on this
 small-image benchmark, likely because its quantization is tuned to sharpen
 at low bitrates and the test dataset is relatively small (~3000 images).
 
+Currently WIP, bitstream format is not yet stable and may change if further quality improvements are found.
+
 ## API and usage
 
 ```c
@@ -105,30 +107,30 @@ But note that format become incompatible with WTPC release version.
 
 | Target | Best Codec         | Size   | PSNR   | ssimulacra2 |
 |--------|--------------------|--------|--------|-------------|
-| 200 B | WTPC 4:2:0 EBCOT | 201 B | 19.62 | -60.88 |
-| 400 B | WTPC 4:2:0 EBCOT | 401 B | 22.02 | -40.36 |
-| 600 B | WTPC 4:2:0 EBCOT | 600 B | 23.10 | -24.06 |
-| 800 B | WTPC 4:2:0 EBCOT | 806 B | 23.92 | -9.82 |
-| 1 KB | WTPC 4:2:0 EBCOT | 1406 B | 25.85 | 18.31 |
-| 2 KB | WTPC 4:4:4 EBCOT | 2002 B | 27.09 | 33.86 |
-| 3 KB | WTPC 4:2:0 EBCOT | 3008 B | 28.43 | 49.49 |
-| 4 KB | WTPC 4:4:4 EBCOT | 4002 B | 29.53 | 57.75 |
-| 5 KB | WTPC 4:2:0 EBCOT | 4996 B | 30.51 | 64.06 |
-| 6 KB | WTPC 4:4:4 EBCOT | 5990 B | 31.43 | 68.88 |
-| 8 KB | WTPC 4:4:4 EBCOT | 8000 B | 33.03 | 74.84 |
-| 10 KB | WTPC 4:4:4 EBCOT | 10014 B | 34.32 | 79.55 |
-| 13 KB | WTPC 4:4:4 EBCOT | 13017 B | 35.85 | 83.84 |
-| 15 KB | WTPC 4:4:4 EBCOT | 15002 B | 36.61 | 85.84 |
-| 18 KB | WTPC 4:4:4 EBCOT | 17985 B | 37.67 | 88.32 |
-| 22 KB | WTPC 4:4:4 EBCOT | 22061 B | 38.95 | 90.20 |
-| 28 KB | WTPC 4:4:4 EBCOT | 27981 B | 40.57 | 92.20 |
-| 36 KB | WTPC 4:4:4 EBCOT | 36122 B | 42.43 | 93.83 |
+| 200 B | WTPC 4:2:0 EBCOT | 200 B | 19.69 | -60.91 |
+| 400 B | WTPC 4:2:0 EBCOT | 405 B | 22.08 | -39.64 |
+| 600 B | WTPC 4:4:4 EBCOT | 600 B | 23.14 | -23.04 |
+| 800 B | WTPC 4:2:0 EBCOT | 803 B | 23.96 | -9.02 |
+| 1 KB | WTPC 4:2:0 EBCOT | 1404 B | 25.94 | 19.01 |
+| 2 KB | WTPC 4:2:0 EBCOT | 2005 B | 27.15 | 34.37 |
+| 3 KB | WTPC 4:4:4 EBCOT | 3003 B | 28.49 | 49.73 |
+| 4 KB | WTPC 4:4:4 EBCOT | 4000 B | 29.60 | 57.68 |
+| 5 KB | WTPC 4:4:4 EBCOT | 4997 B | 30.61 | 64.94 |
+| 6 KB | WTPC 4:4:4 EBCOT | 6002 B | 31.54 | 69.32 |
+| 8 KB | WTPC 4:4:4 EBCOT | 8027 B | 33.16 | 75.47 |
+| 10 KB | WTPC 4:4:4 EBCOT | 9996 B | 34.43 | 79.84 |
+| 13 KB | WTPC 4:4:4 EBCOT | 13028 B | 35.97 | 83.97 |
+| 15 KB | WTPC 4:4:4 EBCOT | 15045 B | 36.77 | 86.12 |
+| 18 KB | WTPC 4:4:4 EBCOT | 18051 B | 37.82 | 88.49 |
+| 22 KB | WTPC 4:4:4 EBCOT | 22031 B | 39.08 | 90.43 |
+| 28 KB | WTPC 4:4:4 EBCOT | 27946 B | 40.72 | 92.38 |
+| 36 KB | WTPC 4:4:4 EBCOT | 35966 B | 42.55 | 93.93 |
 
 ### Speed Summary (lena 256x256, representative q=244)
 
 | Codec               | Encode (ms) | Decode (ms) |
 |---------------------|-------------|-------------|
-| WTPC EBCOT 4:4:4 | 7 | 7 |
+| WTPC EBCOT 4:4:4 | 9 | 8 |
 | WTPC Huffman 4:4:4 | 3 | 1 |
 | WTPC EBCOT 4:2:0 | 5 | 5 |
 | WTPC Huffman 4:2:0 | 2 | 1 |
@@ -198,10 +200,12 @@ Click any image to view full size.
  * https://github.com/MarcioPais/SQZ
  * https://github.com/josejuansanchez/bgp-image-format
  * https://github.com/LMP88959/Digital-Subband-Video-2
+ * https://github.com/datocms/fast_thumbhash
  * https://themaister.net/blog/2025/06/16/i-designed-my-own-ridiculously-fast-game-streaming-video-codec-pyrowave/
 
 ## Image Datasets
 
+ * https://github.com/imazen/codec-corpus
  * https://github.com/castano/image-datasets
  * https://jpegai.github.io/test_images/
  * https://github.com/EliSchwartz/imagenet-sample-images

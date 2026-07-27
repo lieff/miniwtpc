@@ -1,12 +1,16 @@
 build
 builddir
+*.avif
 *.jp2
 *.jxl
 *.png
+*.pnm
+*.y4m
 *.jpg
 *.wtpc
 *.txt
 *.obj
 *.exe
 wtpc
+wtpc_old
 !samples/*

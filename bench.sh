@@ -713,7 +713,7 @@ if any(k.startswith('AVIF_S') for k in data):
         md.append('')
         # Per-speed summary
         if speed == '0':
-            md.append('> **Speed 0:** AVIF wins on ssim2 from 1.4 KB to 26 KB, but encoding is up to 370x slower than WTPC.')
+            md.append('> **Speed 0:** AVIF wins on ssim2 from 2 KB to 26 KB, but encoding is up to 370x slower than WTPC.')
         elif speed == '6':
             md.append('> **Speed 6:** AVIF wins on ssim2 from 2 KB to 16 KB and the gap narrows, but encoding is still up to 8x slower than WTPC.')
         elif speed == '10':
@@ -723,7 +723,7 @@ if any(k.startswith('AVIF_S') for k in data):
 md.append('')
 md.append('---')
 md.append('')
-md.append(f'*Tools: ImageMagick 7.1.2, OpenJPEG 2.5.4, libjxl 0.11.1. Date: {date_str}.*')
+md.append(f'*Tools: ImageMagick 7.1.2, OpenJPEG 2.5.4, libjxl 0.11.1, avifenc 1.3.0. Date: {date_str}.*')
 
 with open(resfile, 'w') as f:
     f.write('\n'.join(md) + '\n')

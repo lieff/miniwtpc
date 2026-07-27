@@ -155,7 +155,7 @@ static void put_set(int64_t freq[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS]) {
 }
 
 static void generate_tables(const char *dir_path) {
-    int q_levels[NUM_DEF_TABLES] = {665, 570, 474, 368, 244, 101, 78}; /* from mean_q= for each target after quantization tune */
+    int q_levels[NUM_DEF_TABLES] = {653, 560, 465, 360, 237, 138, 74}; /* from mean_q= for each target after quantization tune */
 
     int64_t freq_single[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS];
     int64_t freq_t0[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS];
@@ -992,13 +992,10 @@ static void calibrate_qfit(const char *dir_path) {
 }
 #endif  /* WTPC_TUNE_PARAMS */
 #ifdef WTPC_TUNE_CTX
-/* Train significance priors by encoding all images at multiple quality levels,
-   accumulating per-context stats, and printing the optimal priors array. */
+/* Train priors per-quality: encode all images at each training Q, accumulate
+   per-context stats, and print separate priors tables for each quality level. */
 static void train_priors(const char *dir_path) {
-    /* Quality levels covering full range (ultra-low to high quality) */
-    int targets[] = {1000, 2000, 4000, 8000, 16000, 26000, 36000};
-    int nt = sizeof(targets) / sizeof(targets[0]);
-
+    int nq = sizeof(TRAIN_Q) / sizeof(TRAIN_Q[0]);
     /* Collect + preload images (same as calibrate_qfit). */
     DIR *d = opendir(dir_path);
     if (!d) { fprintf(stderr, "Cannot open: %s\n", dir_path); return; }
@@ -1013,85 +1010,240 @@ static void train_priors(const char *dir_path) {
     closedir(d);
     if (nimg == 0) { fprintf(stderr, "No images found\n"); return; }
 
-    /* Reset global stats counters */
-    reset_sig_stats();
+    fprintf(stderr, "Training priors on %d images x %d qualities = %d encodes...\n", nimg, nq, nimg * nq);
 
-    fprintf(stderr, "Training priors on %d images x %d targets = %d encodes...\n", nimg, nt, nimg * nt);
-    int done = 0;
-    for (int i = 0; i < nimg; i++) {
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", dir_path, names[i]);
-        int w, h, has_alpha;
-        const char *ext = strrchr(names[i], '.');
-        unsigned char *rgb = NULL;
-        if (ext && strcmp(ext, ".png") == 0)
-            rgb = read_png(path, &w, &h, &has_alpha);
-        else {
-            int comp;
-            rgb = stbi_load(path, &w, &h, &comp, 4);
-            has_alpha = (comp == 4);
-        }
-        if (!rgb || w <= 0 || h <= 0) { if (rgb) stbi_image_free(rgb); free(names[i]); continue; }
+    int overflow = 0;  /* track uint8_t overflow warnings */
+    unsigned long long grand_total_bytes = 0;
+    double tscale_e = 0.25;  /* default T-scaling exponent */
+    char *env_e = getenv("WTPC_E");
+    if (env_e) tscale_e = atof(env_e);
 
-        for (int ti = 0; ti < nt; ti++) {
-            int t = targets[ti];
-            unsigned char *enc = wtpc_encode_mem(rgb, &(wtpc_enc_info){0}, w, h, t, 0, 0, 2, 0, has_alpha, 0);
-            if (enc) free(enc);
-        }
-        if (ext && strcmp(ext, ".png") == 0) free(rgb); else stbi_image_free(rgb);
-        free(names[i]);
-        done++;
-        if (done % 50 == 0 || done == nimg)
-            fprintf(stderr, "  %d/%d images done\n", done, nimg);
-    }
-    free(names);
+    /* For each training quality level */
+    for (int qi = 0; qi < nq; qi++) {
+        int q = TRAIN_Q[qi];
+        reset_ctx_stats();
+        unsigned long long total_bytes = 0;
 
-    /* Compute priors: for each context, use empirical p0 with total count ~16 */
-    printf("        static const uint16_t priors[30][2] = {\n");
-    /* Compute average frequency for T-scaling */
-    unsigned long long total_all[30], avg_total = 0;
-    int nctx = 0;
-    for (int i = 0; i < 30; i++) {
-        total_all[i] = g_sig_cnt0[i] + g_sig_cnt1[i];
-        if (total_all[i] > 0) { avg_total += total_all[i]; nctx++; }
-    }
-    if (nctx > 0) avg_total /= nctx;
-
-    for (int group = 0; group < 6; group++) {
-        printf("            ");
-        for (int j = 0; j < 5; j++) {
-            int ctx = group * 5 + j;
-            unsigned long long c0 = g_sig_cnt0[ctx], c1 = g_sig_cnt1[ctx];
-            unsigned long long t = c0 + c1;
-            int pc0 = 1, pc1 = 1;
-            if (t > 0 && avg_total > 0) {
-                double p0 = (double)c0 / (double)t;
-                /* Frequency-based T: rare contexts get larger total.
-                   T = base * (avg_freq / ctx_freq)^0.25, clamped to [2,256] */
-                double ratio = (double)avg_total / (double)t;
-                int T = (int)(16.0 * pow(ratio, 0.25) + 0.5);
-                if (T < 2) T = 2;
-                if (T > 256) T = 256;
-                pc0 = (int)(p0 * T + 0.5);
-                if (pc0 < 1) pc0 = 1;
-                if (pc0 > T - 1) pc0 = T - 1;
-                pc1 = T - pc0;
-                /* Near 50/50 with max nsig: use {1,1} */
-                if (j == 4 && p0 >= 0.45 && p0 <= 0.55) { pc0 = 1; pc1 = 1; }
+        int done = 0;
+        for (int i = 0; i < nimg; i++) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s", dir_path, names[i]);
+            int w, h, has_alpha;
+            const char *ext = strrchr(names[i], '.');
+            unsigned char *rgb = NULL;
+            if (ext && strcmp(ext, ".png") == 0)
+                rgb = read_png(path, &w, &h, &has_alpha);
+            else {
+                int comp;
+                rgb = stbi_load(path, &w, &h, &comp, 4);
+                has_alpha = (comp == 4);
             }
-            printf("{%d,%d}%s", pc0, pc1, j < 4 ? "," : "");
+            if (!rgb || w <= 0 || h <= 0) { if (rgb) stbi_image_free(rgb); continue; }
+
+            wtpc_enc_info info = {0};
+            unsigned char *enc = wtpc_encode_mem(rgb, &info, w, h, 0, q, 0, 2, 0, has_alpha, 0);
+            if (enc) { total_bytes += info.encoded_bytes; free(enc); }
+
+            if (ext && strcmp(ext, ".png") == 0) free(rgb); else stbi_image_free(rgb);
+            done++;
+            if (done % 100 == 0 || done == nimg)
+                fprintf(stderr, "  q=%d: %d/%d images done\n", q, done, nimg);
         }
-        printf("%s  /* %d-%d: %s */\n",
-               group < 5 ? "," : "",
-               group * 5, group * 5 + 4,
-               group == 0 ? "no parent" :
-               group == 1 ? "parent sig, low mag" :
-               group == 2 ? "parent sig, high mag" :
-               group == 3 ? "prev-zero, no parent" :
-               group == 4 ? "prev-zero, parent low mag" :
-                              "prev-zero, parent high mag");
+        grand_total_bytes += total_bytes;
+        fprintf(stderr, "  TOTAL_BYTES q=%d: %llu\n", q, total_bytes);
+
+        /* Output priors for this quality */
+        printf("/* Q=%d */\n", q);
+
+        /* Significance priors */
+        printf("static const uint8_t priors_sig_q%d[CTX_SIG][2] = {\n", q);
+        unsigned long long total_all[CTX_SIG]; unsigned long long avg_total = 0;
+        int nctx = 0;
+        for (int i = 0; i < CTX_SIG; i++) {
+            total_all[i] = g_sig_cnt0[i] + g_sig_cnt1[i];
+            if (total_all[i] > 0) { avg_total += total_all[i]; nctx++; }
+        }
+        if (nctx > 0) avg_total /= nctx;
+        for (int group = 0; group < 36; group++) {
+            printf("    ");
+            for (int j = 0; j < 9; j++) {
+                int ctx = group * 9 + j;
+                unsigned long long c0 = g_sig_cnt0[ctx], c1 = g_sig_cnt1[ctx];
+                unsigned long long t = c0 + c1;
+                int pc0 = 1, pc1 = 1;
+                if (t > 0 && avg_total > 0) {
+                    double p0 = (double)c0 / (double)t;
+                    double ratio = (double)avg_total / (double)t;
+                    int T = (int)(16.0 * pow(ratio, tscale_e) + 0.5);
+                    if (T < 2) T = 2;
+                    if (T > 256) T = 256;
+                    pc0 = (int)(p0 * T + 0.5);
+                    if (pc0 < 1) pc0 = 1;
+                    if (pc0 > T - 1) pc0 = T - 1;
+                    pc1 = T - pc0;
+                    if (j == 8 && p0 >= 0.45 && p0 <= 0.55) { pc0 = 1; pc1 = 1; }
+                }
+                if (pc0 > 255 || pc1 > 255) overflow = 1;
+                printf("{%d,%d}%s", pc0, pc1, j < 8 ? "," : "");
+            }
+            printf("%s\n", group < 35 ? "," : "");
+        }
+        printf("};\n");
+
+        /* Sign priors */
+        printf("static const uint8_t priors_sgn_q%d[CTX_SGN][2] = {\n", q);
+        { unsigned long long total[CTX_SGN]; unsigned long long avg = 0; int nz = 0;
+          for (int i = 0; i < CTX_SGN; i++) {
+              total[i] = g_sgn_cnt0[i] + g_sgn_cnt1[i];
+              if (total[i] > 0) { avg += total[i]; nz++; }
+          }
+          if (nz > 0) avg /= nz;
+          printf("    ");
+          for (int i = 0; i < CTX_SGN; i++) {
+              unsigned long long c0 = g_sgn_cnt0[i], c1 = g_sgn_cnt1[i], t = c0 + c1;
+              int pc0 = 1, pc1 = 1;
+              if (t > 0 && avg > 0) {
+                  double p0 = (double)c0 / (double)t;
+                  double ratio = (double)avg / (double)t;
+                  int T = (int)(16.0 * pow(ratio, tscale_e) + 0.5);
+                  if (T < 2) T = 2;
+                  if (T > 256) T = 256;
+                  pc0 = (int)(p0 * T + 0.5);
+                  if (pc0 < 1) pc0 = 1;
+                  if (pc0 > T - 1) pc0 = T - 1;
+                  pc1 = T - pc0;
+              }
+              if (pc0 > 255 || pc1 > 255) overflow = 1;
+              printf("{%d,%d}%s", pc0, pc1, i < CTX_SGN - 1 ? "," : "");
+          }
+          printf("\n");
+        }
+        printf("};\n\n");
+
+        /* Refinement priors */
+        printf("static const uint8_t priors_ref_q%d[CTX_REF][2] = {\n", q);
+        { unsigned long long total[CTX_REF]; unsigned long long avg = 0; int nz = 0;
+          for (int i = 0; i < CTX_REF; i++) {
+              total[i] = g_ref_cnt0[i] + g_ref_cnt1[i];
+              if (total[i] > 0) { avg += total[i]; nz++; }
+          }
+          if (nz > 0) avg /= nz;
+          printf("    ");
+          for (int i = 0; i < CTX_REF; i++) {
+              unsigned long long c0 = g_ref_cnt0[i], c1 = g_ref_cnt1[i], t = c0 + c1;
+              int pc0 = 1, pc1 = 1;
+              if (t > 0 && avg > 0) {
+                  double p0 = (double)c0 / (double)t;
+                  double ratio = (double)avg / (double)t;
+                  int T = (int)(16.0 * pow(ratio, tscale_e) + 0.5);
+                  if (T < 2) T = 2;
+                  if (T > 256) T = 256;
+                  pc0 = (int)(p0 * T + 0.5);
+                  if (pc0 < 1) pc0 = 1;
+                  if (pc0 > T - 1) pc0 = T - 1;
+                  pc1 = T - pc0;
+              }
+              if (pc0 > 255 || pc1 > 255) overflow = 1;
+              printf("{%d,%d}%s", pc0, pc1, i < CTX_REF - 1 ? "," : "");
+          }
+          printf("\n");
+        }
+        printf("};\n\n");
+
+        /* BP + flag priors */
+        printf("static const uint8_t priors_bp_q%d[CTX_BP][2] = {\n", q);
+        { unsigned long long total[CTX_BP]; unsigned long long avg = 0; int nz = 0;
+          for (int i = 0; i < CTX_BP; i++) {
+              total[i] = g_bp_cnt0[i] + g_bp_cnt1[i];
+              if (total[i] > 0) { avg += total[i]; nz++; }
+          }
+          if (nz > 0) avg /= nz;
+          printf("    ");
+          for (int i = 0; i < CTX_BP; i++) {
+              unsigned long long c0 = g_bp_cnt0[i], c1 = g_bp_cnt1[i], t = c0 + c1;
+              int pc0 = 1, pc1 = 1;
+              if (t > 0 && avg > 0) {
+                  double p0 = (double)c0 / (double)t;
+                  double ratio = (double)avg / (double)t;
+                  int T = (int)(16.0 * pow(ratio, tscale_e) + 0.5);
+                  if (T < 2) T = 2;
+                  if (T > 256) T = 256;
+                  pc0 = (int)(p0 * T + 0.5);
+                  if (pc0 < 1) pc0 = 1;
+                  if (pc0 > T - 1) pc0 = T - 1;
+                  pc1 = T - pc0;
+              }
+              if (pc0 > 255 || pc1 > 255) overflow = 1;
+              printf("{%d,%d}%s", pc0, pc1, i < CTX_BP - 1 ? "," : "");
+          }
+          printf("\n");
+        }
+        printf("};\n\n");
+
+        /* DC priors: 4 len + 1 sign + 15 magnitude = 20 contexts */
+        printf("static const uint8_t priors_dc_q%d[CTX_DC][2] = {\n", q);
+        { unsigned long long total[CTX_DC]; unsigned long long avg = 0; int nz = 0;
+          for (int i = 0; i < CTX_DC; i++) {
+              total[i] = g_dc_cnt0[i] + g_dc_cnt1[i];
+              if (total[i] > 0) { avg += total[i]; nz++; }
+          }
+          if (nz > 0) avg /= nz;
+          printf("    ");
+          for (int i = 0; i < CTX_DC; i++) {
+              unsigned long long c0 = g_dc_cnt0[i], c1 = g_dc_cnt1[i], t = c0 + c1;
+              int pc0 = 1, pc1 = 1;
+              if (t > 0 && avg > 0) {
+                  double p0 = (double)c0 / (double)t;
+                  double ratio = (double)avg / (double)t;
+                  int T = (int)(16.0 * pow(ratio, tscale_e) + 0.5);
+                  if (T < 2) T = 2;
+                  if (T > 256) T = 256;
+                  pc0 = (int)(p0 * T + 0.5);
+                  if (pc0 < 1) pc0 = 1;
+                  if (pc0 > T - 1) pc0 = T - 1;
+                  pc1 = T - pc0;
+              }
+              if (pc0 > 255 || pc1 > 255) overflow = 1;
+              printf("{%d,%d}%s", pc0, pc1, i < CTX_DC - 1 ? "," : "");
+          }
+          printf("\n");
+        }
+        printf("};\n\n");
+        fflush(stdout);
     }
-    printf("        };\n"); fflush(stdout);
+
+    /* Output pointer arrays */
+    printf("static const uint16_t (*const priors_sig_q[%d])[2] = {\n", nq);
+    printf("    ");
+    for (int qi = 0; qi < nq; qi++)
+        printf("priors_sig_q%d%s", TRAIN_Q[qi], qi < nq-1 ? ", " : "");
+    printf("\n};\n");
+    printf("static const uint16_t (*const priors_sgn_q[%d])[2] = {\n", nq);
+    printf("    ");
+    for (int qi = 0; qi < nq; qi++)
+        printf("priors_sgn_q%d%s", TRAIN_Q[qi], qi < nq-1 ? ", " : "");
+    printf("\n};\n");
+    printf("static const uint16_t (*const priors_ref_q[%d])[2] = {\n", nq);
+    printf("    ");
+    for (int qi = 0; qi < nq; qi++)
+        printf("priors_ref_q%d%s", TRAIN_Q[qi], qi < nq-1 ? ", " : "");
+    printf("\n};\n");
+    printf("static const uint16_t (*const priors_bp_q[%d])[2] = {\n", nq);
+    printf("    ");
+    for (int qi = 0; qi < nq; qi++)
+        printf("priors_bp_q%d%s", TRAIN_Q[qi], qi < nq-1 ? ", " : "");
+    printf("\n};\n");
+    printf("static const uint16_t (*const priors_dc_q[%d])[2] = {\n", nq);
+    printf("    ");
+    for (int qi = 0; qi < nq; qi++)
+        printf("priors_dc_q%d%s", TRAIN_Q[qi], qi < nq-1 ? ", " : "");
+    printf("\n};\n");
+
+
+    for (int i = 0; i < nimg; i++) free(names[i]);
+    free(names);
+    if (overflow) fprintf(stderr, "WARNING: some priors exceed 255, uint8_t will overflow! Increase to uint16_t.\n");
+    fprintf(stderr, "GRAND_TOTAL_BYTES: %llu\n", grand_total_bytes);
     fprintf(stderr, "Training done (%d images)\n", nimg);
 }
 #endif  /* WTPC_TUNE_CTX */
@@ -1287,12 +1439,12 @@ int main(int argc, char **argv) {
         uint8_t *buf = (uint8_t*)malloc(4096);
         BacEnc e;
         bac_init_enc(&e, buf, 4096);
-        ebcot_encode_channel(&e, c, w, h, NULL);
+        ebcot_encode_channel(&e, c, w, h, NULL, 20);
         int sz = bac_flush_enc(&e);
         int16_t *d=(int16_t*)calloc(total, sizeof(int16_t));
         BacDec dec;
         bac_init_dec(&dec, buf, sz);
-        ebcot_decode_channel(&dec, d, w, h, bp, NULL);
+        ebcot_decode_channel(&dec, d, w, h, NULL, 20);
         errors = 0;
         for(int i = 0; i < total;i++)
             if(c[i] != d[i]) { if(errors < 10) printf("[%d] %d!=%d\n", i, c[i], d[i]); errors++; }
@@ -1321,12 +1473,12 @@ int main(int argc, char **argv) {
                 while(smv > 0) { sbp++; smv >>= 1; } if(sbp == 0) sbp=1;
                 uint8_t *sbuf = (uint8_t*)malloc(st*6 + 4096);
                 BacEnc se; bac_init_enc(&se, sbuf, st*6 + 4096);
-                ebcot_encode_channel(&se, sc, sw, sh, NULL);
+                ebcot_encode_channel(&se, sc, sw, sh, NULL, 20);
                 int ssz=bac_flush_enc(&se);
                 memset(sd, 0, st*sizeof(int16_t));
                 BacDec sdec;
                 bac_init_dec(&sdec, sbuf, ssz);
-                ebcot_decode_channel(&sdec, sd, sw, sh, sbp, NULL);
+                ebcot_decode_channel(&sdec, sd, sw, sh, NULL, 20);
                 for(int i = 0; i < st; i++)
                     if(sc[i] != sd[i]) { fails++; if(fails <= 3) printf("[STRESS trial %d bits %d] idx %d: %d!=%d\n", trial, maxbits, i, sc[i], sd[i]); }
                 free(sbuf);
@@ -1359,11 +1511,11 @@ int main(int argc, char **argv) {
                     while(smv>0){sbp++;smv>>=1;} if(sbp==0)sbp=1;
                     uint8_t *sbuf=(uint8_t*)malloc(st*6+4096);
                     BacEnc se; bac_init_enc(&se,sbuf,st*6+4096);
-                    ebcot_encode_channel(&se, sc, sw, sh, NULL);
+                    ebcot_encode_channel(&se, sc, sw, sh, NULL, 20);
                     int ssz=bac_flush_enc(&se);
                     memset(sd,0,st*sizeof(int16_t));
                     BacDec sdec; bac_init_dec(&sdec,sbuf,ssz);
-                    ebcot_decode_channel(&sdec, sd, sw, sh, sbp, NULL);
+                    ebcot_decode_channel(&sdec, sd, sw, sh, NULL, 20);
                     unsigned f=0;
                     for(int i=0;i<st;i++) if(sc[i]!=sd[i]) f++;
                     if(f){total_fails++; printf("[BAC-SIZE %dx%d trial %d] %u mismatches\n",sw,sh,trial,f);}
