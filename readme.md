@@ -1,7 +1,9 @@
 # Small Wavelet Thumbnail & Preview Codec - WTPC
 
 A simple, drop-in image codec in the style of stb_image (single header library).
-It targets low sizes from 200 B to 36 KB at resolutions around 256x256.
+It targets low sizes from 200 B to 36 KB at resolutions around 256x256, but supports
+any image dimensions up to 65536x65536 (practically tested up to ~27K with
+images loadable by stb_image).
 The main target for thumbnails is 1400 B -- designed to fit within one MTU
 packet, so the user sees *something* while the main preview downloads.
 
@@ -12,6 +14,24 @@ small-image benchmark, likely because its quantization is tuned to sharpen
 at low bitrates and the test dataset is relatively small (~3000 images).
 
 Currently WIP, bitstream format is not yet stable and may change if further quality improvements are found.
+
+**Confirmed to outperform** (by ssimulacra2, 256x256, 200 B - 36 KB):
+- JPEG (libjpeg)
+- JPEG 2000 (OpenJPEG 2.5.4)
+- HTJ2K (openjph 0.26.0, clear win in our range 200 B - 36 KB +1..+24 ssim2, HTJ2K wins only at >62 KB where WTPC hits int16 quality ceiling; encode speed comparable 3-4ms vs WTPC 1-9ms)
+- JPEG XL (libjxl 0.11.1)
+- AVIF --speed 10 (avifenc 1.3.0; speeds 0/6 partially win but encoding is 8-370x slower)
+- WebP (libwebp 1.5.0, clear win across all sizes +2..+15 ssim2, similar encode speed 1-9ms vs WebP 6-9ms)
+- WebP 2 (libwebp2 0.0.1, partial: WTPC wins at <=2.6 KB and 36 KB, WebP2 wins at 2.9-21 KB but encoding is 4-10x slower)
+- HEIF (libheif 1.21.2 / x265 4.1, partial: WTPC wins at <=3 KB and >=15 KB, HEIF wins at 3-15 KB but encoding is 3-5x slower and quality plateaus at ~91.8 ssim2)
+- BPG 0.9.8 x265 (libbpg 0.9.8 / x265 4.1, partial: WTPC wins at <526 B (BPG minimum) and >=21 KB, BPG wins at 0.5-21 KB by +2..+12 ssim2 but encoding is 3-5x slower; quality plateaus at ~93 ssim2 vs WTPC 95)
+- BPG 0.9.8 JCTVC (libbpg 0.9.8, partial: WTPC wins at <380 B (BPG minimum) and >=21 KB, BPG wins at 0.4-21 KB by +0.7..+12 ssim2 but encoding is 20-50x slower; quality plateaus at ~93 ssim2 vs WTPC 95)
+- VC-2 SMPTE 2042-1 (reference encoder 0.1.0.2, Daub97 DD97 wavelets, clear win across all sizes +29..+50 ssim2)
+- SPIHT (TiLib 1.0, Daub97 wavelet)
+- GFWX 1.2 (Golomb-Rice entropy coder)
+- SQZ (5/3 wavelet + WDR, no entropy coding)
+- Ako 0.3.0 (CDF 9/7 + Kagari/ANS)
+- NHW 0.3.3 (simple wavelet, speed-oriented, only 512x512)
 
 ## API and usage
 
@@ -180,7 +200,7 @@ Click any image to view full size.
 | 1000 B | ![](samples/WTPC_1000b.png) | ![](samples/JP2K_1000b.png) | ![](samples/JPEG_1000b.jpg) |
 | 1200 B | ![](samples/WTPC_1200b.png) | ![](samples/JP2K_1200b.png) | ![](samples/JPEG_1200b.jpg) |
 
-**AVIF --speed 6 vs WTPC (best ssim2)** — mid-speed AVIF vs best WTPC at equal file sizes
+**AVIF --speed 6 vs WTPC (best ssim2)** -- mid-speed AVIF vs best WTPC at equal file sizes
 
 | Size | AVIF (--speed 6) | WTPC (best by ssim2) |
 |:----:|:----------------:|:--------------------:|
