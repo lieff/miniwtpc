@@ -274,6 +274,8 @@ if [ "$FAST" = "0" ]; then
 fi
 
 # AVIF --speed 6 vs best WTPC comparison samples
+# q values for speed 6 (also used by AVIF block above, defined here to be available in FAST mode)
+avif_q_s6="0 3 10 19 36 76 92"
 echo "" | tee -a "$LOGFILE"
 echo "=== Saving AVIF comparison samples ===" | tee -a "$LOGFILE"
 cp "$TMPD/avif_s6_q0_dec.png"   "$SAMPLES/AVIF_S6_726b.png"    2>/dev/null || true
@@ -284,13 +286,43 @@ cp "$TMPD/avif_s6_q36_dec.png"  "$SAMPLES/AVIF_S6_4kb.png"     2>/dev/null || tr
 cp "$TMPD/avif_s6_q76_dec.png"  "$SAMPLES/AVIF_S6_16kb.png"    2>/dev/null || true
 cp "$TMPD/avif_s6_q92_dec.png"  "$SAMPLES/AVIF_S6_36kb.png"    2>/dev/null || true
 # Best WTPC by ssim2 at matching AVIF sizes (speed 6)
-cp "$TMPD/avif_w420_e_s6_q0_dec.png"   "$SAMPLES/WTPC_vs_AVIF_726b.png"   2>/dev/null || true
-cp "$TMPD/avif_w420_e_s6_q3_dec.png"   "$SAMPLES/WTPC_vs_AVIF_1kb.png"    2>/dev/null || true
-cp "$TMPD/avif_w420_e_s6_q10_dec.png"  "$SAMPLES/WTPC_vs_AVIF_1.4kb.png"  2>/dev/null || true
-cp "$TMPD/avif_wtpc_e_s6_q19_dec.png"  "$SAMPLES/WTPC_vs_AVIF_2kb.png"    2>/dev/null || true
-cp "$TMPD/avif_wtpc_e_s6_q36_dec.png"  "$SAMPLES/WTPC_vs_AVIF_4kb.png"    2>/dev/null || true
-cp "$TMPD/avif_wtpc_e_s6_q76_dec.png"  "$SAMPLES/WTPC_vs_AVIF_16kb.png"   2>/dev/null || true
-cp "$TMPD/avif_wtpc_e_s6_q92_dec.png"  "$SAMPLES/WTPC_vs_AVIF_36kb.png"   2>/dev/null || true
+# Dynamically picks the better of EBCOT 4:4:4 vs 4:2:0 based on ssimulacra2 score
+echo "" | tee -a "$LOGFILE"
+for q in $avif_q_s6; do
+    # Determine label for this q
+    case $q in
+        0)  label="726b" ;;
+        3)  label="1kb" ;;
+        10) label="1.4kb" ;;
+        19) label="2kb" ;;
+        36) label="4kb" ;;
+        76) label="16kb" ;;
+        92) label="36kb" ;;
+        *)  label="q${q}" ;;
+    esac
+
+    # Extract ssim2 scores from log (field 9: PSNR SSIM2 after two pipe-delimited fields)
+    ssim2_444=$(grep "AVIF_WTPC_E s=6 q=$q " "$LOGFILE" | awk '{print $9}')
+    ssim2_420=$(grep "AVIF_W420_E s=6 q=$q " "$LOGFILE" | awk '{print $9}')
+
+    # Pick the better one (higher ssim2 = better)
+    if [ -n "$ssim2_444" ] && [ -n "$ssim2_420" ]; then
+        if [ "$(echo "$ssim2_444 >= $ssim2_420" | bc -l 2>/dev/null)" = "1" ]; then
+            src="$TMPD/avif_wtpc_e_s6_q${q}_dec.png"; which="444"
+        else
+            src="$TMPD/avif_w420_e_s6_q${q}_dec.png"; which="420"
+        fi
+    elif [ -n "$ssim2_444" ]; then
+        src="$TMPD/avif_wtpc_e_s6_q${q}_dec.png"; which="444"
+    else
+        src="$TMPD/avif_w420_e_s6_q${q}_dec.png"; which="420"
+    fi
+
+    dst="$SAMPLES/WTPC_vs_AVIF_${label}.png"
+    cp "$src" "$dst" 2>/dev/null || true
+    sz=$(fsize "$dst" 2>/dev/null || echo 0)
+    echo "  WTPC vs AVIF ${label}: 4:4:${which}  (ssim2: 444=$ssim2_444  420=$ssim2_420)  dst=$sz bytes" | tee -a "$LOGFILE"
+done
 for f in "$SAMPLES"/AVIF_S6* "$SAMPLES"/WTPC_vs_AVIF*; do
     [ -f "$f" ] && echo "  $(basename "$f"): $(fsize "$f") bytes" | tee -a "$LOGFILE"
 done

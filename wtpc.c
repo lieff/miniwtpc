@@ -562,6 +562,10 @@ static void *tune_worker(void *arg) {
     return NULL;
 }
 
+/* Weight multipliers per target: give more importance to small targets (800B..2KB),
+   since we can borrow quality from large files (q=1) without visual loss. */
+static const float tune_weights[] = {3.0f, 2.0f, 1.5f, 1.0f, 1.0f, 1.0f, 1.0f};
+
 /* --- Automated grid-search: sweeps one param at a time, keeps best, continues --- */
 static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, int base_idx, int chroma_mode, int start_param) {
     if (system("which ssimulacra2 >/dev/null 2>&1") != 0) {
@@ -685,7 +689,7 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
             break; \
         } \
         /* Aggregate across threads, print per-target breakdown */ \
-        double _sum_ssim2 = 0; int _count = 0; \
+        double _sum_ssim2 = 0, _sum_w = 0; int _count = 0; \
         int _overall_max_dev = 0; \
         double _overall_max_dev_pct = 0; \
         double _overall_mean_dev_sum = 0; \
@@ -703,17 +707,18 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
                 double _as = _ts / _tn; \
                 double _ad = _td / _tn; \
                 double _aq = _tq / _tn; \
-                _sum_ssim2 += _as; _count++; \
+                float _w = tune_weights[_tidx]; \
+                _sum_ssim2 += _as * _w; _sum_w += _w; _count++; \
                 double _dp = _ad * 100.0 / targets[_tidx]; \
                 double _mp = _tm * 100.0 / targets[_tidx]; \
                 if (_tm > _overall_max_dev) { _overall_max_dev = _tm; _overall_max_dev_pct = _mp; } \
                 _overall_mean_dev_sum += _ad; \
                 _overall_mean_pct_sum += _dp; \
-                fprintf(stderr, "[t=%d n=%d ssim2=%-9.6f mean_q=%.1f mean_d=%.1f (%.1f%%) max_d=%d (%.1f%%)]%s", targets[_tidx], _tn, _as, _aq, _ad, _dp, _tm, _mp, _tidx == (ntargets - 1) ? "\n" : " "); \
+                fprintf(stderr, "[t=%d w=%.1f n=%d ssim2=%-9.6f mean_q=%.1f mean_d=%.1f (%.1f%%) max_d=%d (%.1f%%)]%s", targets[_tidx], _w, _tn, _as, _aq, _ad, _dp, _tm, _mp, _tidx == (ntargets - 1) ? "\n" : " "); \
             } \
         } \
         free(_astats); \
-        double _avg = _count > 0 ? _sum_ssim2 / _count : 0; \
+        double _avg = _sum_w > 0 ? _sum_ssim2 / _sum_w : 0; \
         *(ssim_out) = _avg; \
         printf("%s, %.3f, %.6f\n", pcfg->name, (val), _avg); \
         fflush(stdout); \
@@ -757,7 +762,95 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
                 if (val <= 0.0f) { neg_stop = 1; skipped_neg = max_d - d + 1; }
                 else {
                     TUNE_EVAL(val, &ssim, " -");
-                    if (ssim < -9000.0f) { neg_stop = 1; skipped_neg = max_d - d; fprintf(stderr, "  Negative search stopped: guard overshoot at %.3f\n", val); }
+                    if (ssim < -9000.0f) {
+                        /* Guard overshoot: try trading with neighbour bands before giving up.
+                           Borrow bits from adjacent bands by making their quantizers coarser. */
+                        float saved_best_val = best_val;
+                        float trade_best_ssim = -9999.0f, trade_best_other = 0;
+                        int trade_ok = 0, trade_other_p = 0;
+
+                        /* Step 1: next band +1..+3 (same channel) */
+                        if ((p % 8) != 7) {
+                            float nxt_center = g_params[base_idx + p + 1];
+                            fprintf(stderr, "  Trying trade n+1: %s\n", cfg[p+1].name);
+                            for (int td = 1; td <= 3 && !trade_ok; td++) {
+                                float nxt_val = nxt_center + td * cfg[p + 1].delta;
+                                fprintf(stderr, "  trade %s +%d = %.3f\n", cfg[p+1].name, td, nxt_val);
+                                g_params[base_idx + p] = val;
+                                g_params[base_idx + p + 1] = nxt_val;
+                                apply_params();
+                                float ts;
+                                TUNE_EVAL(val, &ts, " G");
+                                g_params[base_idx + p] = saved_best_val;
+                                g_params[base_idx + p + 1] = nxt_center;
+                                apply_params();
+                                if (ts > best_ssim) {
+                                    trade_best_ssim = ts; trade_best_other = nxt_val;
+                                    trade_other_p = p + 1; trade_ok = 1;
+                                }
+                            }
+                        }
+                        /* Step 2: previous band +1..+3 (same channel) */
+                        if (!trade_ok && (p % 8) != 0) {
+                            float prv_center = g_params[base_idx + p - 1];
+                            fprintf(stderr, "  Trying trade n-1: %s\n", cfg[p-1].name);
+                            for (int td = 1; td <= 3 && !trade_ok; td++) {
+                                float prv_val = prv_center + td * cfg[p - 1].delta;
+                                fprintf(stderr, "  trade %s +%d = %.3f\n", cfg[p-1].name, td, prv_val);
+                                g_params[base_idx + p] = val;
+                                g_params[base_idx + p - 1] = prv_val;
+                                apply_params();
+                                float ts;
+                                TUNE_EVAL(val, &ts, " G");
+                                g_params[base_idx + p] = saved_best_val;
+                                g_params[base_idx + p - 1] = prv_center;
+                                apply_params();
+                                if (ts > best_ssim) {
+                                    trade_best_ssim = ts; trade_best_other = prv_val;
+                                    trade_other_p = p - 1; trade_ok = 1;
+                                }
+                            }
+                        }
+                        /* Step 3: cross-channel (Y<>C), same band index */
+                        if (!trade_ok && chroma_mode == 0) {
+                            int cross_p = -1;
+                            int col = p % 8;
+                            if (p < 16)      cross_p = (p < 8 ? 8 : 0) + col;     /* multiplier: Y<>C */
+                            else             cross_p = (p < 24 ? 24 : 16) + col;  /* DZ: Y<>C */
+                            if (cross_p >= 0 && cross_p < nparams) {
+                                float cross_center = g_params[base_idx + cross_p];
+                                fprintf(stderr, "  Trying trade cross: %s\n", cfg[cross_p].name);
+                                for (int td = 1; td <= 3 && !trade_ok; td++) {
+                                    float cross_val = cross_center + td * cfg[cross_p].delta;
+                                    fprintf(stderr, "  trade %s +%d = %.3f\n", cfg[cross_p].name, td, cross_val);
+                                    g_params[base_idx + p] = val;
+                                    g_params[base_idx + cross_p] = cross_val;
+                                    apply_params();
+                                    float ts;
+                                    TUNE_EVAL(val, &ts, " G");
+                                    g_params[base_idx + p] = saved_best_val;
+                                    g_params[base_idx + cross_p] = cross_center;
+                                    apply_params();
+                                    if (ts > best_ssim) {
+                                        trade_best_ssim = ts; trade_best_other = cross_val;
+                                        trade_other_p = cross_p; trade_ok = 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (trade_ok) {
+                            best_ssim = trade_best_ssim; best_val = val;
+                            g_params[base_idx + trade_other_p] = trade_best_other;
+                            apply_params();
+                            neg_stop = 1; skipped_neg = max_d - d;
+                            fprintf(stderr, "  Negative search: guard traded with %s = %.3f (ssim2=%.6f)\n",
+                                cfg[trade_other_p].name, trade_best_other, trade_best_ssim);
+                        } else {
+                            neg_stop = 1; skipped_neg = max_d - d;
+                            fprintf(stderr, "  Negative search stopped: guard overshoot at %.3f (no trade found)\n", val);
+                        }
+                    }
                     else if (ssim > best_ssim) { best_ssim = ssim; best_val = val; neg_down = 0; }
                     else {
                         neg_down++;
@@ -890,7 +983,7 @@ static int solve_quad_lsq(const float *lt, const float *lb, int n, float out[3])
 }
 
 static void calibrate_qfit(const char *dir_path) {
-    int targets[] = {200, 400, 800, 1000, 2000, 4000, 8000, 16000, 32000, 36000};
+    int targets[] = {200, 400, 800, 1000, 2000, 4000, 8000, 16000, 26000, 36000};
     int ntargets = sizeof(targets) / sizeof(targets[0]);
 
     /* Collect + preload images (same as tune_grid). */
@@ -1118,7 +1211,7 @@ static void train_priors(const char *dir_path) {
           }
           printf("\n");
         }
-        printf("};\n\n");
+        printf("};\n");
 
         /* Refinement priors */
         printf("static const uint8_t priors_ref_q%d[CTX_REF][2] = {\n", q);
@@ -1148,7 +1241,7 @@ static void train_priors(const char *dir_path) {
           }
           printf("\n");
         }
-        printf("};\n\n");
+        printf("};\n");
 
         /* BP + flag priors */
         printf("static const uint8_t priors_bp_q%d[CTX_BP][2] = {\n", q);
@@ -1178,7 +1271,7 @@ static void train_priors(const char *dir_path) {
           }
           printf("\n");
         }
-        printf("};\n\n");
+        printf("};\n");
 
         /* DC priors: 4 len + 1 sign + 15 magnitude = 20 contexts */
         printf("static const uint8_t priors_dc_q%d[CTX_DC][2] = {\n", q);

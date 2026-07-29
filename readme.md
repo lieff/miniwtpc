@@ -107,35 +107,35 @@ But note that format become incompatible with WTPC release version.
 
 | Target | Best Codec         | Size   | PSNR   | ssimulacra2 |
 |--------|--------------------|--------|--------|-------------|
-| 200 B | WTPC 4:2:0 EBCOT | 200 B | 19.69 | -60.91 |
-| 400 B | WTPC 4:2:0 EBCOT | 405 B | 22.08 | -39.64 |
-| 600 B | WTPC 4:4:4 EBCOT | 600 B | 23.14 | -23.04 |
-| 800 B | WTPC 4:2:0 EBCOT | 803 B | 23.96 | -9.02 |
-| 1 KB | WTPC 4:2:0 EBCOT | 1404 B | 25.94 | 19.01 |
-| 2 KB | WTPC 4:2:0 EBCOT | 2005 B | 27.15 | 34.37 |
-| 3 KB | WTPC 4:4:4 EBCOT | 3003 B | 28.49 | 49.73 |
-| 4 KB | WTPC 4:4:4 EBCOT | 4000 B | 29.60 | 57.68 |
-| 5 KB | WTPC 4:4:4 EBCOT | 4997 B | 30.61 | 64.94 |
-| 6 KB | WTPC 4:4:4 EBCOT | 6002 B | 31.54 | 69.32 |
-| 8 KB | WTPC 4:4:4 EBCOT | 8027 B | 33.16 | 75.47 |
-| 10 KB | WTPC 4:4:4 EBCOT | 9996 B | 34.43 | 79.84 |
-| 13 KB | WTPC 4:4:4 EBCOT | 13028 B | 35.97 | 83.97 |
-| 15 KB | WTPC 4:4:4 EBCOT | 15045 B | 36.77 | 86.12 |
-| 18 KB | WTPC 4:4:4 EBCOT | 18051 B | 37.82 | 88.49 |
-| 22 KB | WTPC 4:4:4 EBCOT | 22031 B | 39.08 | 90.43 |
-| 28 KB | WTPC 4:4:4 EBCOT | 27946 B | 40.72 | 92.38 |
-| 36 KB | WTPC 4:4:4 EBCOT | 35966 B | 42.55 | 93.93 |
+| 200 B | WTPC 4:4:4 EBCOT | 203 B | 19.44 | -60.18 |
+| 400 B | WTPC 4:2:0 EBCOT | 402 B | 21.88 | -40.39 |
+| 600 B | WTPC 4:4:4 EBCOT | 604 B | 23.20 | -21.18 |
+| 800 B | WTPC 4:2:0 EBCOT | 798 B | 23.96 | -8.75 |
+| 1 KB | WTPC 4:4:4 EBCOT | 1404 B | 25.94 | 19.76 |
+| 2 KB | WTPC 4:4:4 EBCOT | 2009 B | 27.17 | 34.57 |
+| 3 KB | WTPC 4:4:4 EBCOT | 3007 B | 28.51 | 49.79 |
+| 4 KB | WTPC 4:4:4 EBCOT | 4014 B | 29.61 | 58.18 |
+| 5 KB | WTPC 4:4:4 EBCOT | 5006 B | 30.59 | 64.84 |
+| 6 KB | WTPC 4:4:4 EBCOT | 5996 B | 31.51 | 69.34 |
+| 8 KB | WTPC 4:4:4 EBCOT | 8027 B | 33.13 | 75.45 |
+| 10 KB | WTPC 4:4:4 EBCOT | 9987 B | 34.40 | 79.77 |
+| 13 KB | WTPC 4:4:4 EBCOT | 13009 B | 35.94 | 84.12 |
+| 15 KB | WTPC 4:4:4 EBCOT | 15010 B | 36.73 | 86.05 |
+| 18 KB | WTPC 4:4:4 EBCOT | 17999 B | 37.80 | 88.40 |
+| 22 KB | WTPC 4:4:4 EBCOT | 21964 B | 39.07 | 90.42 |
+| 28 KB | WTPC 4:4:4 EBCOT | 27973 B | 40.75 | 92.38 |
+| 36 KB | WTPC 4:4:4 EBCOT | 36029 B | 42.59 | 93.91 |
 
 ### Speed Summary (lena 256x256, representative q=244)
 
 | Codec               | Encode (ms) | Decode (ms) |
 |---------------------|-------------|-------------|
-| WTPC EBCOT 4:4:4 | 9 | 8 |
+| WTPC EBCOT 4:4:4 | 8 | 7 |
 | WTPC Huffman 4:4:4 | 3 | 1 |
 | WTPC EBCOT 4:2:0 | 5 | 5 |
 | WTPC Huffman 4:2:0 | 2 | 1 |
 | JPEG 2000 | 16 | 5 |
-| JPEG XL | 104 | 4 |
+| JPEG XL | 103 | 4 |
 | JPEG | 4 | 3 |
 
 See [results.md](results.md) for the complete per-size breakdown, speed
@@ -199,8 +199,16 @@ Click any image to view full size.
  * https://github.com/Themaister/pyrowave
  * https://github.com/MarcioPais/SQZ
  * https://github.com/josejuansanchez/bgp-image-format
+ * https://bellard.org/bpg/
  * https://github.com/LMP88959/Digital-Subband-Video-2
+ * https://github.com/curioustorvald/TAV-video-codec
  * https://github.com/datocms/fast_thumbhash
+ * https://github.com/gopro/cineform-sdk
+ * https://github.com/emericg/libcineform
+ * https://github.com/bbc/vc2-reference
+ * https://github.com/rcanut/nhwcodec
+ * https://github.com/baAlex/Ako
+ * https://github.com/Special-graphic-formats/tilib
  * https://themaister.net/blog/2025/06/16/i-designed-my-own-ridiculously-fast-game-streaming-video-codec-pyrowave/
 
 ## Image Datasets
