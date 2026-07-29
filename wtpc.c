@@ -1746,6 +1746,76 @@ int main(int argc, char **argv) {
                 { printf("[SELF-TEST Q-ROUNDTRIP] FAIL: 256x256 psnr=%.2f dB (mse=%.1f)\n", psnr, mse); all_ok = 0; }
             free(ty); free(tu); free(tv); free(orig); free(dec); free(qy); free(qu); free(qv);
         }
+        /* Bitstream edge case tests */
+        {
+            uint8_t buf[256]; int fails = 0;
+            /* Test 1: simple put/get roundtrip, various bit sizes */
+            { Bitstream w; bitstream_init(&w, buf, sizeof(buf));
+              for (int nb = 1; nb <= 16; nb++) put_bits(&w, (1u << nb) - 1, nb);
+              bitstream_flush(&w);
+              Bitstream r; bitstream_init(&r, buf, bitstream_bytes(&w));
+              for (int nb = 1; nb <= 16; nb++) {
+                  uint32_t v = get_bits(&r, nb);
+                  if (v != (1u << nb) - 1) { fails++; printf("  BS-EDGE put/get nb=%d fail: got %u\n", nb, v); }
+              } }
+            /* Test 2: mixed sizes crossing refill boundaries */
+            { Bitstream w; bitstream_init(&w, buf, sizeof(buf));
+              for (int n = 0; n < 8; n++) { put_bits(&w, 0xAA, 8); }
+              bitstream_flush(&w);
+              Bitstream r; bitstream_init(&r, buf, bitstream_bytes(&w));
+              /* Read 1 bit at a time through several refills */
+              for (int n = 0; n < 64; n++) {
+                  uint32_t v = get_bits(&r, 1);
+                  int expected = (0xAA >> (7 - (n & 7))) & 1;
+                  if (v != (uint32_t)expected) { fails++; printf("  BS-EDGE 1-bit n=%d fail: got %u expected %d\n", n, v, expected); break; }
+              } }
+            /* Test 3: read exactly at cache boundary (bits_in_cache == num_bits) */
+            { Bitstream w; bitstream_init(&w, buf, sizeof(buf));
+              put_bits(&w, 0x12, 8); put_bits(&w, 0x34, 8); put_bits(&w, 0x56, 8); put_bits(&w, 0x78, 8);
+              bitstream_flush(&w);
+              Bitstream r; bitstream_init(&r, buf, bitstream_bytes(&w));
+              /* Read 8 bits exactly at initial fill (bits_in_cache goes from 32 to 25 after init): read 25 */
+              uint32_t v = get_bits(&r, 8);
+              if (v != 0x12) { fails++; printf("  BS-EDGE boundary fail: got 0x%02x\n", v); }
+              /* Now at boundary: read 17 bits to force refill */
+              v = get_bits(&r, 17);
+              if (v != 0x068AC) { fails++; printf("  BS-EDGE refill fail: got 0x%05x\n", v); }
+              v = get_bits(&r, 7);
+              if (v != (0x78 & 0x7F)) { fails++; printf("  BS-EDGE tail fail: got 0x%02x\n", v); } }
+            /* Test 4: get_eg roundtrip */
+            { uint32_t v_in[] = {0,1,2,3,7,15,31,100,1000,0xFFF,0xFFFF};
+              Bitstream w; bitstream_init(&w, buf, sizeof(buf));
+              for (int i = 0; i < (int)(sizeof(v_in)/sizeof(v_in[0])); i++) put_eg(&w, v_in[i]);
+              bitstream_flush(&w);
+              Bitstream r; bitstream_init(&r, buf, bitstream_bytes(&w));
+              for (int i = 0; i < (int)(sizeof(v_in)/sizeof(v_in[0])); i++) {
+                  uint32_t v = get_eg(&r);
+                  if (v != v_in[i]) { fails++; printf("  BS-EDGE get_eg fail: got %u expected %u\n", v, v_in[i]); }
+              } }
+            /* Test 5: zero bit read */
+            { Bitstream r; bitstream_init(&r, buf, 0);
+              uint32_t v = get_bits(&r, 0);
+              if (v != 0) { fails++; printf("  BS-EDGE get_bits(0) fail: got %u\n", v); } }
+            /* Test 6: empty buffer, no put, get should return 0 */
+            { uint8_t zbuf[4] = {0,0,0,0};
+              Bitstream r; bitstream_init(&r, zbuf, 4);
+              uint32_t v = get_bits(&r, 32);
+              if (v != 0) { fails++; printf("  BS-EDGE empty buffer fail: got 0x%08x\n", v); } }
+            /* Test 7: chained refill (25 bits crossing 32-bit cache boundary) */
+            { Bitstream w; bitstream_init(&w, buf, sizeof(buf));
+              put_bits(&w, 0x12345678, 32); put_bits(&w, 1, 1);
+              bitstream_flush(&w);
+              Bitstream r; bitstream_init(&r, buf, bitstream_bytes(&w));
+              uint32_t v = get_bits(&r, 25);
+              uint32_t expected = (uint32_t)((0x12345678ull >> 7) & 0x1FFFFFF);
+              if (v != expected) { fails++; printf("  BS-EDGE 25-bit fail: got 0x%lx expected 0x%lx\n", (unsigned long)v, (unsigned long)expected); }
+              v = get_bits(&r, 8);
+              if (v != (uint32_t)(((0x12345678 & 0x7F) << 1) | 1)) { fails++; printf("  BS-EDGE remainder fail: got 0x%02x\n", v); } }
+            if (fails == 0)
+                printf("[SELF-TEST BITSTREAM] OK: edge cases passed\n");
+            else
+                { printf("[SELF-TEST BITSTREAM] FAIL: %d failures\n", fails); all_ok = 0; }
+        }
         if(!all_ok) return 1;
     }
 #ifdef _WIN32    

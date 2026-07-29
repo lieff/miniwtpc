@@ -201,15 +201,43 @@ static void put_bits(Bitstream *bs, uint32_t value, int num_bits) {
     }
 }
 
-static uint32_t get_bits(Bitstream *bs, int num_bits) {
-    while (bs->bits_in_cache <= 24) {
-        uint32_t next_byte = (bs->byte_pos < bs->buf_size) ? bs->data[bs->byte_pos++] : 0;
-        bs->cache = (bs->cache << 8) | next_byte;
+static void bitstream_refill(Bitstream *bs) {
+    while (bs->bits_in_cache <= 24 && bs->byte_pos < bs->buf_size) {
+        bs->cache = (bs->cache << 8) | bs->data[bs->byte_pos++];
         bs->bits_in_cache += 8;
     }
+}
+
+static uint32_t get_bits_slow(Bitstream *bs, int num_bits) {
+    uint32_t result = 0;
+    /* Take remaining bits from current cache */
+    if (bs->bits_in_cache > 0) {
+        int take = bs->bits_in_cache < num_bits ? bs->bits_in_cache : num_bits;
+        bs->bits_in_cache -= take;
+        result = (bs->cache >> bs->bits_in_cache) & ((1U << take) - 1);
+        num_bits -= take;
+    }
+    /* If still need bits, refill a fresh 32-bit word and take from it */
+    if (num_bits > 0) {
+        bs->cache = 0; bs->bits_in_cache = 0;
+        while (bs->bits_in_cache < 32 && bs->byte_pos < bs->buf_size) {
+            bs->cache = (bs->cache << 8) | bs->data[bs->byte_pos++];
+            bs->bits_in_cache += 8;
+        }
+        int take = bs->bits_in_cache < num_bits ? bs->bits_in_cache : num_bits;
+        bs->bits_in_cache -= take;
+        result = (result << take) | ((bs->cache >> bs->bits_in_cache) & ((1U << take) - 1));
+    }
+    /* Top up cache for subsequent fast-path hits */
+    bitstream_refill(bs);
+    return result;
+}
+
+static inline uint32_t get_bits(Bitstream *bs, int num_bits) {
+    if (bs->bits_in_cache < num_bits)
+        return get_bits_slow(bs, num_bits);
     bs->bits_in_cache -= num_bits;
-    uint32_t value = (bs->cache >> bs->bits_in_cache) & (((1ULL << num_bits) - 1));
-    return value;
+    return (bs->cache >> bs->bits_in_cache) & ((1U << num_bits) - 1);
 }
 
 /* --- Big-endian uint16 (endian-agnostic file format) --- */
@@ -230,12 +258,37 @@ static void put_eg(Bitstream *bs, uint32_t v) {
     put_bits(bs, 1, 1);
     put_bits(bs, v - (1u << m), m);
 }
-static uint32_t get_eg(Bitstream *bs) {
-    int m = 0; while (m < 32 && get_bits(bs, 1) == 0) m++;
-    if (m >= 31) return 0;  /* overflow guard */
+/* Optimized Exp-Golomb decode. Fast path: run=0 (single '1' bit, ~90% of calls).
+   Slow path: CLZ-based leading-zero count reads up to 24 bits at once. */
+static uint32_t get_eg_slow(Bitstream *bs) {
+    int m = 0;
+    for (;;) {
+        bitstream_refill(bs);
+        int peek_bits = bs->bits_in_cache < 24 ? bs->bits_in_cache : 24;
+        if (peek_bits == 0) return 0;
+        uint32_t peek = (bs->cache >> (bs->bits_in_cache - peek_bits)) & ((1u << peek_bits) - 1);
+        if (peek != 0) {
+            int zm = __builtin_clz(peek) - (32 - peek_bits);
+            m += zm;
+            get_bits(bs, zm + 1);  /* consume zm zeros + the '1' */
+            break;
+        }
+        m += peek_bits;
+        get_bits(bs, peek_bits);  /* consume all zeros, continue */
+    }
+    if (m >= 31) return 0;
     uint32_t v = 1u << m;
     if (m > 0) v |= get_bits(bs, m);
     return v - 1;
+}
+
+static inline uint32_t get_eg(Bitstream *bs) {
+    /* Fast path: run=0 -> code is just a single '1' bit */
+    if (bs->bits_in_cache > 0 && ((bs->cache >> (bs->bits_in_cache - 1)) & 1)) {
+        bs->bits_in_cache--;
+        return 0;
+    }
+    return get_eg_slow(bs);
 }
 
 /* BT.601 YUV color conversion. */
@@ -2320,17 +2373,39 @@ static void read_huffman_table(Bitstream *bs, int *code_lens, int num_symbols) {
     }
 }
 
-static int huffman_decode_symbol(Bitstream *bs, uint32_t *huff_codes, int *code_lens, int num_symbols) {
-    uint32_t code = 0;
-    for (int len = 1; len <= MAX_CODE_LEN; len++) {
-        code = (code << 1) | get_bits(bs, 1);
-        for (int sym = 0; sym < num_symbols; sym++) {
-            if (code_lens[sym] == len && huff_codes[sym] == code) {
-                return sym;
-            }
+/* Builds a flat binary tree from canonical codes, walks it one bit at a time.
+   Table format: table[node*2+bit] = next_node (1..126) or leaf (0x80|symbol).
+   Max 2*NUM_HUFF_SYMBOLS-1 = 31 nodes, 64 entries total. */
+#define HUF_FAST_TABLE_SIZE 64
+static void build_huff_table(int *code_lens, uint32_t *huff_codes, int num_symbols, uint8_t *table) {
+    memset(table, 0, HUF_FAST_TABLE_SIZE);
+    int next_node = 1;
+    for (int sym = 0; sym < num_symbols; sym++) {
+        int len = code_lens[sym];
+        if (len == 0) continue;
+        uint32_t code = huff_codes[sym];
+        int node = 0;
+        for (int b = len - 1; b > 0; b--) {
+            int bit = (code >> b) & 1;
+            int child = table[node * 2 + bit];
+            if (child == 0) { child = next_node++; table[node * 2 + bit] = (uint8_t)child; }
+            node = child;
         }
+        int last_bit = code & 1;
+        table[node * 2 + last_bit] = (uint8_t)(0x80 | sym);
     }
-    return -1;  /* decode error */
+}
+
+/* Table-driven Huffman decode: walks the pre-built tree. Uses inline get_bits
+   for fast bit extraction (hot path stays in registers, refill on cache miss). */
+static int huffman_decode_symbol(Bitstream *bs, uint8_t *table) {
+    int node = 0;
+    for (;;) {
+        int bit = (int)get_bits(bs, 1);
+        int val = table[node * 2 + bit];
+        if (val & 0x80) return val & 0x7F;
+        node = val;
+    }
 }
 
 /* ===================================================================== */
@@ -2352,8 +2427,7 @@ static void count_frequencies(const int16_t *d, size_t sz, int *freq) {
 }
 
 /* Write one channel: for each nonzero value emit (huffman_code, eg_run, extra_bits) */
-static void huffman_encode_runval(Bitstream *bs, const int16_t *d, size_t sz,
-                                   uint32_t *hc, int *cl) {
+static void huffman_encode_runval(Bitstream *bs, const int16_t *d, size_t sz, uint32_t *hc, int *cl) {
     int run = 0;
     for (size_t i = 0; i < sz; i++) {
         if (d[i] == 0) { run++; continue; }
@@ -2368,12 +2442,13 @@ static void huffman_encode_runval(Bitstream *bs, const int16_t *d, size_t sz,
         put_bits(bs, hc[EOB_SYMBOL], cl[EOB_SYMBOL]);
 }
 
-static void huffman_decode_channel(Bitstream *bs, int16_t *o, size_t sz,
-                      int *cl, uint32_t *hc) {
+static void huffman_decode_channel(Bitstream *bs, int16_t *o, size_t sz, int *cl, uint32_t *hc) {
+    uint8_t table[HUF_FAST_TABLE_SIZE];
+    build_huff_table(cl, hc, NUM_HUFF_SYMBOLS, table);
     size_t i = 0;
     while (i < sz) {
-        int sym = huffman_decode_symbol(bs, hc, cl, NUM_HUFF_SYMBOLS);
-        if (sym < 0 || sym == EOB_SYMBOL) { while (i < sz) o[i++] = 0; return; }
+        int sym = huffman_decode_symbol(bs, table);
+        if (sym == EOB_SYMBOL) { memset(o + i, 0, (sz - i) * sizeof(int16_t)); return; }
         int run = get_eg(bs);
         size_t end = i + run; if (end > sz) end = sz;
         while (i < end) o[i++] = 0;
@@ -2384,8 +2459,7 @@ static void huffman_decode_channel(Bitstream *bs, int16_t *o, size_t sz,
 }
 
 /* Context-aware Huffman: prev non-zero category selects between 2 tables */
-static void huffman_encode_ctx(Bitstream *bs, const int16_t *d, size_t sz,
-                                uint32_t *hc0, int *cl0, uint32_t *hc1, int *cl1) {
+static void huffman_encode_ctx(Bitstream *bs, const int16_t *d, size_t sz, uint32_t *hc0, int *cl0, uint32_t *hc1, int *cl1) {
     int run = 0, last_cat = 0;
     for (size_t i = 0; i < sz; i++) {
         if (d[i] == 0) { run++; continue; }
@@ -2419,16 +2493,35 @@ static void count_frequencies_ctx(const int16_t *d, size_t sz, int *freq0, int *
     freq0[EOB_SYMBOL] = 1; freq1[EOB_SYMBOL] = 1;
 }
 
-static int measure_encode_bits_ctx(const int16_t *d, size_t sz,
-                                    uint32_t *hc0, int *cl0, uint32_t *hc1, int *cl1) {
-    size_t buf_sz = sz * 3;
-    uint8_t *tmp = (uint8_t*)calloc(1, buf_sz);
-    Bitstream bs; bitstream_init(&bs, tmp, buf_sz);
-    huffman_encode_ctx(&bs, d, sz, hc0, cl0, hc1, cl1);
-    bitstream_flush(&bs);
-    int bits = bitstream_bits(&bs);
-    free(tmp);
-    return bits;
+/* Count frequencies for context-aware tables in one pass.
+   freq0 = categories seen after prev_cat<=2, freq1 = categories after prev_cat>2. */
+static void count_freq_ctx(const int16_t *d, size_t sz, int *freq0, int *freq1) {
+    memset(freq0, 0, NUM_HUFF_SYMBOLS * sizeof(int));
+    memset(freq1, 0, NUM_HUFF_SYMBOLS * sizeof(int));
+    int last_cat = 0, run = 0;
+    for (size_t i = 0; i < sz; i++) {
+        if (d[i] == 0) { run++; continue; }
+        int cat = category_of(d[i]);
+        if (cat < NUM_HUFF_SYMBOLS-1) {
+            if (last_cat <= 2) freq0[cat]++; else freq1[cat]++;
+        }
+        run = 0; last_cat = cat;
+    }
+    freq0[EOB_SYMBOL] = 0; freq1[EOB_SYMBOL] = 0;
+    if (run > 0) {
+        if (last_cat <= 2) freq0[EOB_SYMBOL] = 1;
+        else               freq1[EOB_SYMBOL] = 1;
+    }
+}
+
+/* Bit-count: sum freq0[i]*cl0[i] + freq1[i]*cl1[i]. extra_bits not included. */
+static int measure_encode_bits_ctx(int *freq0, int *freq1, int *cl0, int *cl1) {
+    int total = 0;
+    for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) {
+        total += freq0[i] * cl0[i];
+        total += freq1[i] * cl1[i];
+    }
+    return total;
 }
 
 /* ===================================================================== */
@@ -2507,26 +2600,33 @@ static const uint8_t def_tables_t1_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
  {{0,3,3,2,2,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}}
 };
 
-static int measure_encode_bits(const int16_t *d, size_t sz, uint32_t *hc, int *cl) {
-    size_t buf_sz = sz * 3;  /* safe upper bound */
-    uint8_t *tmp = (uint8_t*)calloc(1, buf_sz);
-    Bitstream bs;
-    bitstream_init(&bs, tmp, buf_sz);
-    huffman_encode_runval(&bs, d, sz, hc, cl);
-    bitstream_flush(&bs);
-    free(tmp);
-    return bitstream_bits(&bs);
+/* One-pass scan: count frequencies. */
+static void count_freq(const int16_t *d, size_t sz, int *freq) {
+    memset(freq, 0, NUM_HUFF_SYMBOLS * sizeof(int));
+    int run = 0;
+    for (size_t i = 0; i < sz; i++) {
+        if (d[i] == 0) { run++; continue; }
+        int cat = category_of(d[i]);
+        if (cat < NUM_HUFF_SYMBOLS-1) freq[cat]++;
+        run = 0;
+    }
+    freq[EOB_SYMBOL] = (run > 0) ? 1 : 0;
 }
 
-static int pick_best_table(const int16_t *d, size_t sz, int *freq, int ch,
+/* Bit-count: sum freq[i]*cl[i]. extra_bits not included - identical across tables. */
+static int measure_encode_bits(int *freq, int *cl) {
+    int total = 0;
+    for (int i = 0; i < NUM_HUFF_SYMBOLS; i++)
+        total += freq[i] * cl[i];
+    return total;
+}
+
+static int pick_best_table(int *freq, int ch,
                            int *clo, uint32_t *hco, int *best_bits, int is_420) {
     int best_idx = 0, best_total = 99999999;
     int cl[NUM_HUFF_SYMBOLS]; uint32_t hc[NUM_HUFF_SYMBOLS];
     const uint8_t (*tbl)[3][NUM_HUFF_SYMBOLS] = (is_420) ? def_tables_single_420 : def_tables_single;
     for (int t = 0; t < NUM_DEF_TABLES; t++) {
-        /* Check that every category present in frequency has a non-zero */
-        /* code length in this default table. Otherwise the table is invalid */
-        /* because the decoder cannot match 0-length codes. */
         int ok = 1;
         for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) {
             if (freq[i] > 0 && tbl[t][ch][i] == 0)
@@ -2536,16 +2636,19 @@ static int pick_best_table(const int16_t *d, size_t sz, int *freq, int ch,
         for(int i = 0; i < NUM_HUFF_SYMBOLS; i++)
             cl[i] = tbl[t][ch][i];
         generate_canonical_codes(cl, NUM_HUFF_SYMBOLS, hc);
-        int bits = measure_encode_bits(d, sz, hc, cl);
+        int bits = measure_encode_bits(freq, cl);
         if (bits < best_total) {
             best_total = bits; best_idx = t;
             memcpy(clo, cl, sizeof(cl)); memcpy(hco, hc, sizeof(hc));
         }
     }
-    memset(cl, 0, sizeof(cl));  /* ensure all entries initialized */
+    memset(cl, 0, sizeof(cl));
+    int save_eob = freq[EOB_SYMBOL];
+    freq[EOB_SYMBOL] = 1;  /* ensure EOB in custom table for compat */
     build_huffman_codes(freq, NUM_HUFF_SYMBOLS, cl);
     generate_canonical_codes(cl, NUM_HUFF_SYMBOLS, hc);
-    int bits = measure_encode_bits(d, sz, hc, cl);
+    freq[EOB_SYMBOL] = save_eob;  /* restore accurate count */
+    int bits = measure_encode_bits(freq, cl);
     int cnt = 0; for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) if (cl[i] > 0) cnt++;
     int total = bits + NUM_HUFF_SYMBOLS + cnt * 4;
     if (total < best_total) {
@@ -2559,16 +2662,8 @@ static int pick_best_table(const int16_t *d, size_t sz, int *freq, int ch,
 /* Pick best pair of context tables (t0 for prev-cat<=2, t1 for prev-cat>2). */
 /* Returns codes in cl0/hc0 (table0) and cl1/hc1 (table1). */
 /* t0: 0..6=default, 7=custom.  t1: 0..6=default, NUM_DEF_T1=custom. */
-static void pick_best_tables_ctx(const int16_t *d, size_t sz, int ch, const int16_t *extra, int *t0_out, int *t1_out,
+static void pick_best_tables_ctx(int *freq0, int *freq1, int ch, int *t0_out, int *t1_out,
                                  int *cl0, uint32_t *hc0, int *cl1, uint32_t *hc1, int *best_total, int is_420) {
-    int freq0[NUM_HUFF_SYMBOLS], freq1[NUM_HUFF_SYMBOLS];
-    count_frequencies_ctx(d, sz, freq0, freq1);
-    if (extra) {
-        int fe0[NUM_HUFF_SYMBOLS], fe1[NUM_HUFF_SYMBOLS];
-        count_frequencies_ctx(extra, sz, fe0, fe1);
-        for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) { freq0[i] += fe0[i]; freq1[i] += fe1[i]; }
-    }
-
     int best_t0 = 0, best_t1 = 0, best_bits = 99999999;
     int cl_t[NUM_HUFF_SYMBOLS]; uint32_t hc_t[NUM_HUFF_SYMBOLS];
     const uint8_t (*t0_tbl)[3][NUM_HUFF_SYMBOLS] = is_420 ? def_tables_t0_420 : def_tables_t0;
@@ -2590,7 +2685,7 @@ static void pick_best_tables_ctx(const int16_t *d, size_t sz, int ch, const int1
             if (!ok1) continue;
             for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) cl_t[i] = t1_tbl[t1][ch][i];
             generate_canonical_codes(cl_t, NUM_HUFF_SYMBOLS, hc_t);
-            int bits = measure_encode_bits_ctx(d, sz, hc0_t, cl0_t, hc_t, cl_t);
+            int bits = measure_encode_bits_ctx(freq0, freq1, cl0_t, cl_t);
             if (bits < best_bits) {
                 best_bits = bits; best_t0 = t0; best_t1 = t1;
                 memcpy(cl0, cl0_t, sizeof(cl0_t)); memcpy(hc0, hc0_t, sizeof(hc0_t));
@@ -2602,13 +2697,16 @@ static void pick_best_tables_ctx(const int16_t *d, size_t sz, int ch, const int1
     /* Build custom tables from frequencies */
     int cl0_c[NUM_HUFF_SYMBOLS] = {0}, cl1_c[NUM_HUFF_SYMBOLS] = {0};
     uint32_t hc0_c[NUM_HUFF_SYMBOLS], hc1_c[NUM_HUFF_SYMBOLS];
+    int save_eob0 = freq0[EOB_SYMBOL], save_eob1 = freq1[EOB_SYMBOL];
+    freq0[EOB_SYMBOL] = 1; freq1[EOB_SYMBOL] = 1;
     build_huffman_codes(freq0, NUM_HUFF_SYMBOLS, cl0_c);
     generate_canonical_codes(cl0_c, NUM_HUFF_SYMBOLS, hc0_c);
     build_huffman_codes(freq1, NUM_HUFF_SYMBOLS, cl1_c);
     generate_canonical_codes(cl1_c, NUM_HUFF_SYMBOLS, hc1_c);
+    freq0[EOB_SYMBOL] = save_eob0; freq1[EOB_SYMBOL] = save_eob1;
     int hdr0 = 0; for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) if (cl0_c[i] > 0) hdr0++;
     int hdr1 = 0; for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) if (cl1_c[i] > 0) hdr1++;
-    int hdr0_bits = NUM_HUFF_SYMBOLS + hdr0 * 4;  /* bitmap + code lengths */
+    int hdr0_bits = NUM_HUFF_SYMBOLS + hdr0 * 4;
     int hdr1_bits = NUM_HUFF_SYMBOLS + hdr1 * 4;
 
     /* custom t0 + default t1 */
@@ -2619,7 +2717,7 @@ static void pick_best_tables_ctx(const int16_t *d, size_t sz, int ch, const int1
         if (!ok1) continue;
         for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) cl_t[i] = t1_tbl[t1][ch][i];
         generate_canonical_codes(cl_t, NUM_HUFF_SYMBOLS, hc_t);
-        int bits = measure_encode_bits_ctx(d, sz, hc0_c, cl0_c, hc_t, cl_t) + hdr0_bits;
+        int bits = measure_encode_bits_ctx(freq0, freq1, cl0_c, cl_t) + hdr0_bits;
         if (bits < best_bits) {
             best_bits = bits; best_t0 = NUM_DEF_TABLES; best_t1 = t1;
             memcpy(cl0, cl0_c, sizeof(cl0_c)); memcpy(hc0, hc0_c, sizeof(hc0_c));
@@ -2636,7 +2734,7 @@ static void pick_best_tables_ctx(const int16_t *d, size_t sz, int ch, const int1
         int cl0_t[NUM_HUFF_SYMBOLS]; uint32_t hc0_t[NUM_HUFF_SYMBOLS];
         for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) cl0_t[i] = t0_tbl[t0][ch][i];
         generate_canonical_codes(cl0_t, NUM_HUFF_SYMBOLS, hc0_t);
-        int bits = measure_encode_bits_ctx(d, sz, hc0_t, cl0_t, hc1_c, cl1_c) + hdr1_bits;
+        int bits = measure_encode_bits_ctx(freq0, freq1, cl0_t, cl1_c) + hdr1_bits;
         if (bits < best_bits) {
             best_bits = bits; best_t0 = t0; best_t1 = NUM_DEF_T1;
             memcpy(cl0, cl0_t, sizeof(cl0_t)); memcpy(hc0, hc0_t, sizeof(hc0_t));
@@ -2646,7 +2744,7 @@ static void pick_best_tables_ctx(const int16_t *d, size_t sz, int ch, const int1
 
     /* both custom */
     {
-        int bits = measure_encode_bits_ctx(d, sz, hc0_c, cl0_c, hc1_c, cl1_c) + hdr0_bits + hdr1_bits;
+        int bits = measure_encode_bits_ctx(freq0, freq1, cl0_c, cl1_c) + hdr0_bits + hdr1_bits;
         if (bits < best_bits) {
             best_t0 = NUM_DEF_TABLES; best_t1 = NUM_DEF_T1;
             memcpy(cl0, cl0_c, sizeof(cl0_c)); memcpy(hc0, hc0_c, sizeof(hc0_c));
@@ -2658,14 +2756,15 @@ static void pick_best_tables_ctx(const int16_t *d, size_t sz, int ch, const int1
     if (best_total) *best_total = best_bits;
 }
 
-static void huffman_decode_ctx(Bitstream *bs, int16_t *o, size_t sz,
-                                int *cl0, uint32_t *hc0, int *cl1, uint32_t *hc1) {
+static void huffman_decode_ctx(Bitstream *bs, int16_t *o, size_t sz, int *cl0, uint32_t *hc0, int *cl1, uint32_t *hc1) {
+    uint8_t table0[HUF_FAST_TABLE_SIZE], table1[HUF_FAST_TABLE_SIZE];
+    build_huff_table(cl0, hc0, NUM_HUFF_SYMBOLS, table0);
+    build_huff_table(cl1, hc1, NUM_HUFF_SYMBOLS, table1);
     size_t i = 0; int last_cat = 0;
     while (i < sz) {
-        int *cl = (last_cat <= 2) ? cl0 : cl1;
-        uint32_t *hc = (last_cat <= 2) ? hc0 : hc1;
-        int sym = huffman_decode_symbol(bs, hc, cl, NUM_HUFF_SYMBOLS);
-        if (sym < 0 || sym == EOB_SYMBOL) { while (i < sz) o[i++] = 0; return; }
+        uint8_t *table = (last_cat <= 2) ? table0 : table1;
+        int sym = huffman_decode_symbol(bs, table);
+        if (sym == EOB_SYMBOL) { memset(o + i, 0, (sz - i) * sizeof(int16_t)); return; }
         int run = get_eg(bs);
         size_t end = i + run; if (end > sz) end = sz;
         while (i < end) o[i++] = 0;
@@ -4048,16 +4147,23 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
 
     /* Y (alpha reuses Y's codes immediately after) */
     if (huf_extra_ctx) {
-        pick_best_tables_ctx(q_y, total, 0, q_a, &t_y0, &t_y1, cl0, hc0, cl1, hc1, NULL, chroma_420);
-        put_bits(&bs, (t_y1 >> 2) & 1, 1);  /* t1_y hi bit as first bit in bitstream */
+        int f0[NUM_HUFF_SYMBOLS], f1[NUM_HUFF_SYMBOLS];
+        count_freq_ctx(q_y, total, f0, f1);
+        if (has_alpha) {
+            int fa0[NUM_HUFF_SYMBOLS], fa1[NUM_HUFF_SYMBOLS];
+            count_freq_ctx(q_a, total, fa0, fa1);
+            for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { f0[s] += fa0[s]; f1[s] += fa1[s]; }
+        }
+        pick_best_tables_ctx(f0, f1, 0, &t_y0, &t_y1, cl0, hc0, cl1, hc1, NULL, chroma_420);
+        put_bits(&bs, (t_y1 >> 2) & 1, 1);
     } else {
-        count_frequencies(q_y, total, freq);
+        count_freq(q_y, total, freq);
         if (has_alpha) {
             int fa[NUM_HUFF_SYMBOLS];
-            count_frequencies(q_a, total, fa);
+            count_freq(q_a, total, fa);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq[s] += fa[s];
         }
-        t_y0 = pick_best_table(q_y, total, freq, 0, cl0, hc0, NULL, chroma_420);
+        t_y0 = pick_best_table(freq, 0, cl0, hc0, NULL, chroma_420);
     }
     if (t_y0 == NUM_DEF_TABLES) t_y_size += write_huffman_table(&bs, cl0, NUM_HUFF_SYMBOLS);
     if (huf_extra_ctx && t_y1 == NUM_DEF_T1) t_y_size += write_huffman_table(&bs, cl1, NUM_HUFF_SYMBOLS);
@@ -4072,10 +4178,12 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
 
     /* U (overwrites cl0/hc0/cl1/hc1 - Y's codes no longer needed) */
     if (huf_extra_ctx) {
-        pick_best_tables_ctx(q_u, ctotal, 1, NULL, &t_u0, &t_u1, cl0, hc0, cl1, hc1, NULL, chroma_420);
+        int f0[NUM_HUFF_SYMBOLS], f1[NUM_HUFF_SYMBOLS];
+        count_freq_ctx(q_u, ctotal, f0, f1);
+        pick_best_tables_ctx(f0, f1, 1, &t_u0, &t_u1, cl0, hc0, cl1, hc1, NULL, chroma_420);
     } else {
-        count_frequencies(q_u, ctotal, freq);
-        t_u0 = pick_best_table(q_u, ctotal, freq, 1, cl0, hc0, NULL, chroma_420);
+        count_freq(q_u, ctotal, freq);
+        t_u0 = pick_best_table(freq, 1, cl0, hc0, NULL, chroma_420);
     }
     if (t_u0 == NUM_DEF_TABLES) t_u_size += write_huffman_table(&bs, cl0, NUM_HUFF_SYMBOLS);
     if (huf_extra_ctx && t_u1 == NUM_DEF_T1) t_u_size += write_huffman_table(&bs, cl1, NUM_HUFF_SYMBOLS);
@@ -4088,16 +4196,16 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
     /* V: pick own tables, then check if sharing U's works better */
     if (huf_extra_ctx) {
         int fv0[NUM_HUFF_SYMBOLS], fv1[NUM_HUFF_SYMBOLS];
+        count_freq_ctx(q_v, ctotal, fv0, fv1);
         int bv;
-        pick_best_tables_ctx(q_v, ctotal, 2, NULL, &t_v0, &t_v1, cl0, hc0, cl1, hc1, &bv, chroma_420);
-        count_frequencies_ctx(q_v, ctotal, fv0, fv1);
+        pick_best_tables_ctx(fv0, fv1, 2, &t_v0, &t_v1, cl0, hc0, cl1, hc1, &bv, chroma_420);
         int ok0 = 1, ok1 = 1;
         for (int i = 0; i < NUM_HUFF_SYMBOLS; i++) {
             if (fv0[i] > 0 && cl_u0[i] == 0) ok0 = 0;
             if (fv1[i] > 0 && cl_u1[i] == 0) ok1 = 0;
         }
         if (ok0 && ok1) {
-            int bu = measure_encode_bits_ctx(q_v, ctotal, hc_u0, cl_u0, hc_u1, cl_u1);
+            int bu = measure_encode_bits_ctx(fv0, fv1, cl_u0, cl_u1);
             if (bu <= bv) {
                 shared_v = 1; t_v0 = t_u0; t_v1 = t_u1;
                 memcpy(cl0, cl_u0, sizeof(cl_u0)); memcpy(hc0, hc_u0, sizeof(hc_u0));
@@ -4105,14 +4213,14 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
             }
         }
     } else {
-        int bv;  /* best V cost in bits (incl. table header for custom), from pick_best_table */
-        count_frequencies(q_v, ctotal, freq);
-        t_v0 = pick_best_table(q_v, ctotal, freq, 2, cl0, hc0, &bv, chroma_420);
+        int bv;
+        count_freq(q_v, ctotal, freq);
+        t_v0 = pick_best_table(freq, 2, cl0, hc0, &bv, chroma_420);
         int ok = 1;
         for (int i = 0; i < NUM_HUFF_SYMBOLS; i++)
             if (freq[i] > 0 && cl_u0[i] == 0) { ok = 0; break; }
         if (ok) {
-            int bu = measure_encode_bits(q_v, ctotal, hc_u0, cl_u0);
+            int bu = measure_encode_bits(freq, cl_u0);
             if (bu <= bv) {
                 shared_v = 1; t_v0 = t_u0; memcpy(cl0, cl_u0, sizeof(cl_u0)); memcpy(hc0, hc_u0, sizeof(hc_u0));
             }

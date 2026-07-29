@@ -17,7 +17,10 @@ else
   CFLAGS="${CFLAGS} -O3 -ffunction-sections -fdata-sections -Wl,--gc-sections -U_FORTIFY_SOURCE -DNDEBUG"
 fi
 
-if [ "${ENABLE_AVX}" = "yes" ]; then
+# Auto-detect x86 host and enable AVX unless explicitly disabled
+if [ "${ENABLE_AVX}" = "no" ]; then
+  :  # explicitly disabled
+elif [ "${ENABLE_AVX}" = "yes" ] || [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "i386" ] || [ "$(uname -m)" = "i686" ]; then
   CFLAGS="${CFLAGS} -mavx"
 fi
 

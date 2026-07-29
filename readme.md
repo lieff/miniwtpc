@@ -151,9 +151,9 @@ But note that format become incompatible with WTPC release version.
 | Codec               | Encode (ms) | Decode (ms) |
 |---------------------|-------------|-------------|
 | WTPC EBCOT 4:4:4 | 8 | 7 |
-| WTPC Huffman 4:4:4 | 3 | 1 |
-| WTPC EBCOT 4:2:0 | 5 | 5 |
-| WTPC Huffman 4:2:0 | 2 | 1 |
+| WTPC Huffman 4:4:4 | 1 | 1 |
+| WTPC EBCOT 4:2:0 | 5 | 4 |
+| WTPC Huffman 4:2:0 | 1 | 1 |
 | JPEG 2000 | 16 | 5 |
 | JPEG XL | 103 | 4 |
 | JPEG | 4 | 3 |
