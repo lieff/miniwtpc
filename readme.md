@@ -35,6 +35,27 @@ Currently WIP, bitstream format is not yet stable and may change if further qual
 
 ## API and usage
 
+### Integration (single-header library)
+
+WTPC follows the stb_image pattern: the header `wtpc_image.h` contains both
+the API declarations and the implementation, gated by a macro.
+
+```c
+// In ONE .c file, define the implementation macro before including:
+#define WTPC_IMAGE_IMPLEMENTATION
+#include "wtpc_image.h"
+
+// Everywhere else, just include the header to get the API declarations:
+#include "wtpc_image.h"
+```
+
+The header pulls in `<stdint.h>`, `<stdlib.h>`, `<string.h>`, `<math.h>`,
+and optionally `<stdio.h>` (exclude with `WTPC_NO_STDIO`).  On x86-64 the
+build script auto-enables AVX; add `-mavx` manually on other compilers.
+Link with `-lm`.
+
+### C API
+
 ```c
    === API ===
 
@@ -111,10 +132,46 @@ Currently WIP, bitstream format is not yet stable and may change if further qual
                                     WTPC_TUNE_PARAMS.
 ```
 
-You can retrain quantization parameters and Huffman tables on your own
-dataset. Enable `WTPC_TUNE_PARAMS`, set param ranges in `param_cfg`, and
-run tuning (`wtpc -T`) and/or Huffman table generation (`wtpc -G`).
-But note that format become incompatible with WTPC release version.
+### CLI tool flags
+
+The standalone `wtpc` binary (built via `build.sh` or `gcc -O3 wtpc.c -o wtpc -lm -lpng16`) uses these flags:
+
+| Flag | Description |
+|------|-------------|
+| `-e in.png` | Encode mode (requires `-o out.wtp`) |
+| `-d in.wtp` | Decode mode (requires `-o out.png`) |
+| `-t in.png` | Self-test: encode + decode + compare PSNR |
+| `-q N` | Quality 1..1024 (lower = better/larger) |
+| `-b N` | Target file size in bytes (auto-finds q) |
+| `-c` | Use 4:2:0 chroma subsampling |
+| `-m best\|ebcot\|huffman` | Encoding mode (default: ebcot) |
+| `-h 1` | Context-aware Huffman tables (slower, slightly better) |
+| `-o file` | Output file path |
+| `-G dir` | Generate Huffman tables from images in directory |
+| `-P dir` | Tune EBCOT contexts from images (needs `WTPC_TUNE_CTX`) |
+| `-T dir` | Tune quantization parameters (needs `WTPC_TUNE_PARAMS`) |
+| `-R dir` | Train DC priors (needs `WTPC_TUNE_PARAMS`) |
+| `-S N` | Start tuning from parameter set N |
+| `-420` | Tune 4:2:0 mode (with `-T` / `-R`) |
+| `-v` | Verbose tuning output |
+
+### Tuning and retraining
+
+You can retrain quantization parameters, DC priors, Huffman tables, and
+EBCOT contexts on your own dataset:
+
+1. Build with `WTPC_TUNE_PARAMS` (and optionally `WTPC_TUNE_CTX` for -P)
+2. Run `./wtpc -T images/` to tune quantization tables
+3. Run `./wtpc -R images/` to train DC priors
+4. Run `./wtpc -G images/` to generate Huffman tables
+5. Run `./wtpc -P images/` to tune EBCOT contexts (requires WTPC_TUNE_CTX instead of WTPC_TUNE_PARAMS)
+6. Paste the printed tables back into `wtpc_image.h`
+
+Use `-420` to tune the 4:2:0 variants, `-S N` to continue from a specific
+parameter set, and `-v` for verbose progress output.
+
+**Note:** tuning changes the bitstream format, making it incompatible with
+the release version.
 
 ## Benchmark: WTPC vs JPEG vs JPEG 2000 vs JPEG XL
 
@@ -127,24 +184,24 @@ But note that format become incompatible with WTPC release version.
 
 | Target | Best Codec         | Size   | PSNR   | ssimulacra2 |
 |--------|--------------------|--------|--------|-------------|
-| 200 B | WTPC 4:4:4 EBCOT | 203 B | 19.44 | -60.18 |
-| 400 B | WTPC 4:2:0 EBCOT | 402 B | 21.88 | -40.39 |
-| 600 B | WTPC 4:4:4 EBCOT | 604 B | 23.20 | -21.18 |
-| 800 B | WTPC 4:2:0 EBCOT | 798 B | 23.96 | -8.75 |
-| 1 KB | WTPC 4:4:4 EBCOT | 1404 B | 25.94 | 19.76 |
-| 2 KB | WTPC 4:4:4 EBCOT | 2009 B | 27.17 | 34.57 |
-| 3 KB | WTPC 4:4:4 EBCOT | 3007 B | 28.51 | 49.79 |
-| 4 KB | WTPC 4:4:4 EBCOT | 4014 B | 29.61 | 58.18 |
-| 5 KB | WTPC 4:4:4 EBCOT | 5006 B | 30.59 | 64.84 |
-| 6 KB | WTPC 4:4:4 EBCOT | 5996 B | 31.51 | 69.34 |
-| 8 KB | WTPC 4:4:4 EBCOT | 8027 B | 33.13 | 75.45 |
-| 10 KB | WTPC 4:4:4 EBCOT | 9987 B | 34.40 | 79.77 |
-| 13 KB | WTPC 4:4:4 EBCOT | 13009 B | 35.94 | 84.12 |
-| 15 KB | WTPC 4:4:4 EBCOT | 15010 B | 36.73 | 86.05 |
-| 18 KB | WTPC 4:4:4 EBCOT | 17999 B | 37.80 | 88.40 |
-| 22 KB | WTPC 4:4:4 EBCOT | 21964 B | 39.07 | 90.42 |
-| 28 KB | WTPC 4:4:4 EBCOT | 27973 B | 40.75 | 92.38 |
-| 36 KB | WTPC 4:4:4 EBCOT | 36029 B | 42.59 | 93.91 |
+| 200 B | WTPC 4:2:0 EBCOT | 205 B | 19.69 | -60.51 |
+| 400 B | WTPC 4:2:0 EBCOT | 402 B | 22.04 | -39.34 |
+| 600 B | WTPC 4:4:4 EBCOT | 605 B | 23.09 | -21.70 |
+| 800 B | WTPC 4:4:4 EBCOT | 804 B | 24.02 | -9.24 |
+| 1 KB | WTPC 4:4:4 EBCOT | 1405 B | 25.90 | 19.97 |
+| 2 KB | WTPC 4:4:4 EBCOT | 1997 B | 27.14 | 35.16 |
+| 3 KB | WTPC 4:4:4 EBCOT | 3001 B | 28.49 | 50.28 |
+| 4 KB | WTPC 4:4:4 EBCOT | 3999 B | 29.57 | 58.21 |
+| 5 KB | WTPC 4:4:4 EBCOT | 5007 B | 30.53 | 64.56 |
+| 6 KB | WTPC 4:4:4 EBCOT | 6000 B | 31.47 | 69.72 |
+| 8 KB | WTPC 4:4:4 EBCOT | 8018 B | 33.08 | 75.64 |
+| 10 KB | WTPC 4:4:4 EBCOT | 9993 B | 34.40 | 79.99 |
+| 13 KB | WTPC 4:4:4 EBCOT | 13035 B | 35.96 | 84.06 |
+| 15 KB | WTPC 4:4:4 EBCOT | 15026 B | 36.74 | 85.96 |
+| 18 KB | WTPC 4:4:4 EBCOT | 17990 B | 37.80 | 88.52 |
+| 22 KB | WTPC 4:4:4 EBCOT | 22054 B | 39.10 | 90.42 |
+| 28 KB | WTPC 4:4:4 EBCOT | 28004 B | 40.76 | 92.34 |
+| 36 KB | WTPC 4:4:4 EBCOT | 36067 B | 42.61 | 93.75 |
 
 ### Speed Summary (lena 256x256, representative q=244)
 
@@ -152,10 +209,10 @@ But note that format become incompatible with WTPC release version.
 |---------------------|-------------|-------------|
 | WTPC EBCOT 4:4:4 | 8 | 7 |
 | WTPC Huffman 4:4:4 | 1 | 1 |
-| WTPC EBCOT 4:2:0 | 5 | 4 |
+| WTPC EBCOT 4:2:0 | 4 | 4 |
 | WTPC Huffman 4:2:0 | 1 | 1 |
 | JPEG 2000 | 16 | 5 |
-| JPEG XL | 103 | 4 |
+| JPEG XL | 103 | 3 |
 | JPEG | 4 | 3 |
 
 See [results.md](results.md) for the complete per-size breakdown, speed

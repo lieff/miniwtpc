@@ -1356,6 +1356,9 @@ int main(int argc, char **argv) {
 #ifdef _WIN32    
     timeBeginPeriod(1);
 #endif
+#ifdef WTPC_TUNE_CDF97_D
+    { const char *ev = getenv("WTPC_CDF97_D"); if (ev) g_cdf97_d = (float)atof(ev); }
+#endif
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-e") == 0) mode = 1;
         else if (strcmp(argv[i], "-d") == 0) mode = 0;
@@ -1507,13 +1510,13 @@ int main(int argc, char **argv) {
         generate_canonical_codes(cl, NUM_HUFF_SYMBOLS, hc);
         uint8_t *enc_buf=(uint8_t*)malloc(10000);
         Bitstream bs; bitstream_init(&bs, enc_buf, 10000);
-        huffman_encode_runval(&bs, test_coeffs, 1000, hc, cl);
+        huffman_encode_runval(&bs, test_coeffs, 1000, 1, hc, cl);
         bitstream_flush(&bs);
         int enc_len = bitstream_bytes(&bs);
         int16_t *dec_coeffs = (int16_t*)calloc(1000, sizeof(int16_t));
         Bitstream rbs;
         bitstream_init(&rbs, enc_buf, enc_len);
-        huffman_decode_channel(&rbs, dec_coeffs, 1000, cl, hc);
+        huffman_decode_channel(&rbs, dec_coeffs, 1000, 1, cl, hc);
         int errors = 0;
         for(int i = 0; i < 1000; i++)
             if(test_coeffs[i] != dec_coeffs[i]) { if(errors<10) printf("[%d] %d!=%d\n", i, test_coeffs[i], dec_coeffs[i]); errors++; }
@@ -1522,6 +1525,41 @@ int main(int argc, char **argv) {
         else
             { printf("[SELF-TEST HUFFMAN] FAIL: %d mismatches\n", errors); all_ok = 0; }
         free(enc_buf); free(dec_coeffs);
+        /* Strict 2D huffman roundtrip across sizes: encode + decode must return
+           the exact same coefficients (subband + 2x2 scan reversibility). */
+        {
+            int hf2 = 0;
+            int szs[][2] = {{1,1},{2,2},{3,5},{4,4},{5,3},{7,9},{8,8},{16,16},{17,9},{1,64},{64,1},{2,7},{7,2}};
+            int nsz = (int)(sizeof(szs)/sizeof(szs[0]));
+            for (int mode = 0; mode < 2 && !hf2; mode++) {  /* 0=single, 1=ctx */
+                for (int t = 0; t < nsz && !hf2; t++) {
+                    int tw = szs[t][0], th = szs[t][1], tt = tw*th;
+                    int16_t *src = malloc(tt*sizeof(int16_t));
+                    for (int i = 0; i < tt; i++) { int r = (i*37+13)%97; src[i] = (r<70)?0 : (int16_t)((r*7)%127-63); }
+                    int fq[NUM_HUFF_SYMBOLS]; count_frequencies(src, tt, fq);
+                    int cl[NUM_HUFF_SYMBOLS]; uint32_t hc[NUM_HUFF_SYMBOLS];
+                    build_huffman_codes(fq, NUM_HUFF_SYMBOLS, cl);
+                    generate_canonical_codes(cl, NUM_HUFF_SYMBOLS, hc);
+                    int cl1[NUM_HUFF_SYMBOLS]; uint32_t hc1[NUM_HUFF_SYMBOLS];
+                    memcpy(cl1, cl, sizeof(cl)); memcpy(hc1, hc, sizeof(hc));
+                    uint8_t *eb = malloc((size_t)tt*8+64);
+                    Bitstream w; bitstream_init(&w, eb, (size_t)tt*8+64);
+                    if (mode) huffman_encode_ctx(&w, src, tw, th, hc, cl, hc1, cl1);
+                    else      huffman_encode_runval(&w, src, tw, th, hc, cl);
+                    bitstream_flush(&w);
+                    int el = bitstream_bytes(&w);
+                    int16_t *dst = calloc(tt, sizeof(int16_t));
+                    Bitstream rb; bitstream_init(&rb, eb, el);
+                    if (mode) huffman_decode_ctx(&rb, dst, tw, th, cl, hc, cl1, hc1);
+                    else      huffman_decode_channel(&rb, dst, tw, th, cl, hc);
+                    for (int i = 0; i < tt; i++)
+                        if (src[i] != dst[i]) { hf2++; printf("  HF2D mode=%d %dx%d idx=%d: %d!=%d\n", mode, tw, th, i, src[i], dst[i]); break; }
+                    free(src); free(dst); free(eb);
+                }
+            }
+            if (hf2 == 0) printf("[SELF-TEST HUFFMAN-2D] OK: %d sizes x 2 modes exact roundtrip\n", nsz);
+            else { printf("[SELF-TEST HUFFMAN-2D] FAIL: %d\n", hf2); all_ok = 0; }
+        }
         /* Self-test: EBCOT roundtrip (small block) */
         int w = 4, h = 4, total = 16;
         int16_t c[16] = {0,5,-3,0, 0,0,12,0, 0,-7,0,0, 1,0,0,0};
