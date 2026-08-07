@@ -5,11 +5,17 @@
 
    === API ===
 
+   typedef enum {
+       WTPC_ENC_AUTO    = 0,
+       WTPC_ENC_HUFFMAN = 1,
+       WTPC_ENC_EBCOT   = 2
+   } wtpc_enc_mode;
+
    typedef struct {
        int encoded_bytes;   - output number of bytes
        int result_q;        - resulting quantization factor if target_bytes provided, or same as 'quality' if target_bytes=0
        int search_steps;    - number of iterations to search target bytes quantization 
-       int ebcot;           - 1 = ebcot or 0 = huffman mode for best pick if auto huffman_mode used
+       int ebcot;           - 1 = ebcot or 0 = huffman mode for best pick if auto encode_mode used
        int huffman_y_size;  - in bits if not picked static table
        int huffman_u_size;
        int huffman_v_size;
@@ -20,7 +26,7 @@
 
    unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info,
        int w, int h, int target_bytes, int quality, int chroma_420,
-       int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
+       int encode_mode, int huf_extra_ctx, int has_alpha, int stride, int block_size);
      Encode an RGB/RGBA image in memory. Returns malloc'd WTPC bitstream,
      or NULL on error. Caller must free().
        rgb           : input pixels, h rows of stride bytes each.
@@ -34,13 +40,17 @@
                        quality / larger file. Used only when target_bytes == 0.
        chroma_420    : 0 = 4:4:4 (full chroma), 1 = 4:2:0 (half chroma).
                        4:2:0 saves ~15-30% bytes with minor visual loss.
-       huffman_mode  : 0 = auto-pick smaller of ebcot/huffman,
-                       1 = huffman, 2 = ebcot.
+       encode_mode   : WTPC_ENC_AUTO (auto-pick ebcot/huffman),
+                       WTPC_ENC_HUFFMAN, WTPC_ENC_EBCOT.
        huf_extra_ctx : 0 = single Huffman table (faster),
                        1 = two context-switched tables (slightly better).
        has_alpha     : 0 = RGB (3 channels), 1 = RGBA (4 channels).
        stride        : bytes per row (0 = tightly packed = w * pixel_bytes).
                         Allows BMP-like padded data without repacking.
+       block_size    : 0 = normal encode, or precinct size for EBCOT block mode
+                       (32, 64, 128, 256, 512, 1024, 2048). Full-image wavelet,
+                       entropy coding split into NxN blocks for speed. 3-4x faster
+                       on large images; only valid with EBCOT (not Huffman).
 
    unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len,
        int *w, int *h, int *out_quality, int *out_comp);
@@ -54,13 +64,30 @@
 
    int wtpc_encode_file(const char *out_path, const unsigned char *rgb,
        wtpc_enc_info *info, int w, int h, int target_bytes, int quality,
-       int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
+       int chroma_420, int encode_mode, int huf_extra_ctx, int has_alpha, int stride, int block_size);
      Same as wtpc_encode_mem but writes directly to a file.
      Returns 0 on success, -1 on error.
 
    unsigned char *wtpc_decode_file(const char *in_path,
        int *w, int *h, int *out_quality, int *out_comp);
      Same as wtpc_decode_mem but reads from a file.
+
+   === Wavelet Hash API (ultra-compact, ThumbHash-like) ===
+
+   uint8_t *wtpc_hash_encode_mem(const uint8_t *rgb, int w, int h, int *out_len);
+     Encode an RGB image (w,h <= 256) to a compact wavelet hash.
+     Uses CDF 9/7 wavelet + YUV color space, auto-budget from image size.
+     Returns malloc'd hash buffer, or NULL on error. Caller must free().
+       rgb     : input pixels, tightly packed RGB (w*h*3 bytes).
+       w, h    : image dimensions (1..256).
+       out_len : filled with hash size in bytes.
+
+   uint8_t *wtpc_hash_decode_mem(const uint8_t *hash, int hash_len, int *w, int *h);
+     Decode a wavelet hash back to w x h RGB image.
+     Returns malloc'd pixel buffer (w*h*3 bytes), or NULL on error. Caller must free().
+       hash     : input hash bytes (from wtpc_hash_encode_mem).
+       hash_len : number of bytes in hash.
+       w, h     : filled with decoded image dimensions.
 
    === Build-time options ===
      #define WTPC_NO_STDIO        : exclude file I/O functions.
@@ -97,6 +124,9 @@
 
 #define MAX_QUALITY 1024
 
+/* EBCOT: skip flag encoding for first N subbands (mostly non-empty in practice). */
+#define SB_SKIP_FLAGS 15
+
 #if defined(_MSC_VER)
   #define WTPC_RESTRICT __restrict
 #elif defined(__GNUC__) || defined(__clang__)
@@ -105,9 +135,24 @@
   #define WTPC_RESTRICT
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+  #define WTPC_LIKELY(x)   __builtin_expect(!!(x), 1)
+  #define WTPC_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+  #define WTPC_LIKELY(x)   (x)
+  #define WTPC_UNLIKELY(x) (x)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Encoding mode for wtpc_encode_mem / wtpc_encode_file */
+typedef enum {
+    WTPC_ENC_AUTO    = 0,  /* auto-pick smaller of ebcot/huffman */
+    WTPC_ENC_HUFFMAN = 1,  /* force Huffman */
+    WTPC_ENC_EBCOT   = 2   /* force EBCOT */
+} wtpc_enc_mode;
 
 typedef struct {
     int encoded_bytes;
@@ -131,12 +176,11 @@ typedef struct {
     int bits_in_cache;
 } Bitstream;
 
-
-unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
+unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int encode_mode, int huf_extra_ctx, int has_alpha, int stride, int block_size);
 unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, int *h, int *out_quality, int *out_comp);
 
 #ifndef WTPC_NO_STDIO
-int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride);
+int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int encode_mode, int huf_extra_ctx, int has_alpha, int stride, int block_size);
 unsigned char *wtpc_decode_file(const char *in_path, int *w, int *h, int *out_quality, int *out_comp);
 #endif  /* WTPC_NO_STDIO */
 
@@ -151,7 +195,7 @@ unsigned char *wtpc_decode_file(const char *in_path, int *w, int *h, int *out_qu
 /* Rate control "never overshoot" mode: pick the largest encoding that still fits
    under target_bytes rather than the one closest to it. Tuning always needs this
    (overshoot would cheat the metrics), so WTPC_TUNE_PARAMS implies it. */
-#if defined(WTPC_TUNE_PARAMS) && !defined(WTPC_RC_ONLY_LESS_THAN_TARGET)
+#if defined(WTPC_TUNE_PARAMS) && !defined(WTPC_RC_ONLY_LESS_THAN_TARGET) && !defined(WTPC_TUNE_PARAMS_KEEP_RC)
 #define WTPC_RC_ONLY_LESS_THAN_TARGET
 #endif
 
@@ -1978,10 +2022,40 @@ static void cdf97_inverse_2d(float * WTPC_RESTRICT data, int width, int height) 
 #endif
 #define MAX_BANDS 8
 #ifndef WTPC_EXTERNAL_TABLES
-/* MAX_BANDS multipliers + MAX_BANDS per-band dead-zone factors */
-static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS*2]    = {0.31f, 0.20f, 0.18f, 0.18f, 0.25f, 0.46f, 1.08f, 3.32f, /*DZ*/ 0.60f, 0.56f, 0.50f, 0.50f, 0.51f, 0.53f, 0.55f, 0.60f};
-static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS*2]    = {0.38f, 0.26f, 0.25f, 0.36f, 0.60f, 1.18f, 2.60f, 6.52f, /*DZ*/ 0.57f, 0.58f, 0.61f, 0.64f, 0.69f, 0.69f, 0.66f, 0.64f};
-static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS*2] = {0.29f, 0.17f, 0.17f, 0.24f, 0.43f, 0.86f, 2.07f, 4.58f, /*DZ*/ 0.54f, 0.61f, 0.59f, 0.65f, 0.69f, 0.68f, 0.59f, 0.50f};
+
+/* Q-dependent EXT band multipliers (bands 8+).
+   Lerp on base (base~quality): EXT_MULT_MIN at q=1 -> table EXT_MULT at q=60.
+   EXT_MULT/EXT_MULT_HH stored per-table after DC (LH[MAX_BANDS*2+1/+2]). */
+#define EXT_BASE_Q1   0.45f
+#define EXT_BASE_Q60  0.73f   /* base at q=60: 0.45*exp(59*WTPC_BASE_LOG_RATIO) */
+#define EXT_MULT_MIN  1.0f
+#ifdef WTPC_TUNE_PARAMS
+#define WTPC_EXT_BASE_THRESH g_ext_base_thresh
+static float g_ext_base_thresh = EXT_BASE_Q60;
+#else
+#define WTPC_EXT_BASE_THRESH EXT_BASE_Q60
+#endif
+static inline float ext_mult_from_base(float base, float target_mult) {
+    if (base <= EXT_BASE_Q1) return EXT_MULT_MIN;
+    if (base >= WTPC_EXT_BASE_THRESH) return target_mult;
+    return EXT_MULT_MIN + (target_mult - EXT_MULT_MIN) * (base - EXT_BASE_Q1) / (WTPC_EXT_BASE_THRESH - EXT_BASE_Q1);
+}
+
+/* Per-subband quantization tables: [mult[8]][dz[8]] for LH/HL/HH.
+   DC stored as LH[16]; EXT_MULT/EXT_MULT_HH (bands 8+) as LH[17]/[18]. */
+static WTPC_TABLES_CONST float g_quant_y_lh[MAX_BANDS*2+3] = {0.28f,0.17f,0.15f,0.15f,0.21f,0.37f,0.85f,2.72f, /*DZ*/ 0.69f,0.55f,0.52f,0.50f,0.50f,0.52f,0.54f,0.55f, /*DC*/ 0.34f, /*EXT*/ 2.04f, /*EXT_HH*/ 2.16f};
+static WTPC_TABLES_CONST float g_quant_y_hl[MAX_BANDS*2]   = {0.21f,0.19f,0.15f,0.16f,0.22f,0.39f,0.88f,2.72f, /*DZ*/ 0.65f,0.60f,0.52f,0.51f,0.51f,0.52f,0.54f,0.55f};
+static WTPC_TABLES_CONST float g_quant_y_hh[MAX_BANDS*2]   = {0.22f,0.16f,0.15f,0.19f,0.28f,0.61f,1.38f,3.80f, /*DZ*/ 0.56f,0.60f,0.54f,0.51f,0.53f,0.58f,0.71f,0.66f};
+static WTPC_TABLES_CONST float g_quant_c_lh[MAX_BANDS*2+3] = {0.37f,0.23f,0.24f,0.29f,0.47f,0.99f,2.45f,6.09f, /*DZ*/ 0.50f,0.54f,0.58f,0.64f,0.66f,0.69f,0.61f,0.58f, /*DC*/ 0.45f, /*EXT*/ 1.95f, /*EXT_HH*/ 2.22f};
+static WTPC_TABLES_CONST float g_quant_c_hl[MAX_BANDS*2]   = {0.36f,0.27f,0.25f,0.31f,0.50f,0.99f,2.39f,6.43f, /*DZ*/ 0.56f,0.59f,0.59f,0.64f,0.67f,0.69f,0.65f,0.58f};
+static WTPC_TABLES_CONST float g_quant_c_hh[MAX_BANDS*2]   = {0.32f,0.24f,0.26f,0.46f,0.82f,1.48f,3.20f,6.81f, /*DZ*/ 0.57f,0.59f,0.64f,0.67f,0.74f,0.77f,0.82f,0.81f};
+static WTPC_TABLES_CONST float g_quant_c420_lh[MAX_BANDS*2+3] = {0.23f,0.13f,0.15f,0.20f,0.34f,0.75f,2.01f,4.62f, /*DZ*/ 0.55f,0.65f,0.59f,0.63f,0.69f,0.68f,0.57f,0.55f, /*DC*/ 0.33f, /*EXT*/ 1.86f, /*EXT_HH*/ 2.19f};
+static WTPC_TABLES_CONST float g_quant_c420_hl[MAX_BANDS*2]   = {0.26f,0.16f,0.17f,0.20f,0.34f,0.78f,1.95f,4.76f, /*DZ*/ 0.59f,0.60f,0.62f,0.65f,0.69f,0.64f,0.59f,0.50f};
+static WTPC_TABLES_CONST float g_quant_c420_hh[MAX_BANDS*2]   = {0.19f,0.16f,0.18f,0.29f,0.63f,1.36f,3.07f,5.41f, /*DZ*/ 0.57f,0.59f,0.59f,0.66f,0.70f,0.68f,0.61f,0.67f};
+
+static const float *const g_qt_y[3]    = {g_quant_y_lh, g_quant_y_hl, g_quant_y_hh};
+static const float *const g_qt_c[3]    = {g_quant_c_lh, g_quant_c_hl, g_quant_c_hh};
+static const float *const g_qt_c420[3] = {g_quant_c420_lh, g_quant_c420_hl, g_quant_c420_hh};
 #endif
 
 /* Quantization step base as a function of quality (1..MAX_QUALITY).               */
@@ -2091,105 +2165,220 @@ static void compute_safe_steps(float min_step[5], int w, int h) {
     }
 }
 
-static void quantize_coeffs(const float * WTPC_RESTRICT wavelet, int16_t * WTPC_RESTRICT quantized, int w, int h, float base, const float * WTPC_RESTRICT bands_mult) {
-    int lw[17], lh[17];
-    compute_ll_sizes(w, h, lw, lh);
+static void quantize_coeffs(const float * WTPC_RESTRICT wavelet, int16_t * WTPC_RESTRICT quantized, int w, int h, float base, const float *const qt[3]) {
+    #define LUT_SZ 17
+    int lw[LUT_SZ], lh[LUT_SZ];
+    int levels = compute_ll_sizes(w, h, lw, lh);
     float min_step[5];
     compute_safe_steps(min_step, w, h);
-    /* Padded local copies: lb = band multipliers, dz_lb = per-band dead-zone factors */
-    #define LUT_SZ 17
-    float lb[LUT_SZ], dz_lb[LUT_SZ];
+    float lb_lh[LUT_SZ] = {0}, lb_hl[LUT_SZ] = {0}, lb_hh[LUT_SZ] = {0};
+    float dz_lh[LUT_SZ] = {0}, dz_hl[LUT_SZ] = {0}, dz_hh[LUT_SZ] = {0};
+
+    const float *m_lh = qt[0], *m_hl = qt[1], *m_hh = qt[2];
     for (int b = 0; b < MAX_BANDS; b++) {
-        lb[b]    = bands_mult[b];
-        dz_lb[b] = bands_mult[MAX_BANDS + b];
+        lb_lh[b] = m_lh[b];  dz_lh[b] = m_lh[MAX_BANDS + b];
+        lb_hl[b] = m_hl[b];  dz_hl[b] = m_hl[MAX_BANDS + b];
+        lb_hh[b] = m_hh[b];  dz_hh[b] = m_hh[MAX_BANDS + b];
     }
-    for (int b = MAX_BANDS; b < LUT_SZ; b++) {
-        lb[b]    = bands_mult[MAX_BANDS - 1];
-        dz_lb[b] = bands_mult[MAX_BANDS * 2 - 1];
+
+    /* Q-dependent lerp: cap large multipliers ->1.0, DZ->0.5.
+       Applied BEFORE EXT band generation so EXT inherits lerped values. */
+    float lerp_t;
+    if (base <= EXT_BASE_Q1) lerp_t = 0.0f;
+    else if (base >= WTPC_EXT_BASE_THRESH) lerp_t = 1.0f;
+    else lerp_t = (base - EXT_BASE_Q1) / (WTPC_EXT_BASE_THRESH - EXT_BASE_Q1);
+    for (int b = 0; b < MAX_BANDS; b++) {
+        if (lb_lh[b] > 1.0f) lb_lh[b] = 1.0f + (lb_lh[b] - 1.0f) * lerp_t;
+        if (lb_hl[b] > 1.0f) lb_hl[b] = 1.0f + (lb_hl[b] - 1.0f) * lerp_t;
+        if (lb_hh[b] > 1.0f) lb_hh[b] = 1.0f + (lb_hh[b] - 1.0f) * lerp_t;
+        dz_lh[b] = 0.5f + (dz_lh[b] - 0.5f) * lerp_t;
+        dz_hl[b] = 0.5f + (dz_hl[b] - 0.5f) * lerp_t;
+        dz_hh[b] = 0.5f + (dz_hh[b] - 0.5f) * lerp_t;
     }
-    static const int qb_lut[17] = {0,4,4,4,4,3,2,1,0,0,0,0,0,0,0,0,0};
-    int i = 0;
-    /* Precompute per-band step + deadzone (k=1..LUT_SZ-1) */
-    float step_k[LUT_SZ], dz_k[LUT_SZ];
+
+    /* Bands beyond MAX_BANDS: generate from LERPED band MAX_BANDS-1 values. */
+    if (levels > MAX_BANDS) {
+        float fl = lb_lh[MAX_BANDS - 1], fhl = lb_hl[MAX_BANDS - 1], fhh = lb_hh[MAX_BANDS - 1];
+        float mult_lh = ext_mult_from_base(base, qt[0][MAX_BANDS*2+1]);
+        float mult_hh = ext_mult_from_base(base, qt[0][MAX_BANDS*2+2]);
+        float last_dz_lh = dz_lh[MAX_BANDS - 1];
+        float last_dz_hl = dz_hl[MAX_BANDS - 1];
+        float last_dz_hh = dz_hh[MAX_BANDS - 1];
+        for (int b = MAX_BANDS; b < LUT_SZ; b++) {
+            fl  *= mult_lh; lb_lh[b] = fl;
+            fhl *= mult_lh; lb_hl[b] = fhl;
+            fhh *= mult_hh; lb_hh[b] = fhh;
+            dz_lh[b] = last_dz_lh;
+            dz_hl[b] = last_dz_hl;
+            dz_hh[b] = last_dz_hh;
+        }
+    }
+
+    static const int qb_lut[17] = {0,4,4,4,4,3,2,1,4,4,4,4,3,2,1,4,4};
+    quantized += (w+2) + 1;
+    float step_lh[LUT_SZ], step_hl[LUT_SZ], step_hh[LUT_SZ];
+    float dz_v_lh[LUT_SZ], dz_v_hl[LUT_SZ], dz_v_hh[LUT_SZ];
     for (int k = 1; k < LUT_SZ; k++) {
-        float s = base * lb[k - 1];
         int qb = qb_lut[k];
-        s = fmaxf(s, min_step[qb]);   // branchless SSE maxss
-        step_k[k] = s;
-        dz_k[k]  = s * dz_lb[k - 1];
+        step_lh[k] = fmaxf(base * lb_lh[k - 1], min_step[qb]);
+        step_hl[k] = fmaxf(base * lb_hl[k - 1], min_step[qb]);
+        step_hh[k] = fmaxf(base * lb_hh[k - 1], min_step[qb]);
+        dz_v_lh[k] = step_lh[k] * dz_lh[k - 1];
+        dz_v_hl[k] = step_hl[k] * dz_hl[k - 1];
+        dz_v_hh[k] = step_hh[k] * dz_hh[k - 1];
     }
+    /* DC: qt[0][MAX_BANDS*2] extra element; uses min_step[4]=qb_lut[1] like band 0 */
+    float dc_mult = qt[0][MAX_BANDS*2];
+    if (dc_mult > 1.0f) dc_mult = 1.0f + (dc_mult - 1.0f) * lerp_t;
+    float dc_step = fmaxf(base * dc_mult, min_step[4]);
+    float dc_dz = dc_step * dz_lh[0];
 
+    int eff_max = levels + 1; if (eff_max > LUT_SZ) eff_max = LUT_SZ;
     for (int y = 0; y < h; y++) {
-        int k_y = MAX_BANDS;
-        for (int k = 1; k < MAX_BANDS; k++) { if (y < lh[k]) { k_y = k; break; } }
+        int k_y = eff_max;
+        for (int k = 1; k < eff_max; k++) { if (y < lh[k]) { k_y = k; break; } }
 
-        /* Segment the row by subband boundary lw[k]: within [x, seg_end) the band   */
-        /* index k = max(k_x, k_y) is constant, so step/deadzone are loop-invariant. */
-        /* get_quant_mult(x,y) picks the first k with x<lw[k] && y<lh[k] = max(k_x,  */
-        /* k_y) since lw/lh are monotone. NOTE: do NOT shortcut k_x via floor(log2   */
-        /* x)+1 even for power-of-two widths -- lw[k] != 2^k when width and height   */
-        /* decompose into a different number of levels (non-square images pad the    */
-        /* coarse end of lw), which silently corrupts quantization. */
         int x = 0, k_x = 1;
-        while (k_x < MAX_BANDS && lw[k_x] <= 0) k_x++;
+        while (k_x < eff_max && lw[k_x] <= 0) k_x++;
         while (x < w) {
-            int seg_end = (k_x < MAX_BANDS) ? lw[k_x] : w;
+            int seg_end = (k_x < eff_max) ? lw[k_x] : w;
             if (seg_end > w) seg_end = w;
             int k = k_x > k_y ? k_x : k_y;
-            float step = step_k[k], dz = dz_k[k];
-            for (; x < seg_end; x++, i++) {
-                float val = wavelet[i];
-                if (fabsf(val) < dz) { quantized[i] = 0; }
-                else {
+            float step, dz;
+            /* Band 0 (k==1, k_x==k_y): split at lw[0] for DC/LH vs HL/HH */
+            if (k == 1 && k_x == k_y && lw[0] < seg_end) {
+                /* [0, lw[0]): DC (y<lh[0]) or LH (y>=lh[0]) */
+                float s0 = (y < lh[0]) ? dc_step : step_lh[1];
+                float d0 = (y < lh[0]) ? dc_dz   : dz_v_lh[1];
+                for (; x < lw[0]; x++, quantized++, wavelet++) {
+                    float val = *wavelet;
+                    if (WTPC_UNLIKELY(fabsf(val) >= d0)) {
+                        float v = val / s0;
+                        int vi = (int)(v + copysignf(0.5f, v));
+                        if (WTPC_UNLIKELY(vi >  32767)) vi =  32767;
+                        if (WTPC_UNLIKELY(vi < -32768)) vi = -32768;
+                        *quantized = (int16_t)vi;
+                    } else *quantized = 0;
+                }
+                /* [lw[0], lw[1]): HL (y<lh[0]) or HH (y>=lh[0]) */
+                step = (y < lh[0]) ? step_hl[1] : step_hh[1];
+                dz   = (y < lh[0]) ? dz_v_hl[1] : dz_v_hh[1];
+            } else {
+                if (k_x < k_y)       { step = step_lh[k]; dz = dz_v_lh[k]; }
+                else if (k_x > k_y)  { step = step_hl[k]; dz = dz_v_hl[k]; }
+                else /* k_x==k_y */  {
+                    if (k == 1 && y < lh[0] && x < lw[0])
+                        { step = dc_step; dz = dc_dz; }
+                    else if (k == 1 && y >= lh[0] && x < lw[0])
+                        { step = step_lh[k]; dz = dz_v_lh[k]; }
+                    else
+                        { step = step_hh[k]; dz = dz_v_hh[k]; }
+                }
+            }
+            for (; x < seg_end; x++, quantized++, wavelet++) {
+                float val = *wavelet;
+                if (WTPC_UNLIKELY(fabsf(val) >= dz)) {
                     float v = val / step;
                     int vi = (int)(v + copysignf(0.5f, v));
                     /* branchless saturate: compiler emits cmov */
-                    if (vi >  32767) vi =  32767;
-                    if (vi < -32768) vi = -32768;
-                    quantized[i] = (int16_t)vi;
-                }
+                    if (WTPC_UNLIKELY(vi >  32767)) vi =  32767;
+                    if (WTPC_UNLIKELY(vi < -32768)) vi = -32768;
+                    *quantized = (int16_t)vi;
+                } else *quantized = 0;
             }
-            if (k_x < MAX_BANDS) k_x++; else break;  /* seg_end==w reached end of row */
+            if (k_x < eff_max) k_x++; else break;
         }
+        quantized += 2;
     }
-    #undef LUT_SZ
 }
 
-static void dequantize_channel(const int16_t * WTPC_RESTRICT quantized, float * WTPC_RESTRICT f_out, int w, int h, float base, const float * WTPC_RESTRICT bands_mult) {
-    int lw[17], lh[17];
-    compute_ll_sizes(w, h, lw, lh);
+static void dequantize_channel(const int16_t * WTPC_RESTRICT quantized, float * WTPC_RESTRICT f_out, int w, int h, float base, const float *const qt[3]) {
+    int lw[LUT_SZ], lh[LUT_SZ];
+    int levels = compute_ll_sizes(w, h, lw, lh);
     float min_step[5];
     compute_safe_steps(min_step, w, h);
-    #define LUT_SZ 17
-    float lb[LUT_SZ];
-    for (int b = 0; b < MAX_BANDS; b++) lb[b] = bands_mult[b];
-    for (int b = MAX_BANDS; b < LUT_SZ; b++) lb[b] = bands_mult[MAX_BANDS-1];
-    static const int qb_lut[17] = {0,4,4,4,4,3,2,1,0,0,0,0,0,0,0,0,0};
-    int i = 0;
-    /* Precompute per-band step (k=1..LUT_SZ-1): saves 1 mul+1 LUT+1 clamp per pixel */
-    float step_k[LUT_SZ];
-    for (int k = 1; k < LUT_SZ; k++) {
-        float s = base * lb[k - 1];
-        int qb = qb_lut[k];
-        step_k[k] = fmaxf(s, min_step[qb]);
+    float lb_lh[LUT_SZ] = {0}, lb_hl[LUT_SZ] = {0}, lb_hh[LUT_SZ] = {0};
+
+    const float *m_lh = qt[0], *m_hl = qt[1], *m_hh = qt[2];
+    for (int b = 0; b < MAX_BANDS; b++) {
+        lb_lh[b] = m_lh[b]; lb_hl[b] = m_hl[b]; lb_hh[b] = m_hh[b];
     }
 
-    for (int y = 0; y < h; y++) {
-        int k_y = MAX_BANDS;
-        for (int k = 1; k < MAX_BANDS; k++) { if (y < lh[k]) { k_y = k; break; } }
+    /* Q-dependent lerp: cap large multipliers ->1.0.
+       Applied BEFORE EXT band generation so EXT inherits lerped values. */
+    float lerp_t;
+    if (base <= EXT_BASE_Q1) lerp_t = 0.0f;
+    else if (base >= WTPC_EXT_BASE_THRESH) lerp_t = 1.0f;
+    else lerp_t = (base - EXT_BASE_Q1) / (WTPC_EXT_BASE_THRESH - EXT_BASE_Q1);
+    for (int b = 0; b < MAX_BANDS; b++) {
+        if (lb_lh[b] > 1.0f) lb_lh[b] = 1.0f + (lb_lh[b] - 1.0f) * lerp_t;
+        if (lb_hl[b] > 1.0f) lb_hl[b] = 1.0f + (lb_hl[b] - 1.0f) * lerp_t;
+        if (lb_hh[b] > 1.0f) lb_hh[b] = 1.0f + (lb_hh[b] - 1.0f) * lerp_t;
+    }
 
-        /* Same segmented row walk as quantize_coeffs (must match exactly). */
+    /* Bands beyond MAX_BANDS: generate from LERPED band MAX_BANDS-1 values. */
+    if (levels > MAX_BANDS) {
+        float fl = lb_lh[MAX_BANDS - 1], fhl = lb_hl[MAX_BANDS - 1], fhh = lb_hh[MAX_BANDS - 1];
+        float mult_lh = ext_mult_from_base(base, qt[0][MAX_BANDS*2+1]);
+        float mult_hh = ext_mult_from_base(base, qt[0][MAX_BANDS*2+2]);
+        for (int b = MAX_BANDS; b < LUT_SZ; b++) {
+            fl  *= mult_lh; lb_lh[b] = fl;
+            fhl *= mult_lh; lb_hl[b] = fhl;
+            fhh *= mult_hh; lb_hh[b] = fhh;
+        }
+    }
+
+    static const int qb_lut[17] = {0,4,4,4,4,3,2,1,4,4,4,4,3,2,1,4,4};
+    quantized += (w+2) + 1;
+    float step_lh[LUT_SZ], step_hl[LUT_SZ], step_hh[LUT_SZ];
+    for (int k = 1; k < LUT_SZ; k++) {
+        int qb = qb_lut[k];
+        step_lh[k] = fmaxf(base * lb_lh[k - 1], min_step[qb]);
+        step_hl[k] = fmaxf(base * lb_hl[k - 1], min_step[qb]);
+        step_hh[k] = fmaxf(base * lb_hh[k - 1], min_step[qb]);
+    }
+    /* DC */
+    float dc_mult = qt[0][MAX_BANDS*2];
+    if (dc_mult > 1.0f) dc_mult = 1.0f + (dc_mult - 1.0f) * lerp_t;
+    float dc_step = fmaxf(base * dc_mult, min_step[4]);
+
+    int eff_max = levels + 1; if (eff_max > LUT_SZ) eff_max = LUT_SZ;
+    for (int y = 0; y < h; y++) {
+        int k_y = eff_max;
+        for (int k = 1; k < eff_max; k++) { if (y < lh[k]) { k_y = k; break; } }
+
         int x = 0, k_x = 1;
-        while (k_x < MAX_BANDS && lw[k_x] <= 0) k_x++;
+        while (k_x < eff_max && lw[k_x] <= 0) k_x++;
         while (x < w) {
-            int seg_end = (k_x < MAX_BANDS) ? lw[k_x] : w;
+            int seg_end = (k_x < eff_max) ? lw[k_x] : w;
             if (seg_end > w) seg_end = w;
             int k = k_x > k_y ? k_x : k_y;
-            float step = step_k[k];
-            for (; x < seg_end; x++, i++)
-                f_out[i] = (float)(quantized[i] * step);
-            if (k_x < MAX_BANDS) k_x++; else break;
+            float step;
+            /* Band 0 (k==1, k_x==k_y): split at lw[0] for DC/LH vs HL/HH */
+            if (k == 1 && k_x == k_y && lw[0] < seg_end) {
+                /* [0, lw[0]): DC (y<lh[0]) or LH (y>=lh[0]) */
+                float s0 = (y < lh[0]) ? dc_step : step_lh[1];
+                for (; x < lw[0]; x++, quantized++, f_out++)
+                    *f_out = (float)(*quantized * s0);
+                /* [lw[0], lw[1]): HL (y<lh[0]) or HH (y>=lh[0]) */
+                step = (y < lh[0]) ? step_hl[1] : step_hh[1];
+            } else {
+                if (k_x < k_y)       { step = step_lh[k]; }
+                else if (k_x > k_y)  { step = step_hl[k]; }
+                else /* k_x==k_y */  {
+                    if (k == 1 && y < lh[0] && x < lw[0])
+                        { step = dc_step; }
+                    else if (k == 1 && y >= lh[0] && x < lw[0])
+                        { step = step_lh[k]; }
+                    else
+                        { step = step_hh[k]; }
+                }
+            }
+            for (; x < seg_end; x++, quantized++, f_out++)
+                *f_out = (float)(*quantized * step);
+            if (k_x < eff_max) k_x++; else break;
         }
+        quantized += 2;
     }
     #undef LUT_SZ
 }
@@ -2426,37 +2615,43 @@ static int huffman_decode_symbol(Bitstream *bs, uint8_t *table) {
 #define NUM_HUFF_SYMBOLS 16
 #define EOB_SYMBOL 15
 
-static void count_frequencies(const int16_t *d, size_t sz, int *freq) {
+static void count_frequencies(const int16_t *d, int w, int h, int *freq) {
     memset(freq, 0, NUM_HUFF_SYMBOLS * sizeof(int));
-    for (size_t i = 0; i < sz; i++) {
-        if (d[i] == 0) continue;
-        int cat = category_of(d[i]);
-        if (cat < NUM_HUFF_SYMBOLS-1) freq[cat]++;
+    int pw = w + 2;
+    size_t i = pw + 1;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++, i++) {
+            int16_t v = d[i];
+            if (v == 0) continue;
+            int cat = category_of(v);
+            if (cat < NUM_HUFF_SYMBOLS-1) freq[cat]++;
+        }
+        i += 2;
     }
     freq[EOB_SYMBOL] = 1;
 }
 
-/* Subband 2x2 block iterator: visits coefficients in (x0,y0)-(x1,y1) region
-   in 2x2 block order. BODY must NOT use `continue` (use if/else instead). */
-#define SB2X2_LOOP(x0,y0,x1,y1,BODY) do { \
+/* Subband 2x2 block iterator with configurable stride/offset (padded or linear).
+   _ws = stride (w for linear, w+2 for padded), _wo = offset (0 for linear, 1 for padded). */
+#define SB2X2_LOOP(x0,y0,x1,y1,_ws,_wo,BODY) do { \
     int _sw=(x1)-(x0), _sh=(y1)-(y0); \
-    for (int _by=0; _by<(_sh+1)/2; _by++) for (int _bx=0; _bx<(_sw+1)/2; _bx++) { \
-        int _r0=((y0)+_by*2)*w+(x0)+_bx*2; \
-        BODY(_r0); if (_bx*2+1<_sw) BODY(_r0+1); \
-        if (_by*2+1<_sh) { int _r1=_r0+w; BODY(_r1); if (_bx*2+1<_sw) BODY(_r1+1); } \
+    for (int _by=0; _by<(_sh+1)/2; _by++) { \
+        size_t _row_base=(size_t)((y0)+_by*2+_wo)*(_ws); \
+        for (int _bx=0; _bx<(_sw+1)/2; _bx++) { \
+            size_t _r0=_row_base+((x0)+_bx*2+_wo); \
+            BODY(_r0); if (_bx*2+1<_sw) BODY(_r0+1); \
+            if (_by*2+1<_sh) { size_t _r1=_r0+(_ws); BODY(_r1); if (_bx*2+1<_sw) BODY(_r1+1); } \
+        } \
     } \
 } while(0)
 
-/* Visit every subband in 2x2-block order: LL first, then HL/LH/HH per level.
-   SB(idx) is applied to each coefficient; lw/lh/levels come from
-   compute_ll_sizes(w, h, lw, lh). Centralizes the band walk shared by the
-   huffman encode/decode/count functions. */
-#define SB_ALL_BANDS(lw,lh,levels,SB) do { \
-    SB2X2_LOOP(0,0,lw[0],lh[0],SB); \
+/* Visit every subband in 2x2-block order. _ws/_wo as in SB2X2_LOOP. */
+#define SB_ALL_BANDS(lw,lh,levels,SB,_ws,_wo) do { \
+    SB2X2_LOOP(0,0,lw[0],lh[0],_ws,_wo,SB); \
     for (int _k = 0; _k < (levels); _k++) { \
-        if (lw[_k] > 0 && lh[_k+1] > lh[_k]) SB2X2_LOOP(0,lh[_k],lw[_k],lh[_k+1],SB); \
-        if (lw[_k+1] > lw[_k] && lh[_k] > 0) SB2X2_LOOP(lw[_k],0,lw[_k+1],lh[_k],SB); \
-        if (lw[_k+1] > lw[_k] && lh[_k+1] > lh[_k]) SB2X2_LOOP(lw[_k],lh[_k],lw[_k+1],lh[_k+1],SB); \
+        if (lw[_k] > 0 && lh[_k+1] > lh[_k]) SB2X2_LOOP(0,lh[_k],lw[_k],lh[_k+1],_ws,_wo,SB); \
+        if (lw[_k+1] > lw[_k] && lh[_k] > 0) SB2X2_LOOP(lw[_k],0,lw[_k+1],lh[_k],_ws,_wo,SB); \
+        if (lw[_k+1] > lw[_k] && lh[_k+1] > lh[_k]) SB2X2_LOOP(lw[_k],lh[_k],lw[_k+1],lh[_k+1],_ws,_wo,SB); \
     } \
 } while(0)
 
@@ -2475,7 +2670,7 @@ static void huffman_encode_runval(Bitstream *bs, const int16_t *d, int w, int h,
             run = 0; \
         } \
     } while(0)
-    SB_ALL_BANDS(lw, lh, levels, SB);
+    SB_ALL_BANDS(lw, lh, levels, SB, w+2, 1);
     #undef SB
     if (run > 0) put_bits(bs, hc[EOB_SYMBOL], cl[EOB_SYMBOL]);
 }
@@ -2498,11 +2693,12 @@ static void huffman_decode_channel(Bitstream *bs, int16_t *o, int w, int h, int 
             else { uint32_t bits = get_bits(bs, sym); o[idx] = (int16_t)decode_category_bits(bits, sym); } \
         } \
     } while(0)
-    SB_ALL_BANDS(lw, lh, levels, SB);
+    SB_ALL_BANDS(lw, lh, levels, SB, w+2, 1);
     #undef SB
 }
 
-/* Context-aware Huffman: subband + 2x2 block scan. */
+/* Context-aware Huffman: subband + 2x2 block scan.
+   Tables: t0 for last_cat<=2, t1 for last_cat>2. */
 static void huffman_encode_ctx(Bitstream *bs, const int16_t *d, int w, int h, uint32_t *hc0, int *cl0, uint32_t *hc1, int *cl1) {
     int run = 0, last_cat = 0;
     int lw[17], lh[17];
@@ -2518,7 +2714,7 @@ static void huffman_encode_ctx(Bitstream *bs, const int16_t *d, int w, int h, ui
             run = 0; last_cat = cat; \
         } \
     } while(0)
-    SB_ALL_BANDS(lw, lh, levels, SB);
+    SB_ALL_BANDS(lw, lh, levels, SB, w+2, 1);
     #undef SB
     if (run > 0) {
         uint32_t *hc = (last_cat <= 2) ? hc0 : hc1;
@@ -2527,17 +2723,23 @@ static void huffman_encode_ctx(Bitstream *bs, const int16_t *d, int w, int h, ui
     }
 }
 
-static void count_frequencies_ctx(const int16_t *d, size_t sz, int *freq0, int *freq1) {
+static void count_frequencies_ctx(const int16_t *d, int w, int h, int *freq0, int *freq1) {
     memset(freq0, 0, NUM_HUFF_SYMBOLS * sizeof(int));
     memset(freq1, 0, NUM_HUFF_SYMBOLS * sizeof(int));
     int last_cat = 0;
-    for (size_t i = 0; i < sz; i++) {
-        if (d[i] == 0) continue;
-        int cat = category_of(d[i]);
-        if (cat < NUM_HUFF_SYMBOLS-1) {
-            if (last_cat <= 2) freq0[cat]++; else freq1[cat]++;
+    int pw = w + 2;
+    size_t i = pw + 1;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++, i++) {
+            int16_t v = d[i];
+            if (v == 0) continue;
+            int cat = category_of(v);
+            if (cat < NUM_HUFF_SYMBOLS-1) {
+                if (last_cat <= 2) freq0[cat]++; else freq1[cat]++;
+            }
+            last_cat = cat;
         }
-        last_cat = cat;
+        i += 2;
     }
     freq0[EOB_SYMBOL] = 1; freq1[EOB_SYMBOL] = 1;
 }
@@ -2560,7 +2762,7 @@ static void count_freq_ctx(const int16_t *d, int w, int h, int *freq0, int *freq
             run = 0; last_cat = cat; \
         } \
     } while(0)
-    SB_ALL_BANDS(lw, lh, levels, SB);
+    SB_ALL_BANDS(lw, lh, levels, SB, w+2, 1);
     #undef SB
     freq0[EOB_SYMBOL] = 0; freq1[EOB_SYMBOL] = 0;
     if (run > 0) {
@@ -2591,10 +2793,10 @@ static int measure_encode_bits_ctx(int *freq0, int *freq1, int *cl0, int *cl1) {
 
 /* Single-table (huf_extra_ctx=0): all coefficients */
 static const uint8_t def_tables_single[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5}},
- {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
- {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7}},
- {{0,1,2,3,4,5,6,7,8,9,10,11,0,0,0,11},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8},{0,1,2,3,4,5,6,7,8,10,11,11,0,0,0,9}},
+ {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5}},
+ {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,8,0,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,8,0,0,0,0,0,0,6}},
+ {{0,1,2,3,4,5,6,7,8,9,10,0,0,0,0,10},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7}},
+ {{0,1,2,3,4,5,6,7,8,9,10,12,12,0,0,11},{0,1,2,3,4,5,6,7,8,10,11,11,0,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,11,0,0,0,9}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10}},
  {{0,2,2,2,3,4,5,6,7,8,9,11,12,12,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10}},
  {{0,2,2,2,3,4,5,6,7,8,9,11,12,12,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10}}
@@ -2602,10 +2804,10 @@ static const uint8_t def_tables_single[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
 
 /* t0 tables (prev-cat <= 2) */
 static const uint8_t def_tables_t0[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,8,8,0,0,0,0,0,0,5}},
- {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
- {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,7,8,9,10,10,0,0,0,0,6},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7}},
- {{0,1,2,3,4,5,6,7,8,9,11,11,0,0,0,10},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8}},
+ {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5}},
+ {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,8,0,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,8,0,0,0,0,0,0,6}},
+ {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7}},
+ {{0,1,2,3,4,5,6,7,8,9,11,12,12,0,0,10},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9}},
  {{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,13,13,0,9}}
@@ -2613,21 +2815,21 @@ static const uint8_t def_tables_t0[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
 
 /* t1 tables (prev-cat > 2) */
 static const uint8_t def_tables_t1[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
- {{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,4,5,5,0,0,0,0,0,0,0,0,3},{0,2,2,2,3,5,5,0,0,0,0,0,0,0,0,4}},
+ {{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,4,5,5,0,0,0,0,0,0,0,0,3},{0,2,2,2,4,5,5,0,0,0,0,0,0,0,0,3}},
  {{0,2,2,2,3,4,5,6,8,8,0,0,0,0,0,7},{0,2,2,2,3,4,6,6,0,0,0,0,0,0,0,5},{0,2,2,2,3,4,6,6,0,0,0,0,0,0,0,5}},
- {{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6}},
- {{0,3,2,2,3,3,4,5,6,7,8,9,0,0,0,9},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,3,2,2,3,3,4,5,6,8,9,9,0,0,0,7}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,3,2,2,3,3,4,5,6,7,9,9,0,0,0,8}},
- {{0,3,3,2,2,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8},{0,2,2,2,3,4,5,6,7,8,10,10,0,0,0,9}}
+ {{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,3,4,5,7,8,8,0,0,0,0,0,6}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,3,2,2,3,3,4,5,6,8,9,9,0,0,0,7},{0,3,2,2,3,3,4,5,6,7,9,9,0,0,0,8}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,3,2,2,3,3,4,5,6,8,9,9,0,0,0,7},{0,3,2,2,3,3,4,5,6,7,9,9,0,0,0,8}},
+ {{0,3,3,2,2,3,4,5,6,7,8,10,10,0,0,9},{0,3,2,2,2,4,5,6,7,9,10,10,0,0,0,8},{0,2,2,2,3,4,5,6,7,8,10,10,0,0,0,9}}
 };
 
 /* 4:2:0 single-table (huf_extra_ctx=0): all coefficients */
 static const uint8_t def_tables_single_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
  {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5}},
- {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
- {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7}},
- {{0,1,2,3,4,5,6,7,8,9,10,11,0,0,0,11},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8}},
+ {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,8,0,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,8,0,0,0,0,0,0,6}},
+ {{0,1,2,3,4,5,6,7,8,9,10,0,0,0,0,10},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7}},
+ {{0,1,2,3,4,5,6,7,8,9,10,12,12,0,0,11},{0,1,2,3,4,5,6,7,8,10,11,11,0,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,11,0,0,0,9}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9}},
  {{0,2,2,2,3,4,5,6,7,8,9,11,12,12,0,10},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9}},
  {{0,2,2,2,3,4,5,6,7,8,9,11,12,12,0,10},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9},{0,1,2,3,4,5,6,7,8,10,11,12,12,0,0,9}}
@@ -2636,9 +2838,9 @@ static const uint8_t def_tables_single_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] 
 /* 4:2:0 t0 tables (prev-cat <= 2) */
 static const uint8_t def_tables_t0_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
  {{0,1,2,3,4,5,6,8,8,0,0,0,0,0,0,7},{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5},{0,1,2,3,4,6,7,7,0,0,0,0,0,0,0,5}},
- {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,9,0,0,0,0,0,6}},
- {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,7,8,9,10,10,0,0,0,0,6},{0,1,2,3,4,5,7,8,9,10,10,0,0,0,0,6}},
- {{0,1,2,3,4,5,6,7,8,9,11,11,0,0,0,10},{0,1,2,3,4,5,6,8,9,10,11,11,0,0,0,7},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8}},
+ {{0,1,2,3,4,5,6,7,9,9,0,0,0,0,0,8},{0,1,2,3,4,5,7,8,8,0,0,0,0,0,0,6},{0,1,2,3,4,5,7,8,8,0,0,0,0,0,0,6}},
+ {{0,1,2,3,4,5,6,7,8,10,10,0,0,0,0,9},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7},{0,1,2,3,4,5,6,8,9,10,10,0,0,0,0,7}},
+ {{0,1,2,3,4,5,6,7,8,9,11,12,12,0,0,10},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,11,0,0,0,8}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8}},
  {{0,1,2,3,4,5,6,7,8,9,10,12,13,13,0,11},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8}},
  {{0,1,2,3,4,5,6,7,8,9,11,12,13,13,0,10},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8},{0,1,2,3,4,5,6,7,9,10,11,12,12,0,0,8}}
@@ -2649,21 +2851,26 @@ static const uint8_t def_tables_t1_420[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS] = {
  {{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,4,5,5,0,0,0,0,0,0,0,0,3},{0,2,2,2,3,5,5,0,0,0,0,0,0,0,0,4}},
  {{0,2,2,2,3,4,5,6,8,8,0,0,0,0,0,7},{0,2,2,2,3,4,6,6,0,0,0,0,0,0,0,5},{0,2,2,2,3,4,6,6,0,0,0,0,0,0,0,5}},
  {{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6},{0,2,2,2,3,4,5,7,7,0,0,0,0,0,0,6}},
- {{0,3,2,2,3,3,4,5,6,7,8,9,0,0,0,9},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7}},
- {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7},{0,2,2,2,3,4,5,6,8,9,9,0,0,0,0,7}},
+ {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,3,2,2,3,3,4,5,6,8,8,0,0,0,0,7},{0,3,2,2,3,3,4,5,6,8,9,9,0,0,0,7}},
  {{0,3,2,2,3,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}},
  {{0,3,3,2,2,3,4,5,6,7,8,10,10,0,0,9},{0,2,2,2,3,4,5,6,7,9,9,0,0,0,0,8},{0,2,2,2,3,4,5,6,7,9,10,10,0,0,0,8}}
 };
 
-/* One-pass scan: count frequencies. */
-static void count_freq(const int16_t *d, size_t sz, int *freq) {
+/* One-pass scan: count frequencies (padded input). */
+static void count_freq(const int16_t *d, int w, int h, int *freq) {
     memset(freq, 0, NUM_HUFF_SYMBOLS * sizeof(int));
     int run = 0;
-    for (size_t i = 0; i < sz; i++) {
-        if (d[i] == 0) { run++; continue; }
-        int cat = category_of(d[i]);
-        if (cat < NUM_HUFF_SYMBOLS-1) freq[cat]++;
-        run = 0;
+    int pw = w + 2;
+    size_t i = pw + 1;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++, i++) {
+            if (d[i] == 0) { run++; continue; }
+            int cat = category_of(d[i]);
+            if (cat < NUM_HUFF_SYMBOLS-1) freq[cat]++;
+            run = 0;
+        }
+        i += 2;
     }
     freq[EOB_SYMBOL] = (run > 0) ? 1 : 0;
 }
@@ -2832,7 +3039,7 @@ static void huffman_decode_ctx(Bitstream *bs, int16_t *o, int w, int h, int *cl0
             else { uint32_t bits = get_bits(bs, sym); o[idx] = (int16_t)decode_category_bits(bits, sym); last_cat = sym; } \
         } \
     } while(0)
-    SB_ALL_BANDS(lw, lh, levels, SB);
+    SB_ALL_BANDS(lw, lh, levels, SB, w+2, 1);
     #undef SB
 }
 
@@ -2896,308 +3103,308 @@ static const int TRAIN_Q[N_TRAIN_Q] = {1024,900,780,560,360,138,1};
 
 /* Q=1024 */
 static const uint8_t priors_sig_q1024[CTX_SIG][2] = {
-    {10,1},{12,1},{14,5},{13,9},{15,13},{26,27},{45,45},{1,155},{1,185},
-    {12,2},{12,3},{13,6},{12,9},{13,13},{20,26},{31,43},{83,24},{99,20},
-    {18,7},{18,6},{15,11},{12,14},{13,17},{24,24},{29,42},{7,89},{1,1},
-    {4,1},{13,1},{29,18},{29,34},{11,80},{1,1},{1,1},{1,1},{1,1},
-    {8,1},{15,2},{28,21},{15,37},{21,70},{1,1},{1,1},{1,1},{1,1},
-    {15,3},{21,7},{26,31},{12,44},{12,74},{1,1},{1,1},{1,1},{1,1},
-    {11,32},{57,11},{59,26},{123,1},{155,1},{1,1},{1,1},{1,1},{1,1},
-    {18,43},{21,48},{75,21},{42,62},{123,1},{1,1},{1,1},{1,1},{1,1},
-    {66,65},{94,47},{66,65},{1,185},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {16,18},{41,24},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {35,27},{140,1},{1,1},{1,185},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {66,65},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{11,2},{14,3},{17,8},{22,18},{24,28},{26,55},{1,185},{1,1},
-    {1,1},{11,4},{13,5},{15,9},{20,17},{22,24},{27,45},{49,65},{1,1},
-    {1,1},{14,9},{14,10},{16,14},{18,22},{17,27},{16,50},{56,33},{1,1},
-    {1,1},{22,21},{19,27},{29,50},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{28,19},{28,22},{62,25},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{27,32},{32,29},{73,31},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{40,21},{41,55},{185,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{23,31},{25,65},{66,65},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{140,1},{185,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {11,1},{13,1},{15,5},{14,10},{17,13},{23,27},{25,53},{38,69},{83,55},
+    {13,2},{14,2},{14,6},{13,10},{14,13},{23,21},{32,36},{54,48},{46,77},
+    {19,6},{18,6},{15,11},{13,13},{14,15},{22,23},{31,33},{28,55},{1,1},
+    {4,1},{14,1},{28,21},{24,37},{35,53},{1,1},{1,1},{1,1},{1,1},
+    {8,1},{16,2},{31,20},{24,27},{41,41},{1,1},{1,1},{1,1},{1,1},
+    {15,3},{21,7},{29,26},{25,27},{34,44},{1,1},{1,1},{1,1},{1,1},
+    {27,9},{53,5},{60,21},{126,1},{156,1},{1,1},{1,1},{1,1},{1,1},
+    {37,15},{43,11},{83,13},{56,49},{92,31},{1,1},{1,1},{1,1},{1,1},
+    {88,44},{110,28},{110,36},{1,206},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {20,2},{45,11},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {37,3},{113,1},{1,1},{1,206},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {76,31},{173,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{12,2},{14,4},{18,8},{24,17},{28,23},{29,44},{52,105},{1,1},
+    {1,1},{12,4},{14,5},{16,9},{20,16},{22,23},{27,38},{39,61},{1,1},
+    {1,1},{14,9},{15,10},{16,14},{18,21},{18,26},{27,34},{38,47},{1,1},
+    {1,1},{26,18},{24,21},{43,32},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{30,19},{30,21},{55,27},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{31,27},{32,27},{56,49},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{40,10},{68,20},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{35,15},{57,13},{88,44},{1,206},{1,206},{1,1},{1,1},{1,1},
+    {1,1},{137,1},{73,73},{1,206},{1,1},{1,1},{1,1},{1,1},{1,1},
     {1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{1,173},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
     {1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{11,3},{13,4},{18,5},{24,19},{32,25},{43,40},{59,48},{1,1},
-    {1,1},{12,4},{13,5},{16,7},{19,20},{26,25},{24,42},{62,42},{1,1},
-    {1,1},{16,8},{15,9},{17,12},{19,23},{23,30},{41,29},{66,65},{1,1},
-    {1,1},{20,5},{21,7},{27,27},{34,62},{1,185},{1,1},{1,1},{1,1},
-    {1,1},{16,9},{16,11},{19,28},{22,48},{1,123},{1,1},{1,1},{1,1},
-    {1,1},{18,17},{14,18},{15,35},{28,44},{21,83},{1,1},{1,1},{1,1},
-    {1,1},{37,14},{67,33},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{48,21},{37,36},{66,65},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{78,78},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{80,10},{74,50},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{15,56},{15,83},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{1,185},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
+    {1,1},{12,3},{14,4},{19,5},{24,17},{27,29},{43,37},{50,59},{1,1},
+    {1,1},{13,4},{14,5},{17,7},{21,19},{25,24},{33,31},{21,68},{1,1},
+    {1,1},{16,8},{15,9},{18,11},{19,22},{23,26},{28,35},{39,57},{1,1},
+    {1,1},{21,5},{22,7},{29,26},{43,42},{105,52},{1,1},{1,1},{1,1},
+    {1,1},{18,7},{18,9},{25,21},{35,29},{47,52},{1,1},{1,1},{1,1},
+    {1,1},{21,14},{18,14},{20,27},{30,33},{41,54},{1,1},{1,1},{1,1},
+    {1,1},{40,11},{78,17},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{45,24},{43,38},{83,55},{1,1},{1,206},{1,1},{1,1},{1,1},
+    {1,1},{1,206},{1,1},{206,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{61,13},{80,40},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{36,17},{51,26},{1,206},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{92,31},{105,52},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
 };
 static const uint8_t priors_sgn_q1024[CTX_SGN][2] = {
-    {9,7},{6,6},{5,5},{5,7},{8,8},{56,17},{35,8},{16,12},{16,26},{16,51},{29,40},{29,17},{10,17},{12,29},{10,55}
+    {8,7},{6,6},{5,5},{5,7},{8,8},{49,18},{33,9},{16,12},{16,25},{13,54},{35,33},{28,16},{11,16},{12,29},{8,59}
 };
 static const uint8_t priors_ref_q1024[CTX_REF][2] = {
-    {12,2},{10,2},{10,2},{11,2},{12,3},{16,4},{18,8},{42,2},{25,5},{21,5},{23,4},{22,9},{29,9},{37,9}
+    {13,2},{10,2},{10,2},{10,2},{11,3},{14,4},{17,6},{33,6},{24,4},{19,5},{20,5},{21,7},{24,8},{30,6}
 };
 static const uint8_t priors_bp_q1024[CTX_BP][2] = {
-    {15,1},{15,1},{15,1},{11,5},{12,4},{13,3}
+    {15,1},{15,1},{15,1},{11,5},{12,4},{14,2}
 };
 static const uint8_t priors_dc_q1024[CTX_DC][2] = {
-    {14,1},{14,1},{9,6},{3,12},{7,8},{4,11},{8,11},{1,21},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
+    {14,1},{14,1},{10,5},{2,13},{8,7},{3,12},{10,10},{1,22},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
 };
 
 /* Q=900 */
 static const uint8_t priors_sig_q900[CTX_SIG][2] = {
-    {11,1},{14,1},{15,5},{13,10},{14,13},{18,22},{23,33},{24,46},{31,62},
-    {13,2},{14,2},{14,6},{12,10},{13,12},{16,19},{21,28},{23,38},{28,46},
-    {16,5},{15,5},{13,9},{10,11},{10,13},{13,18},{16,24},{17,30},{18,38},
-    {3,1},{15,1},{33,17},{25,36},{32,53},{1,1},{1,1},{1,1},{1,1},
-    {7,1},{16,2},{31,17},{23,33},{29,46},{1,1},{1,1},{1,1},{1,1},
-    {13,2},{18,5},{27,22},{19,27},{20,42},{1,1},{1,1},{1,1},{1,1},
-    {20,10},{31,7},{31,18},{32,28},{48,34},{110,74},{1,255},{1,1},{1,1},
-    {26,12},{30,12},{31,20},{31,27},{35,36},{68,61},{70,139},{1,255},{1,1},
-    {40,21},{43,20},{31,34},{29,38},{38,40},{52,72},{62,102},{1,1},{1,1},
-    {17,3},{29,12},{45,89},{31,124},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {24,6},{42,10},{39,81},{14,89},{1,168},{1,1},{1,1},{1,1},{1,1},
-    {33,14},{51,23},{31,98},{7,99},{29,147},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{13,2},{15,3},{18,7},{18,17},{18,24},{24,31},{38,48},{1,1},
-    {1,1},{12,4},{14,5},{15,9},{17,15},{16,21},{20,28},{28,41},{1,1},
-    {1,1},{13,7},{13,8},{13,11},{14,15},{13,19},{15,24},{21,33},{1,1},
-    {1,1},{28,14},{28,17},{45,25},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{27,17},{29,16},{48,17},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{29,21},{28,19},{42,23},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{26,10},{33,14},{47,25},{56,53},{97,72},{146,49},{1,255},{1,1},
-    {1,1},{24,14},{30,18},{36,26},{38,52},{39,81},{98,97},{116,115},{1,1},
-    {1,1},{31,25},{31,32},{40,35},{48,49},{26,77},{78,52},{1,194},{1,1},
-    {1,1},{63,33},{28,68},{1,183},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{56,66},{69,63},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{29,147},{123,41},{139,70},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{13,3},{14,4},{18,5},{19,18},{19,24},{21,32},{25,54},{1,1},
-    {1,1},{13,4},{14,5},{16,7},{17,17},{17,22},{19,28},{31,37},{1,1},
-    {1,1},{14,7},{13,7},{14,9},{14,17},{14,20},{15,24},{18,36},{1,1},
-    {1,1},{26,5},{26,7},{30,28},{32,48},{49,58},{1,1},{1,1},{1,1},
-    {1,1},{22,9},{21,11},{23,26},{27,38},{32,53},{1,1},{1,1},{1,1},
-    {1,1},{23,14},{18,14},{19,25},{18,33},{19,43},{1,1},{1,1},{1,1},
-    {1,1},{25,11},{34,15},{47,26},{76,56},{74,110},{1,255},{1,1},{1,1},
-    {1,1},{27,15},{29,20},{37,27},{62,46},{33,97},{59,117},{1,255},{1,1},
-    {1,1},{35,25},{36,28},{33,47},{34,78},{49,99},{1,194},{255,1},{1,1},
-    {1,1},{39,17},{43,28},{98,97},{255,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{22,27},{24,33},{56,51},{31,124},{1,183},{1,1},{1,1},{1,1},
-    {1,1},{30,47},{17,54},{20,91},{25,123},{1,230},{1,1},{1,1},{1,1}
+    {12,1},{14,1},{16,5},{14,10},{15,13},{19,22},{24,32},{26,42},{29,61},
+    {13,2},{14,2},{15,6},{12,10},{13,12},{17,19},{21,28},{23,37},{30,44},
+    {16,5},{15,5},{13,9},{10,11},{11,12},{14,17},{16,23},{17,28},{19,34},
+    {3,1},{15,1},{34,15},{26,36},{34,43},{1,1},{1,1},{1,1},{1,1},
+    {8,1},{16,2},{32,17},{26,29},{39,36},{1,1},{1,1},{1,1},{1,1},
+    {13,2},{18,5},{26,23},{19,26},{24,34},{1,1},{1,1},{1,1},{1,1},
+    {21,6},{31,4},{32,15},{34,24},{51,31},{65,98},{255,1},{1,255},{1,1},
+    {28,8},{31,7},{31,17},{32,23},{35,32},{73,44},{108,64},{73,147},{1,1},
+    {41,18},{41,18},{34,30},{34,32},{38,38},{55,66},{33,130},{1,255},{1,1},
+    {13,1},{30,7},{59,59},{73,72},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {21,2},{39,10},{35,80},{32,59},{65,98},{1,1},{1,1},{1,1},{1,1},
+    {35,8},{53,19},{48,73},{39,60},{102,76},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{14,2},{15,4},{19,7},{20,16},{20,23},{24,31},{38,44},{1,1},
+    {1,1},{13,4},{14,5},{16,9},{18,15},{17,21},{21,27},{27,42},{1,1},
+    {1,1},{13,7},{13,8},{13,11},{14,15},{13,18},{15,23},{20,32},{1,1},
+    {1,1},{29,14},{30,16},{43,26},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{29,16},{32,14},{49,13},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{27,22},{26,20},{43,20},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{26,7},{34,11},{48,23},{57,51},{129,43},{153,51},{1,255},{1,1},
+    {1,1},{26,10},{30,14},{37,22},{41,49},{44,70},{129,43},{1,242},{1,1},
+    {1,1},{33,22},{32,28},{41,32},{52,41},{33,75},{71,56},{39,154},{1,1},
+    {1,1},{59,34},{40,55},{31,154},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{61,51},{68,58},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{93,47},{78,77},{73,147},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{14,3},{15,4},{19,5},{20,18},{20,24},{22,31},{28,50},{1,1},
+    {1,1},{13,4},{14,5},{16,7},{18,16},{18,22},{20,27},{30,37},{1,1},
+    {1,1},{14,7},{13,7},{15,8},{14,16},{13,20},{15,23},{18,32},{1,1},
+    {1,1},{26,5},{26,7},{30,28},{35,44},{42,65},{1,1},{1,1},{1,1},
+    {1,1},{23,8},{22,10},{25,25},{29,34},{38,45},{1,1},{1,1},{1,1},
+    {1,1},{24,13},{18,14},{20,23},{21,28},{24,34},{1,1},{1,1},{1,1},
+    {1,1},{26,8},{34,12},{51,17},{74,50},{65,107},{73,147},{1,1},{1,1},
+    {1,1},{27,14},{30,16},{38,23},{54,45},{24,99},{65,107},{51,153},{1,1},
+    {1,1},{37,23},{39,24},{43,36},{44,66},{49,85},{37,130},{122,121},{1,1},
+    {1,1},{41,12},{47,19},{74,93},{255,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{27,15},{29,20},{46,45},{67,75},{1,184},{1,1},{1,1},{1,1},
+    {1,1},{37,34},{30,36},{36,69},{45,100},{39,154},{1,1},{1,1},{1,1}
 };
 static const uint8_t priors_sgn_q900[CTX_SGN][2] = {
-    {7,8},{6,6},{5,5},{6,6},{8,7},{28,12},{21,10},{13,10},{14,17},{15,24},{24,16},{16,15},{10,13},{11,19},{11,28}
+    {7,7},{6,6},{5,5},{6,6},{7,7},{27,12},{20,10},{13,10},{13,17},{15,24},{23,16},{16,15},{10,13},{11,19},{11,27}
 };
 static const uint8_t priors_ref_q900[CTX_REF][2] = {
-    {16,2},{12,2},{10,3},{10,3},{9,4},{10,5},{10,6},{28,11},{18,8},{14,7},{13,6},{13,6},{13,7},{13,7}
+    {16,2},{12,2},{10,3},{10,3},{9,4},{10,5},{10,6},{30,11},{19,8},{14,7},{13,6},{12,6},{13,6},{11,7}
 };
 static const uint8_t priors_bp_q900[CTX_BP][2] = {
-    {15,1},{15,1},{14,2},{10,6},{8,8},{12,4}
+    {15,1},{15,1},{13,3},{10,6},{8,8},{13,3}
 };
 static const uint8_t priors_dc_q900[CTX_DC][2] = {
-    {14,1},{11,4},{7,8},{10,5},{7,8},{9,6},{5,11},{10,9},{3,18},{1,33},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
+    {14,1},{11,4},{8,7},{10,5},{7,8},{8,7},{5,11},{11,9},{2,19},{1,38},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
 };
 
 /* Q=780 */
 static const uint8_t priors_sig_q780[CTX_SIG][2] = {
-    {14,1},{16,1},{18,6},{17,11},{17,15},{21,23},{25,33},{26,41},{30,50},
-    {15,2},{16,3},{17,7},{14,11},{15,14},{18,21},{21,30},{21,37},{27,43},
-    {18,4},{16,5},{14,9},{11,11},{11,12},{13,17},{15,22},{15,25},{16,28},
-    {3,1},{17,2},{41,14},{38,40},{35,60},{1,1},{1,1},{1,1},{1,1},
-    {8,1},{18,2},{39,15},{34,37},{39,52},{1,1},{1,1},{1,1},{1,1},
-    {13,2},{19,5},{31,20},{24,30},{27,37},{1,1},{1,1},{1,1},{1,1},
-    {24,5},{30,5},{31,14},{28,24},{35,30},{46,48},{60,71},{77,104},{30,213},
-    {28,7},{30,8},{30,16},{28,23},{31,28},{42,44},{58,63},{64,81},{77,112},
-    {33,13},{33,13},{28,21},{24,25},{26,29},{34,41},{37,57},{44,69},{50,82},
-    {16,1},{32,7},{51,46},{45,71},{35,134},{1,1},{1,1},{1,1},{1,1},
-    {22,2},{37,8},{50,51},{34,64},{52,100},{1,1},{1,1},{1,1},{1,1},
-    {27,7},{40,14},{46,51},{28,58},{36,87},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{15,3},{18,4},{21,8},{23,17},{22,24},{25,32},{30,49},{1,1},
-    {1,1},{15,4},{16,6},{19,9},{20,16},{19,22},{21,29},{27,41},{1,1},
-    {1,1},{14,7},{14,8},{14,11},{14,15},{13,18},{14,22},{17,29},{1,1},
-    {1,1},{34,13},{35,15},{53,20},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{33,15},{35,14},{52,15},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{30,19},{29,17},{42,16},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{27,8},{31,11},{36,21},{41,37},{48,50},{51,84},{23,207},{1,1},
-    {1,1},{27,11},{29,14},{34,20},{38,34},{39,44},{47,64},{84,83},{1,1},
-    {1,1},{28,17},{28,19},{30,25},{31,34},{30,41},{39,48},{41,82},{1,1},
-    {1,1},{49,32},{43,43},{48,100},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{61,33},{64,41},{138,49},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{55,45},{57,44},{78,77},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{16,3},{18,4},{21,6},{23,19},{23,24},{24,32},{28,49},{1,1},
-    {1,1},{16,4},{16,6},{18,8},{20,18},{19,23},{21,29},{26,40},{1,1},
-    {1,1},{15,7},{14,7},{15,9},{14,16},{14,18},{15,21},{17,29},{1,1},
-    {1,1},{35,6},{35,8},{40,32},{40,53},{47,72},{1,1},{1,1},{1,1},
-    {1,1},{32,10},{31,12},{34,30},{36,44},{38,58},{1,1},{1,1},{1,1},
-    {1,1},{29,15},{24,15},{25,25},{23,33},{22,40},{1,1},{1,1},{1,1},
-    {1,1},{27,9},{31,12},{39,17},{44,39},{49,51},{72,58},{61,163},{1,1},
-    {1,1},{28,12},{30,14},{34,21},{40,37},{47,45},{46,72},{84,80},{1,1},
-    {1,1},{30,16},{29,18},{31,24},{34,35},{33,46},{37,61},{56,75},{1,1},
-    {1,1},{47,14},{44,22},{54,57},{100,85},{85,171},{1,1},{1,1},{1,1},
-    {1,1},{35,20},{34,25},{40,54},{52,73},{28,145},{1,1},{1,1},{1,1},
-    {1,1},{36,31},{28,33},{30,55},{28,71},{36,104},{1,1},{1,1},{1,1}
+    {14,1},{16,1},{18,6},{16,11},{17,14},{21,22},{25,32},{26,40},{30,48},
+    {15,2},{16,2},{17,7},{15,10},{15,13},{18,21},{22,29},{22,36},{27,42},
+    {17,4},{16,4},{14,8},{11,11},{11,12},{13,16},{15,21},{14,24},{15,27},
+    {3,1},{18,1},{41,13},{39,37},{40,51},{1,1},{1,1},{1,1},{1,1},
+    {8,1},{18,2},{39,14},{35,34},{41,47},{1,1},{1,1},{1,1},{1,1},
+    {13,1},{19,4},{31,18},{23,29},{26,36},{1,1},{1,1},{1,1},{1,1},
+    {24,4},{29,4},{31,13},{28,22},{33,29},{48,42},{63,65},{87,79},{31,214},
+    {28,6},{29,7},{29,15},{27,21},{30,26},{40,42},{55,57},{59,82},{1,1},
+    {33,12},{32,12},{28,20},{24,23},{25,27},{33,38},{40,49},{45,62},{40,85},
+    {13,1},{31,6},{53,39},{52,60},{57,100},{1,1},{1,1},{1,1},{1,1},
+    {19,2},{35,8},{49,47},{36,54},{51,87},{1,1},{1,1},{1,1},{1,1},
+    {26,6},{38,14},{44,48},{35,45},{41,68},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{15,3},{17,4},{21,8},{22,17},{21,24},{24,32},{30,47},{1,1},
+    {1,1},{15,4},{16,6},{19,9},{20,16},{19,22},{21,28},{28,39},{1,1},
+    {1,1},{14,7},{14,7},{14,10},{14,15},{13,17},{14,21},{17,27},{1,1},
+    {1,1},{33,13},{34,14},{53,17},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{33,14},{34,13},{49,15},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{29,18},{28,16},{41,14},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{26,7},{31,10},{36,19},{40,36},{47,47},{50,78},{62,164},{1,1},
+    {1,1},{26,10},{28,13},{33,19},{37,32},{38,42},{57,50},{84,76},{1,1},
+    {1,1},{27,16},{26,19},{29,23},{31,32},{29,39},{37,45},{46,72},{1,1},
+    {1,1},{49,28},{48,34},{67,72},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{54,32},{56,39},{115,49},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{55,41},{59,37},{81,72},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{16,3},{17,4},{21,5},{22,19},{23,24},{23,32},{28,47},{1,1},
+    {1,1},{16,4},{16,5},{19,7},{20,17},{20,22},{22,27},{27,39},{1,1},
+    {1,1},{14,7},{13,7},{15,8},{14,15},{13,18},{14,20},{16,27},{1,1},
+    {1,1},{34,6},{33,8},{39,32},{40,52},{42,72},{1,1},{1,1},{1,1},
+    {1,1},{32,9},{31,11},{34,29},{36,41},{39,52},{1,1},{1,1},{1,1},
+    {1,1},{29,14},{24,14},{25,24},{23,30},{22,36},{1,1},{1,1},{1,1},
+    {1,1},{26,8},{30,11},{37,17},{42,38},{49,47},{66,59},{92,129},{1,1},
+    {1,1},{27,11},{29,13},{33,19},{39,35},{46,42},{51,62},{80,80},{1,1},
+    {1,1},{28,17},{29,16},{30,23},{33,33},{34,40},{37,52},{50,72},{1,1},
+    {1,1},{45,13},{44,20},{51,55},{82,79},{51,205},{1,1},{1,1},{1,1},
+    {1,1},{35,16},{34,20},{41,45},{47,68},{53,102},{1,1},{1,1},{1,1},
+    {1,1},{36,27},{29,29},{34,44},{36,55},{58,65},{1,1},{1,1},{1,1}
 };
 static const uint8_t priors_sgn_q780[CTX_SGN][2] = {
-    {6,8},{6,6},{6,5},{6,7},{8,6},{19,13},{16,11},{12,9},{14,13},{16,16},{16,16},{13,14},{9,12},{11,16},{13,19}
+    {6,8},{7,6},{6,5},{6,7},{8,6},{18,14},{16,10},{12,9},{14,13},{16,15},{16,16},{13,14},{9,12},{10,16},{13,18}
 };
 static const uint8_t priors_ref_q780[CTX_REF][2] = {
-    {18,2},{13,3},{11,3},{10,3},{10,4},{10,5},{8,6},{31,12},{20,9},{15,7},{12,7},{11,7},{10,7},{9,6}
+    {18,2},{13,3},{11,3},{10,4},{10,4},{10,5},{8,6},{32,13},{20,9},{15,7},{12,7},{11,6},{10,7},{8,6}
 };
 static const uint8_t priors_bp_q780[CTX_BP][2] = {
-    {15,1},{15,1},{10,6},{8,8},{8,8},{12,4}
+    {15,1},{15,1},{10,6},{8,8},{8,8},{13,3}
 };
 static const uint8_t priors_dc_q780[CTX_DC][2] = {
-    {14,1},{9,6},{5,10},{6,9},{7,8},{9,6},{8,7},{6,10},{8,11},{6,15},{1,27},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
+    {14,1},{9,6},{5,10},{6,9},{7,8},{9,6},{8,7},{4,12},{8,11},{7,14},{1,27},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
 };
 
 /* Q=560 */
 static const uint8_t priors_sig_q560[CTX_SIG][2] = {
-    {19,1},{21,2},{26,7},{23,14},{23,19},{29,27},{34,39},{34,48},{38,54},
-    {21,2},{22,3},{24,8},{20,14},{20,18},{25,26},{30,37},{30,44},{33,49},
-    {21,3},{19,5},{18,9},{14,12},{13,14},{16,18},{17,24},{17,25},{16,27},
-    {3,1},{23,2},{57,13},{68,56},{71,73},{1,1},{1,1},{1,1},{1,1},
-    {10,1},{24,3},{54,14},{62,56},{74,74},{1,1},{1,1},{1,1},{1,1},
-    {15,1},{23,4},{41,16},{37,40},{40,49},{1,1},{1,1},{1,1},{1,1},
-    {32,3},{35,5},{39,14},{37,22},{38,30},{50,42},{56,62},{61,72},{72,90},
-    {35,5},{36,7},{38,16},{35,23},{37,28},{46,41},{55,55},{57,69},{58,86},
-    {35,9},{32,10},{29,17},{25,20},{25,23},{31,30},{34,38},{34,43},{34,48},
-    {15,1},{39,5},{78,32},{71,71},{75,96},{1,1},{1,1},{1,1},{1,1},
-    {22,1},{41,7},{81,32},{67,67},{82,94},{1,1},{1,1},{1,1},{1,1},
-    {26,4},{38,11},{58,39},{44,51},{51,63},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{21,4},{24,5},{29,9},{31,21},{30,29},{33,38},{42,53},{1,1},
-    {1,1},{21,5},{22,7},{26,11},{27,21},{26,28},{29,35},{36,49},{1,1},
-    {1,1},{18,7},{17,8},{18,11},{18,16},{16,19},{17,22},{19,29},{1,1},
-    {1,1},{46,13},{47,13},{66,16},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{44,15},{44,14},{62,14},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{36,17},{33,15},{45,14},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{34,8},{38,11},{44,18},{48,33},{49,45},{54,61},{70,93},{1,1},
-    {1,1},{33,11},{37,13},{42,20},{44,33},{44,44},{51,56},{69,75},{1,1},
-    {1,1},{29,14},{28,16},{30,20},{30,27},{29,31},{33,37},{38,50},{1,1},
-    {1,1},{62,26},{65,30},{91,52},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{65,28},{69,29},{103,41},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{55,31},{53,31},{75,41},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{22,4},{24,5},{28,7},{31,23},{31,30},{32,38},{40,53},{1,1},
-    {1,1},{22,5},{22,7},{26,9},{27,23},{27,29},{29,35},{35,48},{1,1},
-    {1,1},{18,7},{17,7},{18,9},{18,17},{17,19},{17,22},{19,29},{1,1},
-    {1,1},{57,10},{57,11},{70,44},{71,73},{71,101},{1,1},{1,1},{1,1},
-    {1,1},{55,15},{54,17},{64,43},{66,65},{67,83},{1,1},{1,1},{1,1},
-    {1,1},{45,18},{38,18},{40,33},{37,41},{33,47},{1,1},{1,1},{1,1},
-    {1,1},{34,9},{37,11},{45,16},{48,37},{51,47},{54,63},{66,93},{1,1},
-    {1,1},{34,11},{36,13},{42,18},{46,35},{48,44},{52,56},{66,77},{1,1},
-    {1,1},{29,14},{28,15},{31,18},{31,28},{31,32},{33,37},{40,49},{1,1},
-    {1,1},{68,19},{68,23},{79,60},{99,83},{93,129},{1,1},{1,1},{1,1},
-    {1,1},{61,23},{61,26},{68,60},{77,79},{78,114},{1,1},{1,1},{1,1},
-    {1,1},{53,30},{45,29},{48,45},{46,56},{45,65},{1,1},{1,1},{1,1}
+    {17,1},{20,2},{24,7},{21,13},{18,19},{27,25},{32,36},{32,43},{34,51},
+    {20,1},{20,3},{22,8},{19,13},{18,17},{24,23},{28,34},{28,40},{30,46},
+    {19,3},{18,4},{17,8},{13,11},{12,12},{14,17},{16,21},{15,23},{15,24},
+    {3,1},{22,2},{53,11},{62,52},{68,65},{1,1},{1,1},{1,1},{1,1},
+    {9,1},{23,2},{50,13},{56,52},{65,70},{1,1},{1,1},{1,1},{1,1},
+    {13,1},{20,4},{38,14},{34,37},{36,44},{1,1},{1,1},{1,1},{1,1},
+    {29,3},{33,4},{36,13},{32,22},{35,27},{45,38},{51,57},{58,63},{64,83},
+    {32,5},{34,6},{34,15},{32,21},{33,26},{41,37},{50,50},{52,63},{54,75},
+    {32,8},{30,9},{27,16},{22,19},{23,21},{28,27},{31,35},{30,40},{31,43},
+    {14,1},{36,5},{73,27},{67,62},{76,75},{1,1},{1,1},{1,1},{1,1},
+    {20,1},{38,6},{72,32},{60,60},{73,81},{1,1},{1,1},{1,1},{1,1},
+    {24,4},{34,10},{55,34},{40,46},{46,55},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{20,4},{22,5},{27,8},{28,20},{28,27},{31,35},{38,50},{1,1},
+    {1,1},{19,5},{21,6},{24,11},{26,19},{24,26},{27,32},{34,45},{1,1},
+    {1,1},{16,7},{16,7},{17,10},{16,15},{15,17},{16,20},{18,26},{1,1},
+    {1,1},{42,12},{43,12},{60,14},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{41,13},{41,12},{56,13},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{33,15},{31,13},{40,13},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{31,7},{35,10},{40,17},{43,31},{44,42},{50,54},{63,85},{1,1},
+    {1,1},{31,10},{34,12},{37,19},{41,30},{41,39},{47,51},{63,68},{1,1},
+    {1,1},{27,13},{26,14},{27,19},{28,24},{27,28},{30,34},{35,45},{1,1},
+    {1,1},{57,24},{61,25},{84,44},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{60,25},{63,26},{93,36},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{48,31},{49,27},{67,37},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{21,4},{22,5},{27,6},{29,21},{28,28},{30,35},{37,49},{1,1},
+    {1,1},{20,5},{21,6},{24,8},{25,21},{25,26},{28,31},{33,44},{1,1},
+    {1,1},{16,7},{15,7},{17,8},{17,15},{15,18},{15,20},{17,26},{1,1},
+    {1,1},{53,9},{52,10},{63,42},{67,65},{67,88},{1,1},{1,1},{1,1},
+    {1,1},{50,14},{49,16},{57,40},{63,56},{66,72},{1,1},{1,1},{1,1},
+    {1,1},{41,17},{34,17},{36,31},{34,37},{30,43},{1,1},{1,1},{1,1},
+    {1,1},{32,8},{34,10},{41,15},{44,33},{46,43},{52,53},{65,78},{1,1},
+    {1,1},{32,10},{33,12},{38,17},{41,32},{45,39},{47,51},{58,72},{1,1},
+    {1,1},{27,13},{26,13},{28,17},{29,25},{28,29},{30,34},{36,44},{1,1},
+    {1,1},{61,18},{61,21},{73,53},{80,81},{86,117},{1,1},{1,1},{1,1},
+    {1,1},{55,21},{54,24},{66,48},{67,71},{74,92},{1,1},{1,1},{1,1},
+    {1,1},{48,27},{41,27},{44,40},{42,49},{41,56},{1,1},{1,1},{1,1}
 };
 static const uint8_t priors_sgn_q560[CTX_SGN][2] = {
-    {6,8},{6,7},{6,5},{7,6},{8,6},{14,13},{13,11},{11,9},{13,11},{16,11},{11,16},{11,13},{9,11},{11,13},{14,14}
+    {6,8},{6,7},{6,5},{7,6},{8,6},{13,14},{13,11},{11,9},{13,11},{16,11},{11,16},{11,13},{9,11},{11,13},{13,14}
 };
 static const uint8_t priors_ref_q560[CTX_REF][2] = {
-    {20,3},{14,3},{12,3},{11,4},{9,5},{9,6},{8,6},{36,14},{23,9},{16,8},{13,7},{10,7},{9,7},{7,5}
+    {20,3},{15,3},{12,3},{11,4},{10,5},{9,6},{8,6},{38,13},{23,10},{16,8},{13,7},{10,7},{9,7},{7,5}
 };
 static const uint8_t priors_bp_q560[CTX_BP][2] = {
-    {15,1},{14,2},{3,13},{9,7},{8,8},{12,4}
+    {15,1},{14,2},{4,12},{10,6},{8,8},{13,3}
 };
 static const uint8_t priors_dc_q560[CTX_DC][2] = {
-    {12,3},{4,11},{9,6},{9,6},{7,8},{8,7},{8,7},{8,7},{8,7},{7,8},{5,12},{10,10},{2,20},{1,40},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
+    {12,3},{4,11},{10,5},{8,7},{7,8},{8,7},{8,7},{8,7},{9,6},{7,9},{6,12},{12,9},{2,20},{1,40},{1,1},{1,1},{1,1},{1,1},{1,1},{1,1}
 };
 
 /* Q=360 */
 static const uint8_t priors_sig_q360[CTX_SIG][2] = {
-    {17,1},{19,2},{23,7},{19,13},{19,17},{26,25},{31,35},{32,41},{35,47},
-    {20,1},{20,3},{21,8},{18,12},{18,16},{23,24},{28,33},{29,38},{31,44},
-    {19,2},{17,3},{16,8},{12,10},{11,12},{14,15},{15,20},{15,20},{14,21},
-    {3,1},{20,2},{49,10},{76,63},{85,78},{1,1},{1,1},{1,1},{1,1},
-    {10,1},{22,2},{47,12},{74,62},{86,80},{1,1},{1,1},{1,1},{1,1},
-    {13,1},{19,3},{36,12},{40,41},{44,48},{1,1},{1,1},{1,1},{1,1},
-    {29,2},{31,4},{34,12},{31,19},{32,25},{42,35},{48,51},{51,58},{1,1},
-    {31,4},{31,6},{34,13},{30,20},{32,24},{40,34},{47,47},{50,55},{1,1},
-    {28,7},{25,8},{24,13},{20,15},{19,18},{24,22},{26,29},{26,30},{26,31},
-    {12,1},{34,4},{73,21},{79,69},{83,88},{1,1},{1,1},{1,1},{1,1},
-    {18,1},{34,6},{73,23},{78,67},{97,84},{1,1},{1,1},{1,1},{1,1},
-    {21,3},{30,8},{52,24},{45,47},{51,54},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{19,4},{21,5},{26,8},{27,20},{27,27},{31,33},{38,47},{1,1},
-    {1,1},{19,5},{20,6},{24,10},{26,19},{24,26},{28,31},{34,44},{1,1},
-    {1,1},{16,6},{16,6},{16,9},{16,14},{14,16},{15,18},{17,24},{1,1},
-    {1,1},{40,11},{40,10},{54,10},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{39,13},{37,12},{50,11},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{31,14},{28,11},{36,10},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{30,7},{32,10},{38,16},{42,28},{42,38},{49,47},{62,66},{1,1},
-    {1,1},{30,9},{32,11},{37,17},{40,28},{40,37},{45,46},{58,63},{1,1},
-    {1,1},{24,11},{23,12},{25,15},{25,20},{24,23},{26,27},{30,35},{1,1},
-    {1,1},{55,20},{59,20},{84,29},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{56,22},{59,21},{85,27},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{43,24},{42,21},{56,26},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{20,4},{21,5},{25,7},{27,21},{28,27},{31,33},{37,47},{1,1},
-    {1,1},{20,5},{20,6},{23,9},{25,20},{25,26},{28,31},{33,44},{1,1},
-    {1,1},{16,6},{15,6},{16,7},{16,14},{15,16},{15,18},{17,23},{1,1},
-    {1,1},{64,11},{64,11},{78,50},{85,74},{84,102},{1,1},{1,1},{1,1},
-    {1,1},{63,16},{62,18},{75,48},{78,71},{83,88},{1,1},{1,1},{1,1},
-    {1,1},{48,18},{40,18},{43,34},{41,41},{37,45},{1,1},{1,1},{1,1},
-    {1,1},{30,8},{32,10},{38,14},{42,30},{43,39},{49,47},{61,67},{1,1},
-    {1,1},{30,9},{31,11},{37,15},{40,30},{42,37},{46,46},{57,63},{1,1},
-    {1,1},{23,11},{23,11},{24,14},{25,21},{24,24},{26,27},{30,35},{1,1},
-    {1,1},{72,19},{71,23},{84,59},{97,83},{96,110},{1,1},{1,1},{1,1},
-    {1,1},{68,22},{67,27},{83,53},{78,87},{89,102},{1,1},{1,1},{1,1},
-    {1,1},{52,27},{45,26},{49,40},{47,48},{43,53},{1,1},{1,1},{1,1}
+    {17,1},{20,2},{23,7},{20,13},{16,19},{26,25},{30,35},{31,41},{32,47},
+    {19,1},{20,3},{22,8},{19,12},{18,17},{24,23},{28,32},{28,38},{29,43},
+    {18,2},{17,3},{16,7},{12,10},{11,11},{13,15},{15,19},{14,20},{14,20},
+    {3,1},{21,2},{52,10},{72,62},{81,77},{1,1},{1,1},{1,1},{1,1},
+    {9,1},{22,2},{49,11},{71,60},{81,79},{1,1},{1,1},{1,1},{1,1},
+    {12,1},{19,3},{35,11},{38,40},{43,46},{1,1},{1,1},{1,1},{1,1},
+    {28,2},{30,4},{33,12},{29,20},{18,32},{38,36},{47,49},{47,58},{48,70},
+    {30,4},{31,5},{33,13},{29,19},{30,24},{39,33},{46,45},{47,54},{1,1},
+    {27,6},{25,7},{24,12},{19,15},{19,17},{23,21},{26,27},{25,29},{25,30},
+    {12,1},{33,4},{71,20},{80,65},{84,80},{1,1},{1,1},{1,1},{1,1},
+    {18,1},{34,5},{71,22},{74,63},{92,80},{1,1},{1,1},{1,1},{1,1},
+    {20,3},{29,7},{51,23},{43,45},{48,52},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{20,4},{22,5},{26,9},{28,20},{27,26},{30,33},{36,47},{1,1},
+    {1,1},{19,5},{21,6},{24,10},{26,19},{25,25},{27,31},{33,43},{1,1},
+    {1,1},{15,6},{15,6},{15,9},{16,13},{14,15},{14,18},{16,23},{1,1},
+    {1,1},{42,11},{42,10},{57,11},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{41,12},{40,11},{53,11},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{31,13},{27,11},{34,10},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{28,8},{32,9},{37,15},{41,27},{40,37},{44,48},{56,66},{1,1},
+    {1,1},{29,9},{31,11},{36,17},{39,27},{39,35},{44,44},{56,60},{1,1},
+    {1,1},{22,11},{23,11},{24,14},{24,20},{23,22},{25,26},{29,33},{1,1},
+    {1,1},{55,18},{57,20},{83,25},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{56,21},{58,20},{82,25},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{42,23},{41,20},{55,23},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{21,4},{22,5},{25,7},{28,21},{28,27},{30,33},{34,46},{1,1},
+    {1,1},{20,5},{21,6},{24,8},{26,20},{25,26},{27,31},{32,42},{1,1},
+    {1,1},{15,6},{14,6},{16,7},{15,14},{14,16},{15,17},{16,23},{1,1},
+    {1,1},{62,11},{62,11},{75,48},{81,72},{80,98},{1,1},{1,1},{1,1},
+    {1,1},{61,16},{60,18},{70,48},{76,69},{81,82},{1,1},{1,1},{1,1},
+    {1,1},{45,18},{38,18},{41,33},{39,40},{35,44},{1,1},{1,1},{1,1},
+    {1,1},{29,8},{31,10},{37,13},{41,29},{41,39},{43,48},{48,70},{1,1},
+    {1,1},{29,9},{30,11},{36,14},{39,29},{40,37},{45,44},{55,61},{1,1},
+    {1,1},{22,11},{21,11},{24,13},{25,20},{24,23},{25,26},{29,33},{1,1},
+    {1,1},{69,19},{67,23},{80,56},{86,85},{91,105},{1,1},{1,1},{1,1},
+    {1,1},{65,22},{64,26},{78,52},{81,77},{90,90},{1,1},{1,1},{1,1},
+    {1,1},{50,26},{43,25},{46,39},{45,46},{41,50},{1,1},{1,1},{1,1}
 };
 static const uint8_t priors_sgn_q360[CTX_SGN][2] = {
-    {5,9},{6,7},{6,5},{7,6},{8,6},{12,14},{12,11},{11,8},{13,10},{16,10},{10,16},{10,13},{8,11},{10,13},{13,13}
+    {6,8},{6,7},{6,5},{7,6},{8,6},{13,12},{12,10},{11,8},{13,9},{16,9},{9,16},{9,13},{8,11},{10,12},{12,13}
 };
 static const uint8_t priors_ref_q360[CTX_REF][2] = {
-    {22,3},{15,3},{13,3},{11,4},{10,5},{9,6},{8,6},{42,14},{25,10},{18,8},{14,7},{11,7},{9,7},{6,5}
+    {22,3},{16,3},{12,4},{11,4},{10,5},{9,6},{8,6},{43,14},{25,10},{18,8},{13,8},{11,7},{9,7},{6,5}
 };
 static const uint8_t priors_bp_q360[CTX_BP][2] = {
-    {15,1},{8,8},{9,7},{7,9},{8,8},{12,4}
+    {15,1},{8,8},{9,7},{6,10},{9,7},{13,3}
 };
 static const uint8_t priors_dc_q360[CTX_DC][2] = {
-    {4,11},{11,4},{7,8},{9,6},{7,8},{8,7},{8,7},{8,7},{8,7},{8,7},{8,7},{8,8},{6,11},{9,11},{5,17},{1,28},{1,1},{1,1},{1,1},{1,1}
+    {5,10},{10,5},{7,8},{9,6},{7,8},{8,7},{7,8},{8,7},{8,7},{9,6},{9,6},{8,8},{5,12},{10,10},{6,16},{1,29},{1,1},{1,1},{1,1},{1,1}
 };
 
 /* Q=138 */
 static const uint8_t priors_sig_q138[CTX_SIG][2] = {
-    {15,1},{17,2},{20,6},{17,10},{16,14},{20,20},{24,27},{25,30},{27,34},
-    {18,1},{19,2},{20,7},{16,11},{15,13},{19,19},{22,26},{22,29},{24,32},
-    {17,2},{16,3},{15,6},{11,8},{9,10},{11,12},{13,15},{12,15},{11,16},
-    {3,1},{19,1},{42,7},{76,60},{86,76},{1,1},{1,1},{1,1},{1,1},
-    {10,1},{20,2},{42,9},{75,59},{87,79},{1,1},{1,1},{1,1},{1,1},
-    {12,1},{18,2},{32,9},{42,41},{47,48},{1,1},{1,1},{1,1},{1,1},
-    {23,2},{24,4},{25,11},{22,16},{23,20},{30,28},{36,38},{37,44},{1,1},
-    {25,3},{24,5},{25,11},{21,16},{21,20},{29,27},{34,37},{36,42},{1,1},
-    {22,5},{20,6},{18,11},{14,13},{13,14},{17,17},{19,22},{19,22},{18,23},
-    {9,1},{25,4},{56,16},{76,68},{83,85},{1,1},{1,1},{1,1},{1,1},
-    {14,1},{26,5},{56,18},{77,66},{92,82},{1,1},{1,1},{1,1},{1,1},
-    {16,2},{23,6},{41,17},{43,46},{48,52},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{18,3},{19,4},{21,8},{22,16},{21,21},{24,25},{29,35},{1,1},
-    {1,1},{19,4},{19,5},{20,9},{21,16},{20,20},{22,24},{27,33},{1,1},
-    {1,1},{16,5},{14,5},{14,8},{14,11},{12,13},{12,14},{14,18},{1,1},
-    {1,1},{35,9},{32,8},{42,9},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{36,11},{33,9},{40,10},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{28,12},{24,9},{28,9},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{22,7},{24,9},{28,14},{30,24},{30,30},{34,37},{43,51},{1,1},
-    {1,1},{22,8},{23,10},{27,15},{30,23},{29,29},{34,35},{43,48},{1,1},
-    {1,1},{18,9},{18,9},{18,12},{18,17},{17,18},{18,21},{22,26},{1,1},
-    {1,1},{43,17},{44,16},{62,20},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{43,19},{43,17},{60,19},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{33,19},{31,16},{40,17},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{18,4},{18,5},{21,6},{22,17},{22,21},{24,25},{28,35},{1,1},
-    {1,1},{19,5},{18,5},{20,8},{21,17},{20,21},{22,24},{26,33},{1,1},
-    {1,1},{15,6},{14,5},{14,6},{13,12},{12,13},{12,14},{14,18},{1,1},
-    {1,1},{62,12},{63,12},{79,46},{85,69},{85,97},{1,1},{1,1},{1,1},
-    {1,1},{63,16},{62,19},{76,47},{81,68},{86,87},{1,1},{1,1},{1,1},
-    {1,1},{50,18},{42,18},{46,34},{43,42},{40,46},{1,1},{1,1},{1,1},
-    {1,1},{23,7},{23,9},{28,12},{30,25},{31,31},{34,37},{43,50},{1,1},
-    {1,1},{23,8},{23,9},{27,13},{29,24},{30,29},{34,35},{41,49},{1,1},
-    {1,1},{17,10},{16,9},{18,11},{18,17},{17,19},{18,21},{22,26},{1,1},
-    {1,1},{67,21},{66,26},{79,57},{86,81},{89,104},{1,1},{1,1},{1,1},
-    {1,1},{65,24},{63,29},{77,55},{85,74},{86,96},{1,1},{1,1},{1,1},
-    {1,1},{49,27},{42,26},{46,40},{44,46},{41,49},{1,1},{1,1},{1,1}
+    {16,1},{18,2},{22,6},{18,11},{16,15},{22,20},{24,28},{26,31},{25,35},
+    {18,1},{20,2},{21,7},{17,11},{16,14},{20,20},{23,27},{24,29},{24,33},
+    {16,2},{15,3},{15,6},{11,8},{9,10},{11,12},{13,15},{12,15},{11,16},
+    {3,1},{20,1},{45,8},{75,58},{85,74},{1,1},{1,1},{1,1},{1,1},
+    {9,1},{21,2},{44,9},{72,58},{84,76},{1,1},{1,1},{1,1},{1,1},
+    {11,1},{18,2},{31,9},{41,40},{45,47},{1,1},{1,1},{1,1},{1,1},
+    {24,2},{25,4},{26,11},{22,16},{16,24},{27,29},{29,40},{33,45},{25,53},
+    {25,3},{25,5},{26,11},{22,16},{22,20},{28,27},{32,37},{34,42},{32,47},
+    {21,5},{19,6},{18,10},{14,12},{13,14},{17,17},{19,21},{18,22},{18,22},
+    {9,1},{26,4},{59,15},{74,67},{80,84},{1,1},{1,1},{1,1},{1,1},
+    {14,1},{27,5},{58,17},{75,66},{90,79},{1,1},{1,1},{1,1},{1,1},
+    {15,2},{22,6},{41,17},{42,45},{47,51},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{19,4},{20,5},{23,8},{24,16},{22,22},{25,26},{29,36},{1,1},
+    {1,1},{20,4},{20,5},{22,9},{23,16},{21,21},{23,25},{27,35},{1,1},
+    {1,1},{15,5},{14,5},{14,7},{14,11},{12,13},{12,14},{14,18},{1,1},
+    {1,1},{37,9},{36,8},{45,10},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{38,11},{35,9},{43,11},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{27,12},{24,9},{28,9},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{22,7},{25,9},{28,14},{30,23},{27,31},{32,37},{37,51},{1,1},
+    {1,1},{23,8},{25,9},{27,15},{29,23},{29,29},{32,35},{38,49},{1,1},
+    {1,1},{17,9},{17,9},{18,12},{18,16},{17,18},{18,20},{22,25},{1,1},
+    {1,1},{44,16},{45,16},{62,20},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{45,18},{45,17},{62,20},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{34,18},{32,15},{40,16},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{20,4},{19,5},{23,6},{24,17},{23,22},{24,26},{26,37},{1,1},
+    {1,1},{20,5},{19,6},{21,8},{23,17},{22,21},{23,25},{26,34},{1,1},
+    {1,1},{15,5},{13,5},{14,6},{13,12},{12,13},{12,14},{13,18},{1,1},
+    {1,1},{61,12},{61,13},{76,45},{81,68},{81,95},{1,1},{1,1},{1,1},
+    {1,1},{61,16},{60,19},{74,46},{79,65},{82,85},{1,1},{1,1},{1,1},
+    {1,1},{47,18},{40,18},{45,33},{42,41},{39,45},{1,1},{1,1},{1,1},
+    {1,1},{24,7},{24,9},{28,11},{31,23},{29,30},{31,34},{18,54},{1,1},
+    {1,1},{23,8},{24,9},{27,13},{29,24},{30,29},{33,33},{34,48},{1,1},
+    {1,1},{17,9},{16,9},{18,10},{18,17},{17,19},{18,20},{21,26},{1,1},
+    {1,1},{65,22},{64,26},{76,56},{81,81},{86,102},{1,1},{1,1},{1,1},
+    {1,1},{64,23},{61,29},{74,54},{80,74},{85,92},{1,1},{1,1},{1,1},
+    {1,1},{48,26},{40,26},{44,40},{43,45},{40,48},{1,1},{1,1},{1,1}
 };
 static const uint8_t priors_sgn_q138[CTX_SGN][2] = {
-    {5,9},{5,8},{6,6},{8,5},{9,5},{10,13},{10,10},{9,8},{12,8},{14,8},{8,14},{8,12},{8,9},{10,10},{13,10}
+    {5,9},{5,8},{6,6},{8,5},{9,5},{11,11},{10,10},{9,8},{12,8},{14,8},{8,14},{8,12},{8,9},{10,10},{11,11}
 };
 static const uint8_t priors_ref_q138[CTX_REF][2] = {
-    {25,3},{18,3},{13,4},{11,5},{10,5},{9,6},{7,6},{48,15},{28,11},{19,9},{14,8},{11,7},{9,7},{6,5}
+    {25,3},{17,4},{14,4},{11,5},{10,5},{9,6},{7,6},{48,15},{28,11},{19,9},{14,8},{11,7},{9,7},{5,5}
 };
 static const uint8_t priors_bp_q138[CTX_BP][2] = {
     {15,1},{3,13},{13,3},{8,8},{8,8},{10,6}
@@ -3208,48 +3415,48 @@ static const uint8_t priors_dc_q138[CTX_DC][2] = {
 
 /* Q=1 */
 static const uint8_t priors_sig_q1[CTX_SIG][2] = {
-    {13,1},{15,2},{17,5},{15,8},{14,11},{17,16},{20,22},{20,25},{22,27},
-    {16,1},{17,2},{17,6},{14,9},{13,11},{17,15},{19,21},{19,23},{19,26},
-    {17,2},{15,3},{14,6},{11,7},{9,8},{10,11},{11,13},{10,13},{10,13},
-    {3,1},{17,1},{36,6},{73,56},{85,73},{1,1},{1,1},{1,1},{1,1},
-    {10,1},{18,2},{38,7},{72,55},{85,75},{1,1},{1,1},{1,1},{1,1},
-    {13,1},{18,2},{30,8},{43,40},{48,47},{1,1},{1,1},{1,1},{1,1},
-    {19,2},{19,4},{19,9},{16,13},{16,16},{21,22},{26,29},{27,33},{30,38},
-    {20,3},{20,4},{19,10},{16,13},{15,16},{20,21},{25,28},{25,32},{29,36},
-    {19,4},{17,5},{15,9},{11,11},{10,12},{13,14},{15,18},{15,18},{15,19},
-    {8,1},{21,3},{43,13},{66,65},{80,78},{1,1},{1,1},{1,1},{1,1},
-    {13,1},{22,4},{43,15},{66,65},{80,80},{1,1},{1,1},{1,1},{1,1},
-    {14,2},{20,5},{34,15},{40,45},{45,51},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{16,3},{16,4},{18,7},{19,13},{18,17},{20,20},{24,28},{1,1},
-    {1,1},{17,4},{16,5},{18,8},{18,13},{17,17},{18,20},{22,27},{1,1},
-    {1,1},{15,5},{13,5},{13,7},{12,10},{11,11},{11,12},{12,15},{1,1},
-    {1,1},{31,7},{29,6},{36,7},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{32,10},{29,8},{35,9},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{28,11},{23,8},{26,8},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{18,5},{19,7},{21,11},{22,19},{22,23},{25,28},{32,39},{1,1},
-    {1,1},{18,7},{19,8},{20,12},{21,19},{21,23},{24,27},{31,37},{1,1},
-    {1,1},{15,8},{14,8},{15,10},{14,14},{13,16},{14,17},{17,22},{1,1},
-    {1,1},{34,14},{33,13},{45,16},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{34,17},{33,14},{43,16},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{27,18},{25,14},{30,15},{1,1},{1,1},{1,1},{1,1},{1,1},
-    {1,1},{16,3},{16,4},{18,6},{19,14},{19,17},{20,20},{24,28},{1,1},
-    {1,1},{17,4},{16,5},{17,7},{18,14},{17,17},{18,20},{22,27},{1,1},
-    {1,1},{15,6},{13,5},{13,6},{13,10},{11,11},{11,12},{12,15},{1,1},
-    {1,1},{56,11},{58,12},{75,43},{81,66},{85,95},{1,1},{1,1},{1,1},
-    {1,1},{58,16},{58,18},{73,44},{82,62},{85,86},{1,1},{1,1},{1,1},
-    {1,1},{50,18},{41,18},{48,33},{45,41},{42,47},{1,1},{1,1},{1,1},
-    {1,1},{18,6},{18,7},{21,10},{22,19},{22,24},{25,28},{31,38},{1,1},
-    {1,1},{19,7},{18,8},{20,11},{21,19},{21,23},{24,27},{30,37},{1,1},
-    {1,1},{15,8},{13,8},{14,9},{14,14},{13,16},{14,17},{17,21},{1,1},
-    {1,1},{59,20},{57,26},{69,53},{75,75},{82,97},{1,1},{1,1},{1,1},
-    {1,1},{58,24},{55,28},{68,52},{75,69},{77,93},{1,1},{1,1},{1,1},
-    {1,1},{45,28},{39,26},{43,39},{42,44},{40,48},{1,1},{1,1},{1,1}
+    {12,1},{13,2},{14,5},{13,7},{12,10},{15,14},{17,20},{17,23},{18,25},
+    {14,2},{15,2},{14,6},{12,8},{11,10},{14,14},{16,19},{16,21},{16,24},
+    {17,2},{15,3},{13,6},{10,7},{8,8},{9,10},{10,13},{9,13},{8,13},
+    {4,1},{15,1},{33,5},{71,56},{85,72},{1,1},{1,1},{1,1},{1,1},
+    {10,1},{17,2},{34,7},{69,55},{83,75},{1,1},{1,1},{1,1},{1,1},
+    {14,1},{17,3},{30,8},{43,40},{48,49},{1,1},{1,1},{1,1},{1,1},
+    {16,2},{16,4},{16,8},{13,11},{12,14},{15,19},{18,26},{18,30},{17,34},
+    {17,4},{16,5},{15,9},{12,11},{11,13},{13,18},{16,24},{16,27},{17,30},
+    {19,6},{16,7},{13,10},{9,11},{8,11},{9,14},{10,17},{10,17},{10,17},
+    {8,1},{18,3},{37,12},{64,67},{78,83},{1,1},{1,1},{1,1},{1,1},
+    {14,1},{19,5},{36,15},{61,67},{75,85},{1,1},{1,1},{1,1},{1,1},
+    {16,4},{19,7},{32,16},{39,48},{45,55},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{13,3},{14,4},{16,6},{17,12},{16,15},{17,19},{21,26},{1,1},
+    {1,1},{15,4},{14,5},{15,7},{16,12},{15,15},{16,18},{19,25},{1,1},
+    {1,1},{15,6},{13,5},{12,7},{11,10},{10,11},{10,12},{11,15},{1,1},
+    {1,1},{28,7},{26,6},{33,7},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{30,10},{27,7},{33,8},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{27,12},{23,7},{25,8},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{16,5},{15,7},{16,11},{17,17},{15,21},{17,25},{22,34},{1,1},
+    {1,1},{15,7},{14,8},{15,11},{15,17},{14,20},{15,23},{19,31},{1,1},
+    {1,1},{14,10},{12,9},{12,11},{11,14},{10,14},{10,16},{12,20},{1,1},
+    {1,1},{29,14},{28,13},{37,16},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{30,17},{27,15},{34,17},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{26,21},{23,15},{27,17},{1,1},{1,1},{1,1},{1,1},{1,1},
+    {1,1},{14,3},{13,4},{15,6},{16,13},{16,16},{17,19},{20,26},{1,1},
+    {1,1},{15,4},{13,5},{14,7},{15,13},{15,15},{16,18},{18,25},{1,1},
+    {1,1},{15,6},{12,5},{12,6},{12,10},{10,11},{10,12},{10,15},{1,1},
+    {1,1},{52,11},{55,13},{74,43},{81,65},{87,95},{1,1},{1,1},{1,1},
+    {1,1},{54,16},{53,19},{70,45},{79,63},{85,84},{1,1},{1,1},{1,1},
+    {1,1},{49,20},{42,18},{48,34},{46,42},{43,48},{1,1},{1,1},{1,1},
+    {1,1},{15,6},{15,7},{16,10},{17,17},{16,21},{18,23},{18,33},{1,1},
+    {1,1},{16,7},{14,8},{15,10},{15,17},{14,20},{15,23},{19,30},{1,1},
+    {1,1},{14,10},{12,9},{12,10},{11,14},{10,15},{10,16},{11,20},{1,1},
+    {1,1},{56,20},{55,26},{67,56},{75,78},{80,107},{1,1},{1,1},{1,1},
+    {1,1},{53,26},{50,30},{64,54},{70,74},{75,98},{1,1},{1,1},{1,1},
+    {1,1},{46,31},{37,29},{43,42},{41,49},{40,53},{1,1},{1,1},{1,1}
 };
 static const uint8_t priors_sgn_q1[CTX_SGN][2] = {
-    {5,10},{6,8},{6,6},{8,6},{10,5},{8,13},{8,10},{9,7},{11,7},{13,7},{6,14},{7,11},{7,9},{10,8},{13,8}
+    {6,9},{6,8},{7,6},{8,6},{9,6},{8,11},{8,9},{8,7},{11,6},{13,6},{6,13},{6,11},{7,8},{9,8},{11,8}
 };
 static const uint8_t priors_ref_q1[CTX_REF][2] = {
-    {27,3},{18,4},{14,4},{11,5},{11,5},{9,6},{7,6},{51,16},{30,11},{20,9},{15,8},{12,7},{9,7},{5,5}
+    {27,4},{18,4},{15,4},{12,5},{11,5},{9,6},{7,6},{52,17},{31,12},{21,9},{15,8},{12,7},{9,7},{5,5}
 };
 static const uint8_t priors_bp_q1[CTX_BP][2] = {
     {15,1},{3,13},{14,2},{8,8},{8,8},{10,6}
@@ -3508,7 +3715,6 @@ static int bac_decode(BacDec *d, BacModel *m) {
     return bit;
 }
 
-
 #if defined(WTPC_TUNE_CTX)
 /* Context statistics: collected during EBCOT encoding.
    g_sig_cnt0[ctx] = count of sig_bit==0 decisions in context ctx, etc.
@@ -3560,111 +3766,15 @@ static inline int ebcot_subband_id(int x, int y, const int *lw, const int *lh, i
 /* Per-coefficient state: sig + neighbour count, merged for cache */
 typedef struct { uint8_t sig, nsig; } EbcotCtx;
 
-/* Encode-side per-coefficient EBCOT step. `border` selects whether boundary
- * conditions are needed: the interior (1..w-2, 1..h-2) calls with border=0
- * and skips all coordinate checks, which dominate the hot loop. */
-static inline void ebcot_enc_coeff(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, const int16_t * WTPC_RESTRICT y_sign,
-                                   EbcotCtx *ctx, BacModel *models, int w, int h,
-                                   int x, int y, size_t i, int16_t v, int b, int bit_mask, int border) {
-    int ctx_sig = ctx[i].nsig;
-    /*if (ctx_sig > 8) ctx_sig = 8;*/
-
-    if (!ctx[i].sig) {
-        /* Parent context: inter-scale correlation. */
-        int sctx = ctx_sig;
-        int px = x >> 1, py = y >> 1;
-        if ((border ? (x > 0 || y > 0) : 1) && ctx[py * w + px].sig) {
-            if ((unsigned)abs(coeffs[py * w + px]) >> (b + 1))
-                sctx += 18;  /* parent sig + high magnitude */
-            else
-                sctx += 9;   /* parent sig, low magnitude */
-        }
-        /* Previous-coefficient zero-run. */
-        if (i > 0 && !ctx[i-1].sig && ctx[i-1].nsig == 0)
-            sctx += 27;
-        /* Cross-channel: Y significance -> U/V also likely significant. */
-        if (y_sign && ((unsigned)abs(y_sign[i]) > (unsigned)bit_mask)) sctx += 54;
-        /* Directional neighbor context: horizontal/vertical bias. */
-        int h_sig = (border ? (x > 0 && ctx[i-1].sig) : ctx[i-1].sig) +
-                    (border ? (x + 1 < w && ctx[i+1].sig) : ctx[i+1].sig);
-        int v_sig = (border ? (y > 0 && ctx[i-w].sig) : ctx[i-w].sig) +
-                    (border ? (y + 1 < h && ctx[i+w].sig) : ctx[i+w].sig);
-        if (h_sig > v_sig) sctx += 108;
-        else if (v_sig > h_sig) sctx += 216;
-        int is_sig = (abs(v) & bit_mask) != 0;
-#ifdef WTPC_TUNE_CTX
-        if (sctx < CTX_SIG) { if (is_sig) g_sig_cnt1[sctx]++; else g_sig_cnt0[sctx]++; }
-#endif
-        bac_encode(e, is_sig, &models[sctx]);
-        if (is_sig) {
-            ctx[i].sig = 1;
-            /* Bump neighbour counts (monotone; in-bounds only). */
-            if (border) {
-                int y0 = y > 0, y1 = y + 1 < h, x0 = x > 0, x1 = x + 1 < w;
-                if (y0) { if (x0) ctx[i-w-1].nsig++; ctx[i-w].nsig++; if (x1) ctx[i-w+1].nsig++; }
-                if (x0) ctx[i-1].nsig++;
-                if (x1) ctx[i+1].nsig++;
-                if (y1) { if (x0) ctx[i+w-1].nsig++; ctx[i+w].nsig++; if (x1) ctx[i+w+1].nsig++; }
-            } else {
-                ctx[i-w-1].nsig++; ctx[i-w].nsig++; ctx[i-w+1].nsig++;
-                ctx[i-1].nsig++;                         ctx[i+1].nsig++;
-                ctx[i+w-1].nsig++; ctx[i+w].nsig++; ctx[i+w+1].nsig++;
-            }
-            int ctx_sgn = 2, sgn_sum = 0;
-            if (border) {
-                for (int dy = -1; dy <= 1; dy++) {
-                    for (int dx = -1; dx <= 1; dx++) {
-                        if (dx == 0 && dy == 0) continue;
-                        int nx = x + dx, ny = y + dy;
-                        if (nx >= 0 && nx < w && ny >= 0 && ny < h && ctx[ny * w + nx].sig)
-                            sgn_sum += (coeffs[ny * w + nx] > 0) ? 1 : -1;
-                    }
-                }
-            } else {
-                /* Interior: all 8 neighbours in bounds. */
-                sgn_sum += ctx[i-w-1].sig ? (coeffs[i-w-1] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i-w  ].sig ? (coeffs[i-w  ] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i-w+1].sig ? (coeffs[i-w+1] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i-1  ].sig ? (coeffs[i-1  ] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i+1  ].sig ? (coeffs[i+1  ] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i+w-1].sig ? (coeffs[i+w-1] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i+w  ].sig ? (coeffs[i+w  ] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i+w+1].sig ? (coeffs[i+w+1] > 0) ? 1 : -1 : 0;
-            }
-            if (sgn_sum < -1) ctx_sgn = 0;
-            else if (sgn_sum < 0) ctx_sgn = 1;
-            else if (sgn_sum == 0) ctx_sgn = 2;
-            else if (sgn_sum <= 1) ctx_sgn = 3;
-            else ctx_sgn = 4;
-            if (y_sign && y_sign[i] != 0)
-                ctx_sgn += 5 + (y_sign[i] > 0 ? 0 : 5);
-            int sign_bit = (v < 0) ? 0 : 1;
-#ifdef WTPC_TUNE_CTX
-            if (sign_bit) g_sgn_cnt1[ctx_sgn]++; else g_sgn_cnt0[ctx_sgn]++;
-#endif
-            bac_encode(e, sign_bit, &models[CTX_SIG + ctx_sgn]);
-        }
-    } else {
-        /* Refinement: 14 contexts = 7 neighbor-count levels x first/subsequent. */
-        int ref_bit = (abs(v) & bit_mask) != 0;
-        int first = ((unsigned int)abs(v) >> (b + 1)) == 1;
-        int nb = ctx_sig; if (nb > 6) nb = 6;
-        int ctx_ref = nb + (first ? 0 : 7);
-#ifdef WTPC_TUNE_CTX
-        if (ref_bit) g_ref_cnt1[ctx_ref]++; else g_ref_cnt0[ctx_ref]++;
-#endif
-        bac_encode(e, ref_bit, &models[CTX_SIG + CTX_SGN + ctx_ref]);
-    }
-}
-
 /* Encode one channel using EBCOT-lite into an existing BAC encoder. */
-/* Returns number of bit-planes (bp). */
-static int ebcot_encode_channel(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, int w, int h, const int16_t * WTPC_RESTRICT y_sign, int quality) {
+/* Borders are never read by EBCOT (ctx.sig=0 gates access) */
+static int ebcot_encode_channel(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, int w, int h, const int16_t * WTPC_RESTRICT y_sign, int quality, int stride) {
     size_t total = (size_t)w * h;
     if (total == 0) return -1;
+    size_t pw = (size_t)stride;
 
     /* DC coefficient: save value for potential separate encoding */
-    int16_t dc_val = coeffs[0];
+    int16_t dc_val = coeffs[pw + 1];
 
     /* --- Subband layout --- */
     int lw[17], lh[17];
@@ -3677,19 +3787,17 @@ static int ebcot_encode_channel(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, int w
        Instead of per-coefficient ebcot_subband_id() calls, we walk the
        image in (row, segment) order and compute sb_id once per segment
        using k_x/k_y (matching quantize_coeffs' band structure). */
-    int max_val = 0, max_nodc = 0;
-    if (levels == 0) {
-        /* 1x1 image: only final LL subband */
-        int av = abs(coeffs[0]);
-        max_val = av;
-        if (av != 0) sb_has_data[0] = 1;
-    } else {
-        int i = 0;
+    int max_val = abs(coeffs[pw + 1]), max_nodc = 0; /* Handle DC (x=0, y=0): contribute to max_val, not max_nodc. */
+#if SB_SKIP_FLAGS == 0
+    if (max_val != 0) sb_has_data[0] = 1;
+#endif
+    if (levels > 0) {
         for (int sy = 0; sy < h; sy++) {
             /* k_y: first band where sy < lh[k_y] */
             int k_y = 1;
             while (k_y <= levels && sy >= lh[k_y]) k_y++;
 
+            size_t pi = (size_t)(sy+1)*pw + 1;
             int x = 0, k_x = 1;
             while (x < w && k_x <= levels) {
                 int seg_end = lw[k_x];
@@ -3698,11 +3806,12 @@ static int ebcot_encode_channel(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, int w
 
                 int sb_id;
                 if (k_x == 1 && k_y == 1) {
-                    /* 2x2 corner: subband changes within segment */
-                    for (; x < seg_end; x++, i++) {
-                        int av = abs(coeffs[i]);
+                    /* 2x2 corner: subband changes within segment. DC (x=0,y=0) already handled. */
+                    if (sy == 0 && x == 0) { pi++; x++; }
+                    for (; x < seg_end; x++, pi++) {
+                        int av = abs(coeffs[pi]);
                         if (av > max_val) max_val = av;
-                        if (i > 0 && av > max_nodc) max_nodc = av;
+                        if (av > max_nodc) max_nodc = av;
                         if (av != 0) {
                             int sid = ebcot_subband_id(x, sy, lw, lh, levels);
                             sb_has_data[sid] = 1;
@@ -3710,15 +3819,15 @@ static int ebcot_encode_channel(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, int w
                     }
                     k_x++; continue;
                 }
-                if (k_x > k_y)          sb_id = 1 + 3*(k_x-1) + 0;  /* HL */
-                else if (k_y > k_x)     sb_id = 1 + 3*(k_y-1) + 1;  /* LH */
-                else                    sb_id = 1 + 3*(k_x-1) + 2;  /* HH */
+                if (k_x > k_y)       sb_id = 1 + 3*(k_x-1) + 0;  /* HL */
+                else if (k_y > k_x)  sb_id = 1 + 3*(k_y-1) + 1;  /* LH */
+                else                 sb_id = 1 + 3*(k_x-1) + 2;  /* HH */
 
                 int has_nonzero = 0;
-                for (; x < seg_end; x++, i++) {
-                    int av = abs(coeffs[i]);
+                for (; x < seg_end; x++, pi++) {
+                    int av = abs(coeffs[pi]);
                     if (av > max_val) max_val = av;
-                    if (i > 0 && av > max_nodc) max_nodc = av;
+                    if (av > max_nodc) max_nodc = av;
                     if (av != 0) has_nonzero = 1;
                 }
                 if (has_nonzero) sb_has_data[sb_id] = 1;
@@ -3758,7 +3867,6 @@ static int ebcot_encode_channel(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, int w
         }
     }
     if (dc_separate) {
-        coeffs[0] = 0;
         /* Encode DC: 4-bit length + sign (1 bit) + magnitude (0-15 bits), each bit context-trained */
         {
             uint16_t mag = (uint16_t)(dc_val < 0 ? -dc_val : dc_val);
@@ -3795,16 +3903,20 @@ static int ebcot_encode_channel(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, int w
         }
     }
 
-    /* Encode per-subband flags (0=empty, 1=has data) */
+    /* Encode per-subband flags. First SB_SKIP_FLAGS assumed non-empty. */
     {
+        for (int s = 0; s < SB_SKIP_FLAGS && s < num_sb; s++)
+            sb_has_data[s] = 1;
         BacModel flag_m; bacm_init_ctx(&flag_m);
-        for (int s = 0; s < num_sb; s++)
+        for (int s = SB_SKIP_FLAGS; s < num_sb; s++)
             bac_encode(e, sb_has_data[s] ? 1 : 0, &flag_m);
     }
-    /* Precompute per-coefficient skip flag: iterate over empty subbands'
-       rectangular regions instead of per-coefficient ebcot_subband_id calls. */
-    uint8_t *coeff_skip = (uint8_t*)calloc(total, sizeof(uint8_t));
+    /* Precompute per-coefficient skip flag in padded array directly.
+       calloc zeroes everything (not skipped); only mark empty subbands. */
+    size_t padded_total = (size_t)pw * (h+2);
+    uint8_t *coeff_skip = (uint8_t*)calloc(padded_total, sizeof(uint8_t));
     if (!coeff_skip) return -1;
+    if (dc_separate) coeff_skip[pw + 1] = 1;
     for (int s = 0; s < num_sb; s++) {
         if (sb_has_data[s]) continue;
         int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
@@ -3813,146 +3925,112 @@ static int ebcot_encode_channel(BacEnc *e, int16_t * WTPC_RESTRICT coeffs, int w
         } else {
             int k = (s - 1) / 3, t = (s - 1) % 3;
             if (t == 0)      { x0 = lw[k]; x1 = lw[k+1]; y0 = 0;     y1 = lh[k];   }  /* HL */
-            else if (t == 1) { x0 = 0;      x1 = lw[k];   y0 = lh[k]; y1 = lh[k+1]; } /* LH */
+            else if (t == 1) { x0 = 0;     x1 = lw[k];   y0 = lh[k]; y1 = lh[k+1]; }  /* LH */
             else             { x0 = lw[k]; x1 = lw[k+1]; y0 = lh[k]; y1 = lh[k+1]; }  /* HH */
         }
         if (x1 > x0 && y1 > y0) {
             for (int ry = y0; ry < y1; ry++)
-                memset(coeff_skip + (size_t)ry * w + x0, 1, (size_t)(x1 - x0));
+                memset(coeff_skip + (size_t)(ry+1)*pw + x0 + 1, 1, (size_t)(x1 - x0));
         }
     }
 
-    EbcotCtx *ctx = (EbcotCtx*)calloc(total, sizeof(EbcotCtx));
+    EbcotCtx *ctx = (EbcotCtx*)calloc(padded_total, sizeof(EbcotCtx));
     if (!ctx) { free(coeff_skip); return -1; }
 
     /* For each bit-plane (MSB first) */
+    int16_t v;
     for (int b = bp - 1; b >= 0; b--) {
         int bit_mask = 1 << b;
-        /* Top row (border) */
-        int y = 0;
-        for (int x = 0; x < w; x++) {
-            size_t i = (size_t)x;
-            if (!coeff_skip[i]) ebcot_enc_coeff(e, coeffs, y_sign, ctx, models, w, h, x, y, i, coeffs[i], b, bit_mask, 1);
-        }
-        /* Interior rows: split into left border, interior, right border */
-        for (y = 1; y < h - 1; y++) {
-            size_t i = (size_t)y * w;
-            if (!coeff_skip[i]) ebcot_enc_coeff(e, coeffs, y_sign, ctx, models, w, h, 0, y, i, coeffs[i], b, bit_mask, 1);
-            i++;
-            for (int x = 1; x < w - 1; x++, i++) {
-                if (coeff_skip[i]) continue;
-                ebcot_enc_coeff(e, coeffs, y_sign, ctx, models, w, h, x, y, i, coeffs[i], b, bit_mask, 0);
-            }
-            if (!coeff_skip[i]) ebcot_enc_coeff(e, coeffs, y_sign, ctx, models, w, h, w - 1, y, i, coeffs[i], b, bit_mask, 1);
-        }
-        /* Bottom row (border) */
-        if (h > 1) {
-            y = h - 1;
-            for (int x = 0; x < w; x++) {
-                size_t i = (size_t)y * w + x;
-                if (!coeff_skip[i]) ebcot_enc_coeff(e, coeffs, y_sign, ctx, models, w, h, x, y, i, coeffs[i], b, bit_mask, 1);
+        for (int y = 1; y <= h; y++) {
+            size_t i = (size_t)y * pw + 1;
+            size_t parent_row = (size_t)(((y-1)>>1)+1) * pw;
+            for (int x = 1; x <= w; x++, i++) {
+                if (WTPC_UNLIKELY(coeff_skip[i])) continue;
+                int ctx_sig = ctx[i].nsig;
+                if (!ctx[i].sig) {
+                    /* Significance coding: 324 contexts. */
+                    int sctx = ctx_sig;
+                    /* Parent context: inter-scale correlation - coefficient at (x>>1,y>>1) */
+                    /* in the next coarser subband. If parent is already significant, */
+                    /* children are much more likely to become significant. */
+                    size_t pi = parent_row + (((x-1)>>1)+1);
+                    if (ctx[pi].sig) {
+                        if ((unsigned)abs(coeffs[pi]) >> (b + 1)) sctx += 18; /* parent sig + high magnitude */
+                        else sctx += 9; /* parent sig, low magnitude */
+                    }
+                    /* Previous-coefficient zero-run: in flat regions, consecutive coefficients are very likely to all be non-significant. */
+                    if (i > pw + 1) {
+                        size_t prev_i = (x > 1) ? (i - 1) : ((size_t)(y-1) * pw + w);
+                        if (!ctx[prev_i].sig && ctx[prev_i].nsig == 0) sctx += 27;
+                    }
+                    /* Cross-channel: Y significance -> U/V also likely significant. */
+                    if (y_sign && ((unsigned)abs(y_sign[i]) > (unsigned)bit_mask)) sctx += 54;
+                    /* Directional neighbor context: separate horizontal/vertical bias.
+                       In edge regions, neighbors aligned with the edge are more predictive. */
+                    int h_sig = ctx[i-1].sig + ctx[i+1].sig;
+                    int v_sig = ctx[i-pw].sig + ctx[i+pw].sig;
+                    if (h_sig > v_sig) sctx += 108;       /* horizontal-dominant */
+                    else if (v_sig > h_sig) sctx += 216;  /* vertical-dominant */
+                    v = coeffs[i];
+                    int is_sig = (abs(v) & bit_mask) != 0;
+#ifdef WTPC_TUNE_CTX
+                    if (sctx < CTX_SIG) { if (is_sig) g_sig_cnt1[sctx]++; else g_sig_cnt0[sctx]++; }
+#endif
+                    bac_encode(e, is_sig, &models[sctx]);
+                    if (is_sig) {
+                        ctx[i].sig = 1;
+                        /* Bump neighbour counts. */
+                        ctx[i-pw-1].nsig++; ctx[i-pw].nsig++; ctx[i-pw+1].nsig++;
+                        ctx[i-1   ].nsig++;                   ctx[i+1   ].nsig++;
+                        ctx[i+pw-1].nsig++; ctx[i+pw].nsig++; ctx[i+pw+1].nsig++;
+                        /* Sign coding: 5 contexts + cross-channel sign bias. */
+                        int ctx_sgn = 2, sgn_sum = 0;
+                        sgn_sum += ctx[i-pw-1].sig ? (coeffs[i-pw-1] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i-pw  ].sig ? (coeffs[i-pw  ] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i-pw+1].sig ? (coeffs[i-pw+1] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i-1   ].sig ? (coeffs[i-1   ] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i+1   ].sig ? (coeffs[i+1   ] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i+pw-1].sig ? (coeffs[i+pw-1] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i+pw  ].sig ? (coeffs[i+pw  ] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i+pw+1].sig ? (coeffs[i+pw+1] > 0) ? 1 : -1 : 0;
+                        if (sgn_sum < -1) ctx_sgn = 0;
+                        else if (sgn_sum < 0) ctx_sgn = 1;
+                        else if (sgn_sum == 0) ctx_sgn = 2;
+                        else if (sgn_sum <= 1) ctx_sgn = 3;
+                        else ctx_sgn = 4;
+                        if (y_sign && y_sign[i] != 0)
+                            ctx_sgn += 5 + (y_sign[i] > 0 ? 0 : 5);
+                        int sign_bit = (v < 0) ? 0 : 1;
+#ifdef WTPC_TUNE_CTX
+                        if (sign_bit) g_sgn_cnt1[ctx_sgn]++; else g_sgn_cnt0[ctx_sgn]++;
+#endif
+                        bac_encode(e, sign_bit, &models[CTX_SIG + ctx_sgn]);
+                    }
+                } else {
+                    /* Refinement: 14 contexts = 7 neighbor-count levels x first/subsequent. */
+                    /* 'first' is true when the coefficient became significant in plane b+1 */
+                    v = coeffs[i];
+                    int ref_bit = (abs(v) & bit_mask) != 0;
+                    int first = ((unsigned int)abs(v) >> (b + 1)) == 1;
+                    int nb = ctx_sig; if (nb > 6) nb = 6;
+                    int ctx_ref = nb + (first ? 0 : 7);
+#ifdef WTPC_TUNE_CTX
+                    if (ref_bit) g_ref_cnt1[ctx_ref]++; else g_ref_cnt0[ctx_ref]++;
+#endif
+                    bac_encode(e, ref_bit, &models[CTX_SIG + CTX_SGN + ctx_ref]);
+                }
             }
         }
     }
-    free(coeff_skip);
     free(ctx);
-    coeffs[0] = dc_val;  /* restore DC for y_sign in U/V encoding */
+    free(coeff_skip);
     return 0;
 }
 
-/* Decode one channel from a shared BAC decoder. */
-/* coeffs: pre-allocated output (calloc'd), bp: number of bit-planes. */
-/* Decode-side per-coefficient EBCOT step. `border` selects boundary checks,
- * mirroring the encode side so the streams stay bit-identical. */
-static inline void ebcot_dec_coeff(BacDec *d, int16_t * WTPC_RESTRICT coeffs, const int16_t * WTPC_RESTRICT y_sign,
-                                   EbcotCtx *ctx, BacModel *models, int w, int h,
-                                   int x, int y, size_t i, int b, int bit_mask, int border) {
-    int ctx_sig = ctx[i].nsig;
-    /*if (ctx_sig > 8) ctx_sig = 8;*/
-
-    if (!ctx[i].sig) {
-        /* Parent context: inter-scale correlation. */
-        int sctx = ctx_sig;
-        int px = x >> 1, py = y >> 1;
-        if ((border ? (x > 0 || y > 0) : 1) && ctx[py * w + px].sig) {
-            if ((unsigned)abs(coeffs[py * w + px]) >> (b + 1))
-                sctx += 18;  /* parent sig + high magnitude */
-            else
-                sctx += 9;   /* parent sig, low magnitude */
-        }
-        /* Previous-coefficient zero-run. */
-        if (i > 0 && !ctx[i-1].sig && ctx[i-1].nsig == 0)
-            sctx += 27;
-        if (y_sign && ((unsigned)abs(y_sign[i]) > (unsigned)bit_mask)) sctx += 54;
-        /* Directional neighbor context: horizontal/vertical bias. */
-        int h_sig = (border ? (x > 0 && ctx[i-1].sig) : ctx[i-1].sig) +
-                    (border ? (x + 1 < w && ctx[i+1].sig) : ctx[i+1].sig);
-        int v_sig = (border ? (y > 0 && ctx[i-w].sig) : ctx[i-w].sig) +
-                    (border ? (y + 1 < h && ctx[i+w].sig) : ctx[i+w].sig);
-        if (h_sig > v_sig) sctx += 108;
-        else if (v_sig > h_sig) sctx += 216;
-        int is_sig = bac_decode(d, &models[sctx]);
-        if (is_sig) {
-            ctx[i].sig = 1;
-            if (border) {
-                int y0 = y > 0, y1 = y + 1 < h, x0 = x > 0, x1 = x + 1 < w;
-                if (y0) { if (x0) ctx[i-w-1].nsig++; ctx[i-w].nsig++; if (x1) ctx[i-w+1].nsig++; }
-                if (x0) ctx[i-1].nsig++;
-                if (x1) ctx[i+1].nsig++;
-                if (y1) { if (x0) ctx[i+w-1].nsig++; ctx[i+w].nsig++; if (x1) ctx[i+w+1].nsig++; }
-            } else {
-                ctx[i-w-1].nsig++; ctx[i-w].nsig++; ctx[i-w+1].nsig++;
-                ctx[i-1].nsig++;                         ctx[i+1].nsig++;
-                ctx[i+w-1].nsig++; ctx[i+w].nsig++; ctx[i+w+1].nsig++;
-            }
-            int ctx_sgn = 2, sgn_sum = 0;
-            if (border) {
-                for (int dy = -1; dy <= 1; dy++) {
-                    for (int dx = -1; dx <= 1; dx++) {
-                        if (dx == 0 && dy == 0) continue;
-                        int nx = x + dx, ny = y + dy;
-                        if (nx >= 0 && nx < w && ny >= 0 && ny < h && ctx[ny * w + nx].sig)
-                            sgn_sum += (coeffs[ny * w + nx] > 0) ? 1 : -1;
-                    }
-                }
-            } else {
-                sgn_sum += ctx[i-w-1].sig ? (coeffs[i-w-1] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i-w  ].sig ? (coeffs[i-w  ] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i-w+1].sig ? (coeffs[i-w+1] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i-1  ].sig ? (coeffs[i-1  ] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i+1  ].sig ? (coeffs[i+1  ] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i+w-1].sig ? (coeffs[i+w-1] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i+w  ].sig ? (coeffs[i+w  ] > 0) ? 1 : -1 : 0;
-                sgn_sum += ctx[i+w+1].sig ? (coeffs[i+w+1] > 0) ? 1 : -1 : 0;
-            }
-            if (sgn_sum < -1) ctx_sgn = 0;
-            else if (sgn_sum < 0) ctx_sgn = 1;
-            else if (sgn_sum == 0) ctx_sgn = 2;
-            else if (sgn_sum <= 1) ctx_sgn = 3;
-            else ctx_sgn = 4;
-            if (y_sign && y_sign[i] != 0)
-                ctx_sgn += 5 + (y_sign[i] > 0 ? 0 : 5);
-            int sign_pos = bac_decode(d, &models[CTX_SIG + ctx_sgn]);
-            int mag = bit_mask;
-            if (sign_pos) coeffs[i] = mag;
-            else          coeffs[i] = -mag;
-        }
-    } else {
-        /* Refinement: 14 contexts = 7 neighbor-count levels x first/subsequent. */
-        int first = ((unsigned int)abs(coeffs[i]) >> (b + 1)) == 1;
-        int nb = ctx_sig; if (nb > 6) nb = 6;
-        int ctx_ref = nb + (first ? 0 : 7);
-        int ref_bit = bac_decode(d, &models[CTX_SIG + CTX_SGN + ctx_ref]);
-        if (ref_bit) {
-            int av = abs(coeffs[i]);
-            coeffs[i] = (coeffs[i] > 0) ? (int16_t)(av | bit_mask) : (int16_t)(-(av | bit_mask));
-        }
-    }
-}
-
-static int ebcot_decode_channel(BacDec *d, int16_t * WTPC_RESTRICT coeffs, int w, int h, const int16_t * WTPC_RESTRICT y_sign, int quality) {
+static int ebcot_decode_channel(BacDec *d, int16_t * WTPC_RESTRICT coeffs, int w, int h, const int16_t * WTPC_RESTRICT y_sign, int quality, int stride) {
     size_t total = (size_t)w * h;
     if (total == 0) return -1;
+    size_t pw = (size_t)stride;
 
     /* --- DC-separation flag + subband empty detection --- */
     int lw[17], lh[17];
@@ -3987,64 +4065,113 @@ static int ebcot_decode_channel(BacDec *d, int16_t * WTPC_RESTRICT coeffs, int w
         }
     }
     {
+        for (int s = 0; s < SB_SKIP_FLAGS && s < num_sb; s++)
+            sb_has_data[s] = 1;
         BacModel flag_m; bacm_init_ctx(&flag_m);
-        for (int s = 0; s < num_sb; s++)
+        for (int s = SB_SKIP_FLAGS; s < num_sb; s++)
             sb_has_data[s] = (uint8_t)bac_decode(d, &flag_m);
     }
     /* Precompute per-coefficient skip flag: iterate over empty subbands'
        rectangular regions instead of per-coefficient ebcot_subband_id calls. */
-    uint8_t *coeff_skip = (uint8_t*)calloc(total, sizeof(uint8_t));
-    if (!coeff_skip) return -1;
+    size_t padded_total = (size_t)pw * (h+2);
+    uint8_t *skip_pad = (uint8_t*)calloc(padded_total, sizeof(uint8_t));
+    if (!skip_pad) return -1;
+    if (dc_separate) skip_pad[pw + 1] = 1;
     for (int s = 0; s < num_sb; s++) {
         if (sb_has_data[s]) continue;
         int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
-        if (s == 0) { /* final LL */
-            x0 = 0; x1 = lw[0]; y0 = 0; y1 = lh[0];
-        } else {
+        if (s == 0) { x0 = 0; x1 = lw[0]; y0 = 0; y1 = lh[0]; }
+        else {
             int k = (s - 1) / 3, t = (s - 1) % 3;
             if (t == 0)      { x0 = lw[k]; x1 = lw[k+1]; y0 = 0;     y1 = lh[k];   }  /* HL */
-            else if (t == 1) { x0 = 0;      x1 = lw[k];   y0 = lh[k]; y1 = lh[k+1]; }  /* LH */
+            else if (t == 1) { x0 = 0;     x1 = lw[k];   y0 = lh[k]; y1 = lh[k+1]; }  /* LH */
             else             { x0 = lw[k]; x1 = lw[k+1]; y0 = lh[k]; y1 = lh[k+1]; }  /* HH */
         }
         if (x1 > x0 && y1 > y0) {
             for (int ry = y0; ry < y1; ry++)
-                memset(coeff_skip + (size_t)ry * w + x0, 1, (size_t)(x1 - x0));
+                memset(skip_pad + (size_t)(ry+1)*pw + x0 + 1, 1, (size_t)(x1 - x0));
         }
     }
 
-    EbcotCtx *ctx = (EbcotCtx*)calloc((size_t)total, sizeof(EbcotCtx));
-    if (!ctx) { free(coeff_skip); return -1; }
+    EbcotCtx *ctx = (EbcotCtx*)calloc(padded_total, sizeof(EbcotCtx));
+    if (!ctx) { free(skip_pad); return -1; }
 
     for (int b = bp - 1; b >= 0; b--) {
         int bit_mask = 1 << b;
-        /* Top row (border) */
-        int y = 0;
-        for (int x = 0; x < w; x++) {
-            size_t i = (size_t)x;
-            if (!coeff_skip[i]) ebcot_dec_coeff(d, coeffs, y_sign, ctx, models, w, h, x, y, i, b, bit_mask, 1);
-        }
-        /* Interior rows: left border, interior, right border */
-        for (y = 1; y < h - 1; y++) {
-            size_t i = (size_t)y * w;
-            if (!coeff_skip[i]) ebcot_dec_coeff(d, coeffs, y_sign, ctx, models, w, h, 0, y, i, b, bit_mask, 1);
-            i++;
-            for (int x = 1; x < w - 1; x++, i++) {
-                if (coeff_skip[i]) continue;
-                ebcot_dec_coeff(d, coeffs, y_sign, ctx, models, w, h, x, y, i, b, bit_mask, 0);
-            }
-            if (!coeff_skip[i]) ebcot_dec_coeff(d, coeffs, y_sign, ctx, models, w, h, w - 1, y, i, b, bit_mask, 1);
-        }
-        /* Bottom row (border) */
-        if (h > 1) {
-            y = h - 1;
-            for (int x = 0; x < w; x++) {
-                size_t i = (size_t)y * w + x;
-                if (!coeff_skip[i]) ebcot_dec_coeff(d, coeffs, y_sign, ctx, models, w, h, x, y, i, b, bit_mask, 1);
+        for (int y = 1; y <= h; y++) {
+            size_t i = (size_t)y * pw + 1;
+            size_t parent_row = (size_t)(((y-1)>>1)+1) * pw;
+            for (int x = 1; x <= w; x++, i++) {
+                if (WTPC_UNLIKELY(skip_pad[i])) continue;
+                int ctx_sig = ctx[i].nsig;
+                if (!ctx[i].sig) {
+                    /* Significance coding: 324 contexts. */
+                    int sctx = ctx_sig;
+                    /* Parent context: inter-scale correlation. */
+                    size_t pi = parent_row + (((x-1)>>1)+1);
+                    if (ctx[pi].sig) {
+                        /* Parent magnitude: if parent has bits above current plane,
+                           children are even more likely to become significant. */
+                        if ((unsigned)abs(coeffs[pi]) >> (b + 1)) sctx += 18; /* parent sig + high magnitude */
+                        else sctx += 9; /* parent sig, low magnitude */
+                    }
+                    /* Previous-coefficient zero-run */
+                    if (i > pw + 1) {
+                        size_t prev_i = (x > 1) ? (i - 1) : ((size_t)(y-1) * pw + w);
+                        if (!ctx[prev_i].sig && ctx[prev_i].nsig == 0) sctx += 27;
+                    }
+                    /* Cross-channel: Y significance -> U/V also likely significant. */
+                    if (y_sign && ((unsigned)abs(y_sign[i]) > (unsigned)bit_mask)) sctx += 54;
+                    /* Directional neighbor context: horizontal/vertical bias. */
+                    int h_sig = ctx[i-1].sig + ctx[i+1].sig;
+                    int v_sig = ctx[i-pw].sig + ctx[i+pw].sig;
+                    if (h_sig > v_sig) sctx += 108;
+                    else if (v_sig > h_sig) sctx += 216;
+                    int is_sig = bac_decode(d, &models[sctx]);
+                    if (is_sig) {
+                        ctx[i].sig = 1;
+                        /* Bump neighbour counts. */
+                        ctx[i-pw-1].nsig++; ctx[i-pw].nsig++; ctx[i-pw+1].nsig++;
+                        ctx[i-1   ].nsig++;                   ctx[i+1   ].nsig++;
+                        ctx[i+pw-1].nsig++; ctx[i+pw].nsig++; ctx[i+pw+1].nsig++;
+                        /* Sign coding: 5 contexts + cross-channel sign bias. */
+                        int ctx_sgn = 2, sgn_sum = 0;
+                        sgn_sum += ctx[i-pw-1].sig ? (coeffs[i-pw-1] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i-pw  ].sig ? (coeffs[i-pw  ] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i-pw+1].sig ? (coeffs[i-pw+1] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i-1   ].sig ? (coeffs[i-1   ] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i+1   ].sig ? (coeffs[i+1   ] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i+pw-1].sig ? (coeffs[i+pw-1] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i+pw  ].sig ? (coeffs[i+pw  ] > 0) ? 1 : -1 : 0;
+                        sgn_sum += ctx[i+pw+1].sig ? (coeffs[i+pw+1] > 0) ? 1 : -1 : 0;
+                        if (sgn_sum < -1) ctx_sgn = 0;
+                        else if (sgn_sum < 0) ctx_sgn = 1;
+                        else if (sgn_sum == 0) ctx_sgn = 2;
+                        else if (sgn_sum <= 1) ctx_sgn = 3;
+                        else ctx_sgn = 4;
+                        if (y_sign && y_sign[i] != 0)
+                            ctx_sgn += 5 + (y_sign[i] > 0 ? 0 : 5);
+                        int sign_pos = bac_decode(d, &models[CTX_SIG + ctx_sgn]);
+                        int mag = bit_mask;
+                        if (sign_pos) coeffs[i] = mag;
+                        else          coeffs[i] = -mag;
+                    }
+                } else {
+                    /* Refinement: 14 contexts = 7 neighbor-count levels x first/subsequent. */
+                    int first = ((unsigned int)abs(coeffs[i]) >> (b + 1)) == 1;
+                    int nb = ctx_sig; if (nb > 6) nb = 6;
+                    int ctx_ref = nb + (first ? 0 : 7);
+                    int ref_bit = bac_decode(d, &models[CTX_SIG + CTX_SGN + ctx_ref]);
+                    if (ref_bit) {
+                        int av = abs(coeffs[i]);
+                        coeffs[i] = (coeffs[i] > 0) ? (int16_t)(av | bit_mask) : (int16_t)(-(av | bit_mask));
+                    }
+                }
             }
         }
     }
-    if (dc_separate) coeffs[0] = dc_val;
-    free(coeff_skip);
+    if (dc_separate) coeffs[pw + 1] = dc_val;
+    free(skip_pad);
     free(ctx);
     return 0;
 }
@@ -4053,14 +4180,14 @@ static int ebcot_decode_channel(BacDec *d, int16_t * WTPC_RESTRICT coeffs, int w
 /*  WTP header helpers (shared between EBCOT and Huffman paths) */
 /* ===================================================================== */
 
-static int wtp_header_size(int w, int h, int quality, int huf_extra_ctx) {
-    int qsz = (quality <= 768 || huf_extra_ctx) ? 2 : 1;
+static int wtp_header_size(int w, int h, int quality, int huf_extra_ctx, int block_mode) {
+    int qsz = (quality <= 768 || huf_extra_ctx || block_mode) ? 2 : 1;
     int wide = (w > 256 || h > 256);
     return 4 + 1 + 1 + qsz + (wide ? 2 : 0);
 }
 
-static int write_wtp_header(uint8_t *out, int pos, uint8_t flags, int w, int h, int quality, int huf_extra_ctx, int chroma_420, int has_alpha, int alpha_one) {
-    int extra_data = quality <= 768 || huf_extra_ctx; /* part of q and/or huf_extra_ctx flag */
+static int write_wtp_header(uint8_t *out, int pos, uint8_t flags, int w, int h, int quality, int huf_extra_ctx, int chroma_420, int has_alpha, int alpha_one, int block_mode) {
+    int extra_data = quality <= 768 || huf_extra_ctx || block_mode; /* part of q and/or huf_extra_ctx flag */
     int wide = (w > 256 || h > 256);
     if (chroma_420)  flags |= 1 << 0;
     if (extra_data)  flags |= 1 << 2;
@@ -4073,7 +4200,7 @@ static int write_wtp_header(uint8_t *out, int pos, uint8_t flags, int w, int h, 
     /* Quality encoding: 769..1024 stored as 1 byte (q-769), saving 1B in ultra-low range.
        Lower quality or huf_extra_ctx: stored as 16-bit with huf_extra_ctx in bit 15. */
     if (extra_data) {
-        put_u16(out + pos, (uint16_t)(quality - 1) | (!!huf_extra_ctx << 15)); pos += 2;
+        put_u16(out + pos, (uint16_t)(quality - 1) | (block_mode << 10) | (!!huf_extra_ctx << 15)); pos += 2;
     } else {
         out[pos++] = (uint8_t)(quality - 769);
     }
@@ -4085,31 +4212,85 @@ static int write_wtp_header(uint8_t *out, int pos, uint8_t flags, int w, int h, 
 /*  Top-level EBCOT encode/decode (all 3 channels) */
 /* ===================================================================== */
 
-/* EBCOT encode from already-quantized coefficients -> malloc'd WTP buffer */
-static uint8_t *ebcot_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int16_t *q_a, wtpc_enc_info *info,
-                            int w, int h, int cw, int ch,
-                            int quality, int chroma_420, int alpha_one, int *out_size) {
-    /* Worst case: 3 channels x (non-420) x 16 bits/coeff x 3 bytes margin */
-    /*             = total coeffs x 48 bits -> 6 bytes/coeff. total*8 for safety. */
-    size_t buf_sz = (size_t)w * h * 8 + 4096;
+/* EBCOT encode from already-quantized AND padded coefficients -> malloc'd WTP buffer. */
+static uint8_t *ebcot_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int16_t *q_a, wtpc_enc_info *info, int w, int h, int cw, int ch,
+                            int quality, int chroma_420, int alpha_one, int *out_size, int bm) {
+    size_t total = (size_t)w * h;
     int has_alpha = (q_a != NULL) && !alpha_one;
-    int hdr_sz = wtp_header_size(w, h, quality, 0);  /* bp in BAC stream */
+    int hdr_sz = wtp_header_size(w, h, quality, 0, bm);
+    /* Source stride for block sub-views (padded arrays have +2 stride) */
+    int y_ss = w+2, c_ss = cw+2;
+
+    if (bm > 0) {
+        /* === Precinct mode: split coeffs into spatial blocks === */
+        int blk_sz = 16 << bm;
+        int blocks_x = (w + blk_sz - 1) / blk_sz, blocks_y = (h + blk_sz - 1) / blk_sz;
+        int cblocks_x = (cw + blk_sz - 1) / blk_sz, cblocks_y = (ch + blk_sz - 1) / blk_sz;
+        int y_blocks = blocks_x * blocks_y, c_blocks = cblocks_x * cblocks_y;
+        int a_blocks = has_alpha ? y_blocks : 0;
+        int total_blocks = y_blocks + c_blocks * 2 + a_blocks;
+        int idx_sz = total_blocks * 2;
+
+        size_t buf_sz = (size_t)hdr_sz + idx_sz + total * 6 + 4096;
+        uint8_t *out = (uint8_t*)malloc(buf_sz);
+        if (!out) return NULL;
+        uint8_t flags = 1 << 1;
+        write_wtp_header(out, 0, flags, w, h, quality, 0, chroma_420, has_alpha, alpha_one, bm);
+        int idx_pos = hdr_sz, data_start = hdr_sz + idx_sz;
+
+        BacEnc e;
+        bac_init_enc(&e, out + data_start, (int)(buf_sz - data_start));
+
+        #define ENC(q, fw, fh, bx, by, _ss) do { \
+            for (int _by = 0; _by < (by); _by++) { \
+                for (int _bx = 0; _bx < (bx); _bx++) { \
+                    int x0 = _bx * blk_sz, y0 = _by * blk_sz; \
+                    int pw = (x0 + blk_sz <= (fw)) ? blk_sz : (fw) - x0; \
+                    int ph = (y0 + blk_sz <= (fh)) ? blk_sz : (fh) - y0; \
+                    /* sub-view into already-padded big array: borders = adjacent block data */ \
+                    int16_t *qp = (q) + (size_t)(y0) * (_ss) + x0; \
+                    int prev = (int)e.pos; \
+                    if (ebcot_encode_channel(&e, qp, pw, ph, NULL, quality, _ss) < 0) \
+                        { free(out); return NULL; } \
+                    put_u16(out + idx_pos, (uint16_t)((int)e.pos - prev)); \
+                    idx_pos += 2; \
+                } \
+            } \
+        } while(0)
+        ENC(q_y, w, h, blocks_x, blocks_y, y_ss);
+        ENC(q_u, cw, ch, cblocks_x, cblocks_y, c_ss);
+        ENC(q_v, cw, ch, cblocks_x, cblocks_y, c_ss);
+        if (has_alpha) ENC(q_a, w, h, blocks_x, blocks_y, y_ss);
+        #undef ENC
+
+        int data_len = bac_flush_enc(&e);
+        int total_len = data_start + data_len;
+        if (out_size) *out_size = total_len;
+        if (info) {
+            info->ebcot = 1; info->encoded_bytes = total_len; info->result_q = quality;
+            info->alpha_one = alpha_one;
+        }
+        return out;
+    }
+
+    /* === Full-image mode === */
+    size_t buf_sz = total * 8 + 4096;
     uint8_t *out = (uint8_t*)malloc(hdr_sz + buf_sz);
     if (!out) return NULL;
 
     BacEnc e;
     bac_init_enc(&e, out + hdr_sz, buf_sz);
 
-    int ok_y = ebcot_encode_channel(&e, q_y, w, h, NULL, quality);
-    int ok_u = ebcot_encode_channel(&e, q_u, cw, ch, chroma_420 ? NULL : q_y, quality);
-    int ok_v = ebcot_encode_channel(&e, q_v, cw, ch, chroma_420 ? NULL : q_y, quality);
+    int ok_y = ebcot_encode_channel(&e, q_y, w, h, NULL, quality, w+2);
+    int ok_u = ebcot_encode_channel(&e, q_u, cw, ch, chroma_420 ? NULL : q_y, quality, cw+2);
+    int ok_v = ebcot_encode_channel(&e, q_v, cw, ch, chroma_420 ? NULL : q_y, quality, cw+2);
     int ok_a = 0;
-    if (has_alpha) ok_a = ebcot_encode_channel(&e, q_a, w, h, NULL, quality);
+    if (has_alpha) ok_a = ebcot_encode_channel(&e, q_a, w, h, NULL, quality, w+2);
     if (ok_y || ok_u || ok_v || (has_alpha && ok_a)) { free(out); return NULL; }
     int data_sz = bac_flush_enc(&e);
 
     uint8_t flags = 1 << 1;  /* is_ebcot = 1 */
-    write_wtp_header(out, 0, flags, w, h, quality, 0, chroma_420, has_alpha, alpha_one);
+    write_wtp_header(out, 0, flags, w, h, quality, 0, chroma_420, has_alpha, alpha_one, 0);
 
     if (out_size) *out_size = hdr_sz + data_sz;
     if (info) {
@@ -4119,28 +4300,64 @@ static uint8_t *ebcot_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int16_t *q_
     return out;
 }
 
-static uint8_t *ebcot_decode_mem(const uint8_t *data, int data_len, int pos, int w, int h, int quality, int is_420, int alpha, int alpha_one) {
+static uint8_t *ebcot_decode_mem(const uint8_t *data, int data_len, int pos, int w, int h, int quality, int is_420, int alpha, int alpha_one, int block_mode) {
     size_t total = (size_t)w * h;
     int cw = is_420 ? (w+1)/2 : w, ch = is_420 ? (h+1)/2 : h;
     size_t ctotal = (size_t)cw * ch;
 
-    /* Allocate coefficient arrays */
-    int16_t *q_y = calloc(total, sizeof(int16_t));
-    int16_t *q_u = calloc(ctotal, sizeof(int16_t));
-    int16_t *q_v = calloc(ctotal, sizeof(int16_t));
+    int16_t *q_y = (int16_t*)calloc((size_t)(w+2)*(h+2), sizeof(int16_t));
+    int16_t *q_u = (int16_t*)calloc((size_t)(cw+2)*(ch+2), sizeof(int16_t));
+    int16_t *q_v = (int16_t*)calloc((size_t)(cw+2)*(ch+2), sizeof(int16_t));
     int16_t *q_a = NULL;
-    if (alpha || alpha_one) q_a = calloc(total, sizeof(int16_t));
+    if (alpha || alpha_one) q_a = (int16_t*)calloc((size_t)(w+2)*(h+2), sizeof(int16_t));
     if (!q_y || !q_u || !q_v || ((alpha || alpha_one) && !q_a)) { free(q_y); free(q_u); free(q_v); free(q_a); return NULL; }
 
-    /* One shared BAC decoder for all channels */
-    BacDec d;
-    bac_init_dec(&d, data + pos, data_len - pos);
+    if (block_mode > 0) {
+        /* === Precinct mode: decode per-block, assemble full coeff array === */
+        int blk_sz = 16 << block_mode;
+        int blocks_x = (w + blk_sz - 1) / blk_sz, blocks_y = (h + blk_sz - 1) / blk_sz;
+        int cblocks_x = (cw + blk_sz - 1) / blk_sz, cblocks_y = (ch + blk_sz - 1) / blk_sz;
+        int y_blocks = blocks_x * blocks_y, c_blocks = cblocks_x * cblocks_y;
+        int a_blocks = (alpha && !alpha_one) ? y_blocks : 0;
+        int total_blocks = y_blocks + c_blocks * 2 + a_blocks;
 
-    if (ebcot_decode_channel(&d, q_y, w, h, NULL, quality) ||
-        ebcot_decode_channel(&d, q_u, cw, ch, is_420 ? NULL : q_y, quality) ||
-        ebcot_decode_channel(&d, q_v, cw, ch, is_420 ? NULL : q_y, quality) ||
-        (alpha && !alpha_one && ebcot_decode_channel(&d, q_a, w, h, NULL, quality))) {
-        free(q_y); free(q_u); free(q_v); free(q_a); return NULL;
+        /* Skip index area */
+        if (pos + total_blocks * 2 > data_len) { free(q_y); free(q_u); free(q_v); free(q_a); return NULL; }
+        pos += total_blocks * 2;
+
+        BacDec d;
+        bac_init_dec(&d, data + pos, data_len - pos);
+
+        #define DEC(q, fw, fh, bx, by, _ps) do { \
+            for (int _by = 0; _by < (by); _by++) { \
+                for (int _bx = 0; _bx < (bx); _bx++) { \
+                    int x0 = _bx * blk_sz, y0 = _by * blk_sz; \
+                    int pw = (x0 + blk_sz <= (fw)) ? blk_sz : (fw) - x0; \
+                    int ph = (y0 + blk_sz <= (fh)) ? blk_sz : (fh) - y0; \
+                    /* Sub-view: pointer to top-left border of block in big padded array. */ \
+                    int16_t *qp = (q) + (size_t)(y0) * (_ps) + x0; \
+                    if (ebcot_decode_channel(&d, qp, pw, ph, NULL, quality, _ps) < 0) \
+                        { free(q_y); free(q_u); free(q_v); free(q_a); return NULL; } \
+                } \
+            } \
+        } while(0)
+
+        DEC(q_y, w, h, blocks_x, blocks_y, w+2);
+        DEC(q_u, cw, ch, cblocks_x, cblocks_y, cw+2);
+        DEC(q_v, cw, ch, cblocks_x, cblocks_y, cw+2);
+        if (alpha && !alpha_one) DEC(q_a, w, h, blocks_x, blocks_y, w+2);
+        #undef DEC
+    } else {
+        /* === Full-image mode (original path) === */
+        BacDec d;
+        bac_init_dec(&d, data + pos, data_len - pos);
+
+        if (ebcot_decode_channel(&d, q_y, w, h, NULL, quality, w+2) ||
+            ebcot_decode_channel(&d, q_u, cw, ch, is_420 ? NULL : q_y, quality, cw+2) ||
+            ebcot_decode_channel(&d, q_v, cw, ch, is_420 ? NULL : q_y, quality, cw+2) ||
+            (alpha && !alpha_one && ebcot_decode_channel(&d, q_a, w, h, NULL, quality, w+2))) {
+            free(q_y); free(q_u); free(q_v); free(q_a); return NULL;
+        }
     }
     /* if alpha_one: q_a is all zero, no decode needed */
 
@@ -4149,10 +4366,10 @@ static uint8_t *ebcot_decode_mem(const uint8_t *data, int data_len, int pos, int
     float *u_s = (float*)malloc(ctotal * sizeof(float));
     float *v_s = (float*)malloc(ctotal * sizeof(float));
     float *a_f = (alpha || alpha_one) ? (float*)malloc(total * sizeof(float)) : NULL;
-    dequantize_channel(q_y, y_f, w, h, compute_base(quality), g_quant_y);
-    dequantize_channel(q_u, u_s, cw, ch, compute_base(quality), is_420 ? g_quant_c420 : g_quant_c);
-    dequantize_channel(q_v, v_s, cw, ch, compute_base(quality), is_420 ? g_quant_c420 : g_quant_c);
-    if (alpha && !alpha_one) dequantize_channel(q_a, a_f, w, h, compute_base(quality), g_quant_y);
+    dequantize_channel(q_y, y_f, w, h, compute_base(quality), g_qt_y);
+    dequantize_channel(q_u, u_s, cw, ch, compute_base(quality), is_420 ? g_qt_c420 : g_qt_c);
+    dequantize_channel(q_v, v_s, cw, ch, compute_base(quality), is_420 ? g_qt_c420 : g_qt_c);
+    if (alpha && !alpha_one) dequantize_channel(q_a, a_f, w, h, compute_base(quality), g_qt_y);
     else if (alpha_one) { for (size_t i = 0; i < total; i++) a_f[i] = 127.0f; } /* == encode of opaque 255: 255-128 */
     free(q_y); free(q_u); free(q_v); free(q_a);
 
@@ -4186,9 +4403,9 @@ static uint8_t *ebcot_decode_mem(const uint8_t *data, int data_len, int pos, int
 static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int16_t *q_a, wtpc_enc_info *info,
                                     int w, int h, int cw, int ch,
                                     int quality, int chroma_420, int huf_extra_ctx, int alpha_one, int *out_size) {
-    size_t total = (size_t)w * h, ctotal = (size_t)cw * ch;
+    size_t total = (size_t)w * h;
     int has_alpha = (q_a != NULL) && !alpha_one;
-    int hdr_sz = wtp_header_size(w, h, quality, huf_extra_ctx) + 1 + (huf_extra_ctx ? 1 : 0);  /* +1=tables, +1=extra_tables */
+    int hdr_sz = wtp_header_size(w, h, quality, huf_extra_ctx, 0) + 1 + (huf_extra_ctx ? 1 : 0);  /* +1=tables, +1=extra_tables */
     unsigned char *out = (unsigned char*)malloc(total * 4 * 3 + 4096);
     if (!out) return NULL;
 
@@ -4218,10 +4435,10 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
         pick_best_tables_ctx(f0, f1, 0, &t_y0, &t_y1, cl0, hc0, cl1, hc1, NULL, chroma_420);
         put_bits(&bs, (t_y1 >> 2) & 1, 1);  /* t1_y hi bit as first bit in bitstream */
     } else {
-        count_freq(q_y, total, freq);
+        count_freq(q_y, w, h, freq);
         if (has_alpha) {
             int fa[NUM_HUFF_SYMBOLS];
-            count_freq(q_a, total, fa);
+            count_freq(q_a, w, h, fa);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq[s] += fa[s];
         }
         t_y0 = pick_best_table(freq, 0, cl0, hc0, NULL, chroma_420);
@@ -4243,7 +4460,7 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
         count_freq_ctx(q_u, cw, ch, f0, f1);
         pick_best_tables_ctx(f0, f1, 1, &t_u0, &t_u1, cl0, hc0, cl1, hc1, NULL, chroma_420);
     } else {
-        count_freq(q_u, ctotal, freq);
+        count_freq(q_u, cw, ch, freq);
         t_u0 = pick_best_table(freq, 1, cl0, hc0, NULL, chroma_420);
     }
     if (t_u0 == NUM_DEF_TABLES) t_u_size += write_huffman_table(&bs, cl0, NUM_HUFF_SYMBOLS);
@@ -4275,7 +4492,7 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
         }
     } else {
         int bv;
-        count_freq(q_v, ctotal, freq);
+        count_freq(q_v, cw, ch, freq);
         t_v0 = pick_best_table(freq, 2, cl0, hc0, &bv, chroma_420);
         int ok = 1;
         for (int i = 0; i < NUM_HUFF_SYMBOLS; i++)
@@ -4299,7 +4516,7 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
     uint8_t flags = 0;
     if (shared_v)       flags |= 1 << 6;
     flags |= ((t_v0 >> 2) & 1) << 7;  /* t0_v 3rd bit in flags */
-    int pos = write_wtp_header(out, 0, flags, w, h, quality, huf_extra_ctx, chroma_420, has_alpha, alpha_one);
+    int pos = write_wtp_header(out, 0, flags, w, h, quality, huf_extra_ctx, chroma_420, has_alpha, alpha_one, 0);
     /* tables byte: t0_y (3b), t0_u (3b), t0_v bits 0-1 (2b), t0_v bit 2 in flags */
     out[pos++] = (uint8_t)((t_y0 & 7) | ((t_u0 & 7) << 3) | ((t_v0 & 3) << 6));
     if (huf_extra_ctx)
@@ -4322,29 +4539,28 @@ static unsigned char *huffman_pack(int16_t *q_y, int16_t *q_u, int16_t *q_v, int
 #else
 #define WTPC_RC_TRACE(tq, sz) ((void)0)
 #endif
-static unsigned char *find_quality_for_target(const float *y_w, const float *u_w, const float *v_w, const float *a_w, wtpc_enc_info *info, int w, int h, int cw, int ch, int target_bytes, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int alpha_one) {
-    size_t total = (size_t)w * h, ctotal = (size_t)cw * ch;
-    int16_t *q_y = malloc(total * sizeof(int16_t));
-    int16_t *q_u = malloc(ctotal * sizeof(int16_t));
-    int16_t *q_v = malloc(ctotal * sizeof(int16_t));
-    int16_t *q_a = has_alpha ? malloc(total * sizeof(int16_t)) : NULL;
+static unsigned char *find_quality_for_target(const float *y_w, const float *u_w, const float *v_w, const float *a_w, wtpc_enc_info *info, int w, int h, int cw, int ch, int target_bytes, int chroma_420, int encode_mode, int huf_extra_ctx, int has_alpha, int alpha_one, int bm) {
+    int16_t *q_y = (int16_t*)malloc((size_t)(w+2)*(h+2) * sizeof(int16_t));
+    int16_t *q_u = (int16_t*)malloc((size_t)(cw+2)*(ch+2) * sizeof(int16_t));
+    int16_t *q_v = (int16_t*)malloc((size_t)(cw+2)*(ch+2) * sizeof(int16_t));
+    int16_t *q_a = has_alpha ? (int16_t*)malloc((size_t)(w+2)*(h+2) * sizeof(int16_t)) : NULL;
     if (!q_y || !q_u || !q_v || (has_alpha && !q_a)) {
         free(q_y); free(q_u); free(q_v); free(q_a);
         return 0;
     }
 
     #define PROBE(qv, out_d, out_i, out_sz) do { \
-        quantize_coeffs(y_w, q_y, w, h, compute_base(qv), g_quant_y); \
-        quantize_coeffs(u_w, q_u, cw, ch, compute_base(qv), (chroma_420) ? g_quant_c420 : g_quant_c); \
-        quantize_coeffs(v_w, q_v, cw, ch, compute_base(qv), (chroma_420) ? g_quant_c420 : g_quant_c); \
-        if (has_alpha) quantize_coeffs(a_w, q_a, w, h, compute_base(qv), g_quant_y); \
-        if (huffman_mode == 2) { \
-            *(out_d) = ebcot_pack(q_y, q_u, q_v, q_a, out_i, w, h, cw, ch, qv, chroma_420, alpha_one, out_sz); \
-        } else if (huffman_mode == 1) { \
+        quantize_coeffs(y_w, q_y, w, h, compute_base(qv), g_qt_y); \
+        quantize_coeffs(u_w, q_u, cw, ch, compute_base(qv), (chroma_420) ? g_qt_c420 : g_qt_c); \
+        quantize_coeffs(v_w, q_v, cw, ch, compute_base(qv), (chroma_420) ? g_qt_c420 : g_qt_c); \
+        if (has_alpha) quantize_coeffs(a_w, q_a, w, h, compute_base(qv), g_qt_y); \
+        if (encode_mode == WTPC_ENC_EBCOT) { \
+            *(out_d) = ebcot_pack(q_y, q_u, q_v, q_a, out_i, w, h, cw, ch, qv, chroma_420, alpha_one, out_sz, bm); \
+        } else if (encode_mode == WTPC_ENC_HUFFMAN) { \
             *(out_d) = huffman_pack(q_y, q_u, q_v, q_a, out_i, w, h, cw, ch, qv, chroma_420, huf_extra_ctx, alpha_one, out_sz); \
         } else { \
             int _es, _hs; wtpc_enc_info _ei={0}, _hi={0}; \
-            unsigned char *_e = ebcot_pack(q_y, q_u, q_v, q_a, &_ei, w, h, cw, ch, qv, chroma_420, alpha_one, &_es); \
+            unsigned char *_e = ebcot_pack(q_y, q_u, q_v, q_a, &_ei, w, h, cw, ch, qv, chroma_420, alpha_one, &_es, bm); \
             if (!_e) goto exit_error; \
             unsigned char *_h = huffman_pack(q_y, q_u, q_v, q_a, &_hi, w, h, cw, ch, qv, chroma_420, huf_extra_ctx, alpha_one, &_hs); \
             if (!_h) { free(_e); goto exit_error; } \
@@ -4380,18 +4596,17 @@ static unsigned char *find_quality_for_target(const float *y_w, const float *u_w
     /* [coder][is_420]. Coder rows: 0=EBCOT, 1=Huffman single-table, 2=Huffman       */
     /* context-aware (huf_extra_ctx / -h 1). Context-aware tables compress a bit     */
     /* better than the single table, so they hit a given size at a slightly lower q  */
-    /* (a few q, growing with rate), which is worth its own row. huffman_mode: 2 or  */
-    /* 0 = ebcot/auto (auto picks the smaller of ebcot/huffman, so its size tracks   */
-    /* ebcot); 1 = huffman (row chosen by huf_extra_ctx). */
+    /* (a few q, growing with rate), which is worth its own row.                     */
+    /* WTPC_ENC_EBCOT/AUTO share the same fit; WTPC_ENC_HUFFMAN has its own. */
     static const float qfit[3][2][3] = {
-        /* EBCOT        */ { {  -0.07374f,  -0.06244f,   8.57406f },   /* 4:4:4 */
-                            {  -0.08756f,   0.13097f,   7.91482f } },  /* 4:2:0 */
-        /* Huffman 1tbl */ { {  -0.07300f,  -0.01618f,   8.35845f },   /* 4:4:4 */
-                            {  -0.08697f,   0.17780f,   7.69720f } },  /* 4:2:0 */
-        /* Huffman ctx  */ { {  -0.07339f,  -0.01866f,   8.39091f },   /* 4:4:4 */
-                            {  -0.08754f,   0.17766f,   7.72234f } },  /* 4:2:0 */
+        /* EBCOT        */ { {  -0.06980f,  -0.15287f,   9.04137f },   /* 4:4:4 */
+                            {  -0.08378f,   0.04003f,   8.39397f } },  /* 4:2:0 */
+        /* Huffman 1tbl */ { {  -0.07225f,  -0.06239f,   8.68884f },   /* 4:4:4 */
+                            {  -0.08555f,   0.11977f,   8.07513f } },  /* 4:2:0 */
+        /* Huffman ctx  */ { {  -0.07235f,  -0.07008f,   8.74213f },   /* 4:4:4 */
+                            {  -0.08585f,   0.11471f,   8.11993f } },  /* 4:2:0 */
     };
-    int coder = (huffman_mode == 1) ? (huf_extra_ctx ? 2 : 1) : 0;
+    int coder = (encode_mode == WTPC_ENC_HUFFMAN) ? (huf_extra_ctx ? 2 : 1) : 0;
     const float *fc = qfit[coder][chroma_420 ? 1 : 0];
     /* ln(base) = c2*lt^2 + c1*lt + c0,  lt = ln(target_n) */
     float lt = logf(target_n);
@@ -4589,7 +4804,247 @@ exit_error:
     return NULL;
 }
 
-unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride) {
+uint8_t *wtpc_hash_encode_mem(const uint8_t *rgb, int w, int h, int *out_len) {
+    if (w < 1 || w > 256 || h < 1 || h > 256) return NULL;
+
+    int max_wh = w > h ? w : h;
+    /* Wavelet levels: target LL = 1<<(level-1). level=4 -> ~8xN, level=5 -> ~4xN */
+    int level = 4;  /* quality: 1..max, higher = more compression */
+    int target = 1 << (level - 1);
+    int ctarget = 1 << (level - 2); if (ctarget < 1) ctarget = 1;  /* chroma one level deeper */
+    int y_llw = w, y_llh = h;
+    while ((y_llw > target || y_llh > target) && (y_llw > 1 || y_llh > 1))
+        { y_llw = (y_llw+1)/2; y_llh = (y_llh+1)/2; }
+    int c_llw = w, c_llh = h;
+    while ((c_llw > ctarget || c_llh > ctarget) && (c_llw > 1 || c_llh > 1))
+        { c_llw = (c_llw+1)/2; c_llh = (c_llh+1)/2; }
+
+    /* Full rectangular AC counts */
+    int y_ac = y_llw * y_llh - 1, c_ac = c_llw * c_llh - 1;
+
+    /* Bit allocation: DC 5b, scale 5b, Y-AC 4b, C-AC 3b */
+    #define DC_BITS   5
+    #define SC_BITS   5
+    #define AC_Y_BITS 4
+    #define AC_C_BITS 3
+    int hdr_bits = 3*DC_BITS + 2*SC_BITS;
+    int total_bits = hdr_bits + y_ac*AC_Y_BITS + 2*c_ac*AC_C_BITS;
+    int total_bytes = 2 + (total_bits + 7) / 8;
+
+    /* Convert RGB->YUV */
+    int total = w * h;
+    float *Y = (float*)malloc((size_t)total * sizeof(float));
+    float *U = (float*)malloc((size_t)total * sizeof(float));
+    float *V = (float*)malloc((size_t)total * sizeof(float));
+    uint8_t *hash = (uint8_t*)malloc((size_t)total_bytes);
+    if (!Y || !U || !V || !hash) { free(Y); free(U); free(V); free(hash); return NULL; }
+    memset(hash, 0, (size_t)total_bytes);
+    for (int i = 0; i < total; i++) {
+        float fy, fu, fv;
+        rgb_to_yuv(rgb[i*3], rgb[i*3+1], rgb[i*3+2], &fy, &fu, &fv);
+        Y[i] = fy; U[i] = fu; V[i] = fv;
+    }
+
+    /* Full wavelet decomposition */
+    cdf97_forward_2d(Y, w, h);
+    cdf97_forward_2d(U, w, h);
+    cdf97_forward_2d(V, w, h);
+
+    /* DC gain */
+    int actual_levels = 0, tmp_m = max_wh;
+    while (tmp_m > 1) { tmp_m = (tmp_m + 1) / 2; actual_levels++; }
+    float g1d = 1.0f + 2.0f*CDF97_B*(1.0f + 2.0f*CDF97_A)
+              + 2.0f*CDF97_D*((1.0f + 2.0f*CDF97_A)
+              + 2.0f*CDF97_G*(1.0f + 2.0f*CDF97_B*(1.0f + 2.0f*CDF97_A)));
+    float dc_gain = 1.0f; for (int _gl = 0; _gl < 2 * actual_levels; _gl++) dc_gain *= g1d;
+
+    /* PUT_BITS: everything bit-packed after the 2-byte w,h header */
+    hash[0] = (uint8_t)(w - 1);
+    hash[1] = (uint8_t)(h - 1);
+    int bit_pos = 0;
+    #define PUT_BITS(val, n) do { \
+        for (int _b = (n)-1; _b >= 0; _b--) { \
+            int _bit = ((val) >> _b) & 1; \
+            int _byte_idx = 2 + bit_pos / 8; \
+            int _bit_idx  = 7 - (bit_pos % 8); \
+            if (_bit) hash[_byte_idx] |= (uint8_t)(1u << _bit_idx); \
+            bit_pos++; \
+        } \
+    } while(0)
+
+    /* Compute and write DCs + scales */
+    int dc_y = 0, dc_u = 0, dc_v = 0, sc_y = 0, sc_uv = 0;
+    float uv_scale_max = 0.0f;
+    int ch_llw[3] = { y_llw, c_llw, c_llw };
+    int ch_llh[3] = { y_llh, c_llh, c_llh };
+    for (int ch = 0; ch < 3; ch++) {
+        float *chan = (ch == 0) ? Y : (ch == 1) ? U : V;
+        int    ll_w = ch_llw[ch], ll_h = ch_llh[ch];
+        int    budget = (ch == 0) ? y_ac : c_ac;
+        /* DC: 5-bit (>>3, step 8) */
+        int y_val = (int)(chan[0] / dc_gain + 128.0f + 0.5f);
+        if (y_val < 0) y_val = 0;
+        if (y_val > 255) y_val = 255;
+        int dc_q = y_val >> 3;
+        if (ch == 0) dc_y = dc_q; else if (ch == 1) dc_u = dc_q; else dc_v = dc_q;
+        /* Scale: max AC magnitude */
+        float scale = 0.0f;
+        for (int iy = 0, cnt = 0; iy < ll_h && cnt < budget; iy++) {
+            for (int ix = 0; ix < ll_w && cnt < budget; ix++) {
+                if (iy == 0 && ix == 0) continue;
+                cnt++;
+                float av = fabsf(chan[iy * w + ix] / dc_gain);
+                if (av > scale) scale = av;
+            }
+        }
+        int sc_max = (1<<SC_BITS)-1;
+        int scale_q = (int)(scale * ((float)sc_max / 128.0f) + 0.5f);
+        if (scale_q < 0) scale_q = 0;
+        if (scale_q > sc_max) scale_q = sc_max;
+        if (ch == 0) sc_y = scale_q;
+        else { if (scale > uv_scale_max) uv_scale_max = scale; }
+    }
+    int sc_max = (1<<SC_BITS)-1;
+    int sc_uv_q = (int)(uv_scale_max * ((float)sc_max / 128.0f) + 0.5f);
+    if (sc_uv_q < 0) sc_uv_q = 0;
+    if (sc_uv_q > sc_max) sc_uv_q = sc_max;
+    sc_uv = sc_uv_q;
+
+    PUT_BITS(dc_y, DC_BITS);
+    PUT_BITS(dc_u, DC_BITS);
+    PUT_BITS(dc_v, DC_BITS);
+    PUT_BITS(sc_y, SC_BITS);
+    PUT_BITS(sc_uv, SC_BITS);
+
+    /* Write ACs */
+    float scf = (128.0f / (float)((1<<SC_BITS)-1));
+    float sc_y_v  = (sc_y  * scf) * dc_gain;
+    float sc_uv_v = (sc_uv * scf) * dc_gain;
+    for (int ch = 0; ch < 3; ch++) {
+        float *chan = (ch == 0) ? Y : (ch == 1) ? U : V;
+        int    ll_w = ch_llw[ch], ll_h = ch_llh[ch];
+        int    budget = (ch == 0) ? y_ac : c_ac;
+        float  scale_dec = (ch == 0) ? sc_y_v : sc_uv_v;
+        int    ac_bits = (ch == 0) ? AC_Y_BITS : AC_C_BITS;
+        int    qmax = (1 << ac_bits) - 1;
+        float  bias = (float)((1 << (ac_bits-1)) - 0.5f);  /* 3.5 for 3-bit, 7.5 for 4-bit */
+        for (int iy = 0, cnt = 0; iy < ll_h && cnt < budget; iy++) {
+            for (int ix = 0; ix < ll_w && cnt < budget; ix++) {
+                if (iy == 0 && ix == 0) continue;
+                cnt++;
+                float norm = (scale_dec > 0.0001f) ? (chan[iy * w + ix] / scale_dec) : 0.0f;
+                int q = (int)(bias + bias * norm + 0.5f);
+                if (q < 0) q = 0; else if (q > qmax) q = qmax;
+                PUT_BITS(q, ac_bits);
+            }
+        }
+    }
+    #undef PUT_BITS
+    free(Y); free(U); free(V);
+    *out_len = total_bytes;
+    return hash;
+}
+
+uint8_t *wtpc_hash_decode_mem(const uint8_t *hash, int hash_len, int *w, int *h) {
+    if (hash_len < 2) return NULL;
+    int enc_w = (int)hash[0] + 1, enc_h = (int)hash[1] + 1;
+    if (enc_w < 1 || enc_w > 256 || enc_h < 1 || enc_h > 256) return NULL;
+    *w = enc_w; *h = enc_h;
+
+    /* Recompute budget (same as encode) */
+    int max_wh = enc_w > enc_h ? enc_w : enc_h;
+    int level = 4, target = 1 << (level - 1);
+    int ctarget = 1 << (level - 2); if (ctarget < 1) ctarget = 1;
+    int y_llw = enc_w, y_llh = enc_h;
+    while ((y_llw > target || y_llh > target) && (y_llw > 1 || y_llh > 1))
+        { y_llw = (y_llw+1)/2; y_llh = (y_llh+1)/2; }
+    int c_llw = enc_w, c_llh = enc_h;
+    while ((c_llw > ctarget || c_llh > ctarget) && (c_llw > 1 || c_llh > 1))
+        { c_llw = (c_llw+1)/2; c_llh = (c_llh+1)/2; }
+
+    /* Full rectangular AC counts */
+    int y_ac = y_llw * y_llh - 1, c_ac = c_llw * c_llh - 1;
+
+    float *Y = (float*)calloc((size_t)enc_w * enc_h, sizeof(float));
+    float *U = (float*)calloc((size_t)enc_w * enc_h, sizeof(float));
+    float *V = (float*)calloc((size_t)enc_w * enc_h, sizeof(float));
+    uint8_t *rgb = (uint8_t*)malloc((size_t)enc_w * enc_h * 3);
+    if (!Y || !U || !V || !rgb) { free(Y); free(U); free(V); free(rgb); return NULL; }
+
+    int actual_levels = 0, tmp_m = max_wh;
+    while (tmp_m > 1) { tmp_m = (tmp_m + 1) / 2; actual_levels++; }
+    float g1d = 1.0f + 2.0f*CDF97_B*(1.0f + 2.0f*CDF97_A)
+              + 2.0f*CDF97_D*((1.0f + 2.0f*CDF97_A)
+              + 2.0f*CDF97_G*(1.0f + 2.0f*CDF97_B*(1.0f + 2.0f*CDF97_A)));
+    float dc_gain = 1.0f; for (int _gl = 0; _gl < 2 * actual_levels; _gl++) dc_gain *= g1d;
+
+    /* GET_BITS helper: read n bits from bitstream starting at byte 2 */
+    int bit_pos = 0;
+    #define GET_BITS(n) ({ \
+        int _val = 0; \
+        for (int _b = 0; _b < (n); _b++) { \
+            int _byte_idx = 2 + bit_pos / 8; \
+            int _bit_idx  = 7 - (bit_pos % 8); \
+            if ((size_t)_byte_idx < (size_t)hash_len && (hash[_byte_idx] & (1u << _bit_idx))) \
+                _val |= (1 << ((n)-1 - _b)); \
+            bit_pos++; \
+        } \
+        _val; \
+    })
+
+    int dc_y  = GET_BITS(DC_BITS);
+    int dc_u  = GET_BITS(DC_BITS);
+    int dc_v  = GET_BITS(DC_BITS);
+    int sc_y  = GET_BITS(SC_BITS);
+    int sc_uv = GET_BITS(SC_BITS);
+
+    /* Reconstruct DCs: 5-bit (<<3) */
+    Y[0] = ((float)(dc_y << 3) - 128.0f) * dc_gain;
+    U[0] = ((float)(dc_u << 3) - 128.0f) * dc_gain;
+    V[0] = ((float)(dc_v << 3) - 128.0f) * dc_gain;
+
+    float scf = (128.0f / (float)((1<<SC_BITS)-1));
+    float sc_y_v  = (sc_y  * scf) * dc_gain;
+    float sc_uv_v = (sc_uv * scf) * dc_gain;
+
+    /* Read ACs */
+    int ch_llw[3] = { y_llw, c_llw, c_llw };
+    int ch_llh[3] = { y_llh, c_llh, c_llh };
+    for (int ch = 0; ch < 3; ch++) {
+        float *chan  = (ch == 0) ? Y : (ch == 1) ? U : V;
+        int    ll_w  = ch_llw[ch], ll_h = ch_llh[ch];
+        int    budget = (ch == 0) ? y_ac : c_ac;
+        float  scale_decoded = (ch == 0) ? sc_y_v : sc_uv_v;
+        int    ac_bits = (ch == 0) ? AC_Y_BITS : AC_C_BITS;
+        float  bias = (float)((1 << (ac_bits-1)) - 0.5f);
+        for (int iy = 0, cnt = 0; iy < ll_h && cnt < budget; iy++) {
+            for (int ix = 0; ix < ll_w && cnt < budget; ix++) {
+                if (iy == 0 && ix == 0) continue;
+                cnt++;
+                int q = GET_BITS(ac_bits);
+                chan[iy * enc_w + ix] = (q / bias - 1.0f) * scale_decoded;
+            }
+        }
+    }
+    #undef GET_BITS
+    #undef DC_BITS
+    #undef SC_BITS
+    #undef AC_Y_BITS
+    #undef AC_C_BITS
+
+    cdf97_inverse_2d(Y, enc_w, enc_h);
+    cdf97_inverse_2d(U, enc_w, enc_h);
+    cdf97_inverse_2d(V, enc_w, enc_h);
+    for (int i = 0; i < enc_w * enc_h; i++) {
+        uint8_t r, g, b;
+        yuv_to_rgb(Y[i], U[i], V[i], &r, &g, &b);
+        rgb[i*3] = r; rgb[i*3+1] = g; rgb[i*3+2] = b;
+    }
+    free(Y); free(U); free(V);
+    return rgb;
+}
+
+unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int encode_mode, int huf_extra_ctx, int has_alpha, int stride, int block_size) {
     memset(info, 0, sizeof(*info));
     if (!target_bytes && (quality < 1 || quality > MAX_QUALITY)) return 0;
     /* Platform-aware max dimension (format caps w,h at 65536) plus
@@ -4603,6 +5058,14 @@ unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, in
     if (w < 1 || w > max_dim || h < 1 || h > max_dim) return 0;
     size_t peak = chroma_420 ? (has_alpha ? 18 : 14) : (has_alpha ? 24 : 18);
     if (peak > 0 && (size_t)w * h > SIZE_MAX / peak) return 0;
+
+    /* Validate block_size (precinct mode): must be 0 or power of 2 in [32..2048] */
+    int bm = 0;
+    if (block_size > 0) {
+        for (int s = 32; s <= 2048; s <<= 1) { bm++; if (s == block_size) break; }
+        if (bm == 0 || bm > 7) return 0;
+        if (encode_mode == WTPC_ENC_HUFFMAN) return 0;  /* precincts are EBCOT-only */
+    }
 
     /* Pre-compute wavelet coefficients (quality-independent, shared by all paths) */
     size_t total = (size_t)w * h;
@@ -4645,30 +5108,30 @@ unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, in
 #endif
 
     if (target_bytes) {
-        unsigned char *out = find_quality_for_target(y_w, u_w, v_w, a_w, info, w, h, cw, ch, target_bytes, chroma_420, huffman_mode, huf_extra_ctx, has_alpha, alpha_one);
+        unsigned char *out = find_quality_for_target(y_w, u_w, v_w, a_w, info, w, h, cw, ch, target_bytes, chroma_420, encode_mode, huf_extra_ctx, has_alpha, alpha_one, bm);
         free(y_w); free(u_w); free(v_w); free(a_w);
         return out;
     }
 
-    /* Quantize + entropy code */
-    int16_t *q_y = malloc(total * sizeof(int16_t));
-    int16_t *q_u = malloc(ctotal * sizeof(int16_t));
-    int16_t *q_v = malloc(ctotal * sizeof(int16_t));
-    int16_t *q_a = has_alpha ? malloc(total * sizeof(int16_t)) : NULL;
+    /* Quantize + entropy code - always padded for EBCOT border-free loops */
+    int16_t *q_y = (int16_t*)malloc((size_t)(w+2)*(h+2) * sizeof(int16_t));
+    int16_t *q_u = (int16_t*)malloc((size_t)(cw+2)*(ch+2) * sizeof(int16_t));
+    int16_t *q_v = (int16_t*)malloc((size_t)(cw+2)*(ch+2) * sizeof(int16_t));
+    int16_t *q_a = has_alpha ? (int16_t*)malloc((size_t)(w+2)*(h+2) * sizeof(int16_t)) : NULL;
     if (!q_y || !q_u || !q_v || (has_alpha && !q_a)) {
         free(y_w); free(u_w); free(v_w); free(a_w); free(q_y); free(q_u); free(q_v); free(q_a);
         return NULL;
     }
-    quantize_coeffs(y_w, q_y, w, h, compute_base(quality), g_quant_y);
-    quantize_coeffs(u_w, q_u, cw, ch, compute_base(quality), chroma_420 ? g_quant_c420 : g_quant_c);
-    quantize_coeffs(v_w, q_v, cw, ch, compute_base(quality), chroma_420 ? g_quant_c420 : g_quant_c);
-    if (has_alpha) quantize_coeffs(a_w, q_a, w, h, compute_base(quality), g_quant_y);
+    quantize_coeffs(y_w, q_y, w, h, compute_base(quality), g_qt_y);
+    quantize_coeffs(u_w, q_u, cw, ch, compute_base(quality), chroma_420 ? g_qt_c420 : g_qt_c);
+    quantize_coeffs(v_w, q_v, cw, ch, compute_base(quality), chroma_420 ? g_qt_c420 : g_qt_c);
+    if (has_alpha) quantize_coeffs(a_w, q_a, w, h, compute_base(quality), g_qt_y);
 
 #ifdef DEBUG_WAVELET
     if (!target_bytes) {
         float *tmp = malloc(total * sizeof(float));
         if (tmp) {
-            dequantize_channel(q_y, tmp, w, h, compute_base(quality), g_quant_y);
+            dequantize_channel(q_y, tmp, w, h, compute_base(quality), g_qt_y);
             char path[128];
             snprintf(path, sizeof(path), "wavelet_y_after_q%d.png", quality);
             save_wavelet_png(tmp, w, h, path);
@@ -4679,19 +5142,19 @@ unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, in
 
     free(y_w); free(u_w); free(v_w); free(a_w);
 
-    if (huffman_mode == 1) {
+    if (encode_mode == WTPC_ENC_HUFFMAN) {
         unsigned char *out = huffman_pack(q_y, q_u, q_v, q_a, info, w, h, cw, ch, quality, chroma_420, huf_extra_ctx, alpha_one, 0);
         free(q_y); free(q_u); free(q_v); free(q_a);
         return out;
     }
-    if (huffman_mode == 2) {
-        unsigned char *out = ebcot_pack(q_y, q_u, q_v, q_a, info, w, h, cw, ch, quality, chroma_420, alpha_one, 0);
+    if (encode_mode == WTPC_ENC_EBCOT) {
+        unsigned char *out = ebcot_pack(q_y, q_u, q_v, q_a, info, w, h, cw, ch, quality, chroma_420, alpha_one, 0, bm);
         free(q_y); free(q_u); free(q_v); free(q_a);
         return out;
     }
     /* Best mode: try both entropy coders on the same quantized data, pick smaller */
     int eb_sz, hf_sz;
-    unsigned char *eb = ebcot_pack(q_y, q_u, q_v, q_a, info, w, h, cw, ch, quality, chroma_420, alpha_one, &eb_sz);
+    unsigned char *eb = ebcot_pack(q_y, q_u, q_v, q_a, info, w, h, cw, ch, quality, chroma_420, alpha_one, &eb_sz, bm);
     unsigned char *hf = huffman_pack(q_y, q_u, q_v, q_a, info, w, h, cw, ch, quality, chroma_420, huf_extra_ctx, alpha_one, &hf_sz);
     free(q_y); free(q_u); free(q_v); free(q_a);
 
@@ -4702,8 +5165,8 @@ unsigned char *wtpc_encode_mem(const unsigned char *rgb, wtpc_enc_info *info, in
 }
 
 #ifndef WTPC_NO_STDIO
-int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int huffman_mode, int huf_extra_ctx, int has_alpha, int stride) {
-    unsigned char *data = wtpc_encode_mem(rgb, info, w, h, target_bytes, quality, chroma_420, huffman_mode, huf_extra_ctx, has_alpha, stride);
+int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_info *info, int w, int h, int target_bytes, int quality, int chroma_420, int encode_mode, int huf_extra_ctx, int has_alpha, int stride, int block_size) {
+    unsigned char *data = wtpc_encode_mem(rgb, info, w, h, target_bytes, quality, chroma_420, encode_mode, huf_extra_ctx, has_alpha, stride, block_size);
     if (!data) return -1;
     FILE *f = fopen(out_path, "wb");
     if (!f) { free(data); return -1; }
@@ -4717,7 +5180,7 @@ int wtpc_encode_file(const char *out_path, const unsigned char *rgb, wtpc_enc_in
 /* Returns malloc'd RGB buffer (w*h*3 bytes). Sets *w, *h, *out_quality. */
 /* Returns NULL on error. */
 unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, int *h, int *out_quality, int *out_comp) {
-    if (data_len < (4 + 2 + 1) || strncmp((const char*)data, "WTP", 3) != 0) return NULL;
+    if (data_len < (3 + 1 + 2) || strncmp((const char*)data, "WTP", 3) != 0) return NULL;
 
     int pos = 4, quality;
     uint8_t flags = data[3];
@@ -4733,10 +5196,12 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     int comp = (alpha || alpha_one) ? 4 : 3;
     if (out_comp) *out_comp = comp;
 
-    int huf_extra_ctx = 0;
+    if (data_len < (6 + (q_hi ? 2 : 1) + (wh_hi ? 2 : 0))) return NULL;
+    int huf_extra_ctx = 0, block_mode = 0;
     if (q_hi) {
         uint16_t q16 = get_u16(data + pos); pos += 2;
         quality = (q16 & 0x3FF) + 1;
+        block_mode = (q16 >> 10) & 7;
         huf_extra_ctx = (q16 >> 15) & 1;
     } else {
         quality = 769 + data[pos++];
@@ -4752,8 +5217,9 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     if (peak > 0 && (size_t)(*w) * (*h) > SIZE_MAX / peak) return NULL;
 
     if (is_ebcot)
-        return ebcot_decode_mem(data, data_len, pos, *w, *h, quality, is_420, alpha, alpha_one);
+        return ebcot_decode_mem(data, data_len, pos, *w, *h, quality, is_420, alpha, alpha_one, block_mode);
 
+    if (pos >= data_len) return NULL;
     int tables = data[pos++];
     int t0_y = tables & HUFF_TBL_MASK;
     int t0_u = (tables >> 3) & HUFF_TBL_MASK;
@@ -4761,6 +5227,7 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     /* Context Huffman: extra table selectors byte (conditional on huf_extra_ctx) */
     int t1_y = 0, t1_u = 0, t1_v = 0;
     if (huf_extra_ctx) {
+        if (pos >= data_len) return NULL;
         int extra_tables = data[pos++];
         t1_y = extra_tables & 3; t1_u = (extra_tables >> 2) & 7; t1_v = (extra_tables >> 5) & 7;
     }
@@ -4769,9 +5236,9 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     int cw = is_420 ? ((*w)+1)/2 : (*w), ch = is_420 ? ((*h)+1)/2 : (*h);
     size_t total = (size_t)(*w) * (*h);
     size_t ctotal = (size_t)cw * ch;
-    int16_t *q_y = (int16_t*)calloc(total, sizeof(int16_t));
-    int16_t *q_u = (int16_t*)calloc(ctotal, sizeof(int16_t));
-    int16_t *q_v = (int16_t*)calloc(ctotal, sizeof(int16_t));
+    int16_t *q_y = (int16_t*)calloc((size_t)(*w + 2) * (*h + 2), sizeof(int16_t));
+    int16_t *q_u = (int16_t*)calloc((size_t)(cw + 2) * (ch + 2), sizeof(int16_t));
+    int16_t *q_v = (int16_t*)calloc((size_t)(cw + 2) * (ch + 2), sizeof(int16_t));
 
     Bitstream bs;
     bitstream_init(&bs, data + pos, data_len - pos);
@@ -4791,7 +5258,7 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     if (huf_extra_ctx) {
         RD_TBL(t0_y, 0, cl, hc, def_tables_t0, def_tables_t0_420);
         RD_TBL(t1_y, 0, cl1, hc1, def_tables_t1, def_tables_t1_420);
-        huffman_decode_ctx(&bs, q_y, *w, *h,  cl, hc, cl1, hc1);
+        huffman_decode_ctx(&bs, q_y, *w, *h, cl, hc, cl1, hc1);
     } else {
         RD_TBL(t0_y, 0, cl, hc, def_tables_single, def_tables_single_420);
         huffman_decode_channel(&bs, q_y, *w, *h,  cl, hc);
@@ -4800,12 +5267,12 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
     /* Alpha: reuse Y's codes (still in cl/hc/cl1/hc1) */
     int16_t *q_a = NULL;
     if (alpha || alpha_one) {
-        q_a = (int16_t*)calloc(total, sizeof(int16_t));
+        q_a = (int16_t*)calloc((size_t)(*w + 2) * (*h + 2), sizeof(int16_t));
         if (!q_a) { free(q_y); free(q_u); free(q_v); return NULL; }
         /* if alpha_one: q_a stays zero, no decode from bitstream */
         if (alpha && !alpha_one) {
             if (huf_extra_ctx)
-                huffman_decode_ctx(&bs, q_a, *w, *h,  cl, hc, cl1, hc1);
+                huffman_decode_ctx(&bs, q_a, *w, *h, cl, hc, cl1, hc1);
             else
                 huffman_decode_channel(&bs, q_a, *w, *h,  cl, hc);
         }
@@ -4851,10 +5318,10 @@ unsigned char *wtpc_decode_mem(const unsigned char *data, int data_len, int *w, 
         return NULL;
     }
 
-    dequantize_channel(q_y, y_f, *w, *h, compute_base(quality), g_quant_y);
-    dequantize_channel(q_u, u_s, cw, ch, compute_base(quality), is_420 ? g_quant_c420 : g_quant_c);
-    dequantize_channel(q_v, v_s, cw, ch, compute_base(quality), is_420 ? g_quant_c420 : g_quant_c);
-    if (alpha && !alpha_one) dequantize_channel(q_a, a_f, *w, *h, compute_base(quality), g_quant_y);
+    dequantize_channel(q_y, y_f, *w, *h, compute_base(quality), g_qt_y);
+    dequantize_channel(q_u, u_s, cw, ch, compute_base(quality), is_420 ? g_qt_c420 : g_qt_c);
+    dequantize_channel(q_v, v_s, cw, ch, compute_base(quality), is_420 ? g_qt_c420 : g_qt_c);
+    if (alpha && !alpha_one) dequantize_channel(q_a, a_f, *w, *h, compute_base(quality), g_qt_y);
     else if (alpha_one) { for (size_t i = 0; i < total; i++) a_f[i] = 127.0f; } /* == encode of opaque 255: 255-128 */
 
     cdf97_inverse_2d(y_f, *w, *h);
@@ -4900,5 +5367,4 @@ unsigned char *wtpc_decode_file(const char *in_path, int *w, int *h, int *out_qu
     return rgb;
 }
 #endif /* WTPC_NO_STDIO */
-
 #endif /* WTPC_IMAGE_IMPLEMENTATION */

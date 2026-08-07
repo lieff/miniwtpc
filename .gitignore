@@ -8,6 +8,7 @@ builddir
 *.y4m
 *.jpg
 *.wtpc
+*.whash
 *.txt
 *.obj
 *.exe

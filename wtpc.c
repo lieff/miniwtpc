@@ -155,7 +155,7 @@ static void put_set(int64_t freq[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS]) {
 }
 
 static void generate_tables(const char *dir_path) {
-    int q_levels[NUM_DEF_TABLES] = {653, 560, 465, 360, 237, 138, 74}; /* from mean_q= for each target after quantization tune */
+    int q_levels[NUM_DEF_TABLES] = {664, 566, 463, 351, 222, 119, 56}; /* from mean_q= for each target after quantization tune */
 
     int64_t freq_single[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS];
     int64_t freq_t0[NUM_DEF_TABLES][3][NUM_HUFF_SYMBOLS];
@@ -197,13 +197,13 @@ static void generate_tables(const char *dir_path) {
         float *y_w = malloc(total * sizeof(float));
         float *u_w = malloc(total * sizeof(float));
         float *v_w = malloc(total * sizeof(float));
-        int16_t *q_y = malloc(total * sizeof(int16_t));
-        int16_t *q_u = malloc(total * sizeof(int16_t));
-        int16_t *q_v = malloc(total * sizeof(int16_t));
+        int16_t *q_y = (int16_t*)malloc((size_t)(w+2)*(h+2) * sizeof(int16_t));
+        int16_t *q_u = (int16_t*)malloc((size_t)(w+2)*(h+2) * sizeof(int16_t));
+        int16_t *q_v = (int16_t*)malloc((size_t)(w+2)*(h+2) * sizeof(int16_t));
         float *a_w = NULL; int16_t *q_a = NULL;
         if (has_alpha) {
             a_w = malloc(total * sizeof(float));
-            q_a = malloc(total * sizeof(int16_t));
+            q_a = (int16_t*)malloc((size_t)(w+2)*(h+2) * sizeof(int16_t));
         }
         if (!y_w || !u_w || !v_w || !q_y || !q_u || !q_v
             || (has_alpha && (!a_w || !q_a))) {
@@ -222,8 +222,8 @@ static void generate_tables(const char *dir_path) {
         int cw420 = (w+1)/2, ch420 = (h+1)/2, ctotal420 = cw420 * ch420;
         float *u_ds = malloc(ctotal420 * sizeof(float));
         float *v_ds = malloc(ctotal420 * sizeof(float));
-        int16_t *q_u420 = malloc(ctotal420 * sizeof(int16_t));
-        int16_t *q_v420 = malloc(ctotal420 * sizeof(int16_t));
+        int16_t *q_u420 = (int16_t*)malloc((size_t)(cw420+2)*(ch420+2) * sizeof(int16_t));
+        int16_t *q_v420 = (int16_t*)malloc((size_t)(cw420+2)*(ch420+2) * sizeof(int16_t));
         if (!u_ds || !v_ds || !q_u420 || !q_v420) {
             free(u_ds); free(v_ds); free(q_u420); free(q_v420);
             free(y_w); free(u_w); free(v_w); free(q_y); free(q_u); free(q_v);
@@ -244,56 +244,56 @@ static void generate_tables(const char *dir_path) {
             int q = q_levels[lev];
             float base = compute_base(q);
 
-            /* --- 4:4:4: quantize + count --- */
-            quantize_coeffs(y_w, q_y, w, h, base, g_quant_y);
-            quantize_coeffs(u_w, q_u, w, h, base, g_quant_c);
-            quantize_coeffs(v_w, q_v, w, h, base, g_quant_c);
+            /* --- 4:4:4: quantize (padded) + count --- */
+            quantize_coeffs(y_w, q_y, w, h, base, g_qt_y);
+            quantize_coeffs(u_w, q_u, w, h, base, g_qt_c);
+            quantize_coeffs(v_w, q_v, w, h, base, g_qt_c);
 
             int fs[NUM_HUFF_SYMBOLS];
-            count_frequencies(q_y, total, fs);
+            count_frequencies(q_y, w, h, fs);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single[lev][0][s] += fs[s];
-            count_frequencies(q_u, total, fs);
+            count_frequencies(q_u, w, h, fs);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single[lev][1][s] += fs[s];
-            count_frequencies(q_v, total, fs);
+            count_frequencies(q_v, w, h, fs);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single[lev][2][s] += fs[s];
 
             int f0[NUM_HUFF_SYMBOLS], f1[NUM_HUFF_SYMBOLS];
-            count_frequencies_ctx(q_y, total, f0, f1);
+            count_frequencies_ctx(q_y, w, h, f0, f1);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0[lev][0][s] += f0[s]; freq_t1[lev][0][s] += f1[s]; }
-            count_frequencies_ctx(q_u, total, f0, f1);
+            count_frequencies_ctx(q_u, w, h, f0, f1);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0[lev][1][s] += f0[s]; freq_t1[lev][1][s] += f1[s]; }
-            count_frequencies_ctx(q_v, total, f0, f1);
+            count_frequencies_ctx(q_v, w, h, f0, f1);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0[lev][2][s] += f0[s]; freq_t1[lev][2][s] += f1[s]; }
             if (has_alpha) {
-                quantize_coeffs(a_w, q_a, w, h, base, g_quant_y);
-                count_frequencies(q_a, total, fs);
+                quantize_coeffs(a_w, q_a, w, h, base, g_qt_y);
+                count_frequencies(q_a, w, h, fs);
                 for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single[lev][0][s] += fs[s];
-                count_frequencies_ctx(q_a, total, f0, f1);
+                count_frequencies_ctx(q_a, w, h, f0, f1);
                 for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0[lev][0][s] += f0[s]; freq_t1[lev][0][s] += f1[s]; }
             }
 
             /* --- 4:2:0: quantize half-res U/V, Y already quantized from 4:4:4 --- */
-            quantize_coeffs(u_ds, q_u420, cw420, ch420, base, g_quant_c420);
-            quantize_coeffs(v_ds, q_v420, cw420, ch420, base, g_quant_c420);
+            quantize_coeffs(u_ds, q_u420, cw420, ch420, base, g_qt_c420);
+            quantize_coeffs(v_ds, q_v420, cw420, ch420, base, g_qt_c420);
 
             /* Y: recount from q_y (fs/f0/f1 were overwritten by U/V above), then accumulate */
-            count_frequencies(q_y, total, fs);
+            count_frequencies(q_y, w, h, fs);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single_420[lev][0][s] += fs[s];
-            count_frequencies(q_u420, ctotal420, fs);
+            count_frequencies(q_u420, cw420, ch420, fs);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single_420[lev][1][s] += fs[s];
-            count_frequencies(q_v420, ctotal420, fs);
+            count_frequencies(q_v420, cw420, ch420, fs);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single_420[lev][2][s] += fs[s];
 
-            count_frequencies_ctx(q_y, total, f0, f1);
+            count_frequencies_ctx(q_y, w, h, f0, f1);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0_420[lev][0][s] += f0[s]; freq_t1_420[lev][0][s] += f1[s]; }
-            count_frequencies_ctx(q_u420, ctotal420, f0, f1);
+            count_frequencies_ctx(q_u420, cw420, ch420, f0, f1);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0_420[lev][1][s] += f0[s]; freq_t1_420[lev][1][s] += f1[s]; }
-            count_frequencies_ctx(q_v420, ctotal420, f0, f1);
+            count_frequencies_ctx(q_v420, cw420, ch420, f0, f1);
             for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0_420[lev][2][s] += f0[s]; freq_t1_420[lev][2][s] += f1[s]; }
             if (has_alpha) {
-                count_frequencies(q_a, total, fs);
+                count_frequencies(q_a, w, h, fs);
                 for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) freq_single_420[lev][0][s] += fs[s];
-                count_frequencies_ctx(q_a, total, f0, f1);
+                count_frequencies_ctx(q_a, w, h, f0, f1);
                 for (int s = 0; s < NUM_HUFF_SYMBOLS; s++) { freq_t0_420[lev][0][s] += f0[s]; freq_t1_420[lev][0][s] += f1[s]; }
             }
         }
@@ -341,99 +341,196 @@ static void generate_tables(const char *dir_path) {
 #ifdef WTPC_TUNE_PARAMS
 
 enum {
-    P_BAND0, P_BAND1, P_BAND2, P_BAND3, P_BAND4, P_BAND5, P_BAND6, P_BAND7,
-    P_CBAND0, P_CBAND1, P_CBAND2, P_CBAND3, P_CBAND4, P_CBAND5, P_CBAND6, P_CBAND7,
-    P_DZ_Y0, P_DZ_Y1, P_DZ_Y2, P_DZ_Y3, P_DZ_Y4, P_DZ_Y5, P_DZ_Y6, P_DZ_Y7,
-    P_DZ_C0, P_DZ_C1, P_DZ_C2, P_DZ_C3, P_DZ_C4, P_DZ_C5, P_DZ_C6, P_DZ_C7,
-    P420_BAND0, P420_BAND1, P420_BAND2, P420_BAND3, P420_BAND4, P420_BAND5, P420_BAND6, P420_BAND7,
-    P420_DZ_C0, P420_DZ_C1, P420_DZ_C2, P420_DZ_C3, P420_DZ_C4, P420_DZ_C5, P420_DZ_C6, P420_DZ_C7,
+    /* --- Y: LH/HL/HH multipliers + per-subband DZ (48 params) --- */
+    P_Y_LH0,P_Y_LH1,P_Y_LH2,P_Y_LH3,P_Y_LH4,P_Y_LH5,P_Y_LH6,P_Y_LH7,
+    P_Y_HL0,P_Y_HL1,P_Y_HL2,P_Y_HL3,P_Y_HL4,P_Y_HL5,P_Y_HL6,P_Y_HL7,
+    P_Y_HH0,P_Y_HH1,P_Y_HH2,P_Y_HH3,P_Y_HH4,P_Y_HH5,P_Y_HH6,P_Y_HH7,
+    P_Y_DZ_LH0,P_Y_DZ_LH1,P_Y_DZ_LH2,P_Y_DZ_LH3,P_Y_DZ_LH4,P_Y_DZ_LH5,P_Y_DZ_LH6,P_Y_DZ_LH7,
+    P_Y_DZ_HL0,P_Y_DZ_HL1,P_Y_DZ_HL2,P_Y_DZ_HL3,P_Y_DZ_HL4,P_Y_DZ_HL5,P_Y_DZ_HL6,P_Y_DZ_HL7,
+    P_Y_DZ_HH0,P_Y_DZ_HH1,P_Y_DZ_HH2,P_Y_DZ_HH3,P_Y_DZ_HH4,P_Y_DZ_HH5,P_Y_DZ_HH6,P_Y_DZ_HH7,
+    /* --- C 4:4:4: LH/HL/HH multipliers + per-subband DZ (48 params) --- */
+    P_C_LH0,P_C_LH1,P_C_LH2,P_C_LH3,P_C_LH4,P_C_LH5,P_C_LH6,P_C_LH7,
+    P_C_HL0,P_C_HL1,P_C_HL2,P_C_HL3,P_C_HL4,P_C_HL5,P_C_HL6,P_C_HL7,
+    P_C_HH0,P_C_HH1,P_C_HH2,P_C_HH3,P_C_HH4,P_C_HH5,P_C_HH6,P_C_HH7,
+    P_C_DZ_LH0,P_C_DZ_LH1,P_C_DZ_LH2,P_C_DZ_LH3,P_C_DZ_LH4,P_C_DZ_LH5,P_C_DZ_LH6,P_C_DZ_LH7,
+    P_C_DZ_HL0,P_C_DZ_HL1,P_C_DZ_HL2,P_C_DZ_HL3,P_C_DZ_HL4,P_C_DZ_HL5,P_C_DZ_HL6,P_C_DZ_HL7,
+    P_C_DZ_HH0,P_C_DZ_HH1,P_C_DZ_HH2,P_C_DZ_HH3,P_C_DZ_HH4,P_C_DZ_HH5,P_C_DZ_HH6,P_C_DZ_HH7,
+    /* --- DC (Y + C, stored in LH[16]) --- */
+    P_DC_Y, P_DC_C,
+    /* --- EXT multipliers for bands 8+ (Y + C) --- */
+    P_EXT_MULT_Y, P_EXT_MULT_HH_Y, P_EXT_MULT_C, P_EXT_MULT_HH_C,
+    /* --- C420: LH/HL/HH multipliers + per-subband DZ + DC (49 params) --- */
+    P_C420_LH0,P_C420_LH1,P_C420_LH2,P_C420_LH3,P_C420_LH4,P_C420_LH5,P_C420_LH6,P_C420_LH7,
+    P_C420_HL0,P_C420_HL1,P_C420_HL2,P_C420_HL3,P_C420_HL4,P_C420_HL5,P_C420_HL6,P_C420_HL7,
+    P_C420_HH0,P_C420_HH1,P_C420_HH2,P_C420_HH3,P_C420_HH4,P_C420_HH5,P_C420_HH6,P_C420_HH7,
+    P_C420_DZ_LH0,P_C420_DZ_LH1,P_C420_DZ_LH2,P_C420_DZ_LH3,P_C420_DZ_LH4,P_C420_DZ_LH5,P_C420_DZ_LH6,P_C420_DZ_LH7,
+    P_C420_DZ_HL0,P_C420_DZ_HL1,P_C420_DZ_HL2,P_C420_DZ_HL3,P_C420_DZ_HL4,P_C420_DZ_HL5,P_C420_DZ_HL6,P_C420_DZ_HL7,
+    P_C420_DZ_HH0,P_C420_DZ_HH1,P_C420_DZ_HH2,P_C420_DZ_HH3,P_C420_DZ_HH4,P_C420_DZ_HH5,P_C420_DZ_HH6,P_C420_DZ_HH7,
+    P_DC_C420,
+    P_EXT_MULT_C420, P_EXT_MULT_HH_C420,
     NPARAMS
 };
-#define NPARAMS_MAIN (P_DZ_C7 + 1)
-#define NPARAMS_420  (NPARAMS - NPARAMS_MAIN)
+#define NPARAMS_MAIN (P_DC_C + 1)
+#define NPARAMS_420  (P_DC_C420 + 1 - P_C420_LH0)
+#define NPARAMS_EXT  6
 
 typedef struct {
     const char *name;
-    float delta;  /* step size */
-    float win_size;  /* max +-deviation from center */
+    float delta;
+    float win_size;
 } ParamCfg;
 
+#define BAND_NAME(sb, b) ((b)==0 ? sb"0(c)" : (b)==7 ? sb"7(f)" : sb #b)
+
 static const ParamCfg param_cfg[NPARAMS_MAIN] = {
-    /* Luma bands */
-    {"b0(coarsest)", 0.01f, 0.05f},
-    {"b1",           0.01f, 0.05f},
-    {"b2",           0.01f, 0.05f},
-    {"b3",           0.01f, 0.05f},
-    {"b4",           0.01f, 0.05f},
-    {"b5",           0.01f, 0.05f},
-    {"b6",           0.01f, 0.10f},
-    {"b7(finest)",   0.01f, 0.20f},
-    /* Chroma 4:4:4 bands */
-    {"cb0(coarsest)",0.01f, 0.10f},
-    {"cb1",          0.01f, 0.10f},
-    {"cb2",          0.01f, 0.10f},
-    {"cb3",          0.01f, 0.10f},
-    {"cb4",          0.01f, 0.10f},
-    {"cb5",          0.01f, 0.10f},
-    {"cb6",          0.01f, 0.20f},
-    {"cb7(finest)",  0.01f, 0.40f},
-    /* Per-band luma DZ */
-    {"dz_y0(coarsest)", 0.01f, 0.05f},
-    {"dz_y1",           0.01f, 0.05f},
-    {"dz_y2",           0.01f, 0.05f},
-    {"dz_y3",           0.01f, 0.05f},
-    {"dz_y4",           0.01f, 0.05f},
-    {"dz_y5",           0.01f, 0.05f},
-    {"dz_y6",           0.01f, 0.10f},
-    {"dz_y7(finest)",   0.01f, 0.20f},
-    /* Per-band chroma 4:4:4 DZ */
-    {"dz_c0(coarsest)", 0.01f, 0.05f},
-    {"dz_c1",           0.01f, 0.05f},
-    {"dz_c2",           0.01f, 0.05f},
-    {"dz_c3",           0.01f, 0.05f},
-    {"dz_c4",           0.01f, 0.05f},
-    {"dz_c5",           0.01f, 0.05f},
-    {"dz_c6",           0.01f, 0.10f},
-    {"dz_c7(finest)",   0.01f, 0.20f},
+    /* Y LH */
+    {BAND_NAME("y_lh",0),0.01f,0.05f},{BAND_NAME("y_lh",1),0.01f,0.05f},{BAND_NAME("y_lh",2),0.01f,0.05f},{BAND_NAME("y_lh",3),0.01f,0.05f},
+    {BAND_NAME("y_lh",4),0.01f,0.05f},{BAND_NAME("y_lh",5),0.01f,0.05f},{BAND_NAME("y_lh",6),0.01f,0.10f},{BAND_NAME("y_lh",7),0.01f,0.20f},
+    /* Y HL */
+    {BAND_NAME("y_hl",0),0.01f,0.05f},{BAND_NAME("y_hl",1),0.01f,0.05f},{BAND_NAME("y_hl",2),0.01f,0.05f},{BAND_NAME("y_hl",3),0.01f,0.05f},
+    {BAND_NAME("y_hl",4),0.01f,0.05f},{BAND_NAME("y_hl",5),0.01f,0.05f},{BAND_NAME("y_hl",6),0.01f,0.10f},{BAND_NAME("y_hl",7),0.01f,0.20f},
+    /* Y HH */
+    {BAND_NAME("y_hh",0),0.01f,0.05f},{BAND_NAME("y_hh",1),0.01f,0.05f},{BAND_NAME("y_hh",2),0.01f,0.05f},{BAND_NAME("y_hh",3),0.01f,0.05f},
+    {BAND_NAME("y_hh",4),0.01f,0.05f},{BAND_NAME("y_hh",5),0.01f,0.05f},{BAND_NAME("y_hh",6),0.01f,0.10f},{BAND_NAME("y_hh",7),0.01f,0.20f},
+    /* Y DZ LH */
+    {BAND_NAME("y_dzl",0),0.01f,0.05f},{BAND_NAME("y_dzl",1),0.01f,0.05f},{BAND_NAME("y_dzl",2),0.01f,0.05f},{BAND_NAME("y_dzl",3),0.01f,0.05f},
+    {BAND_NAME("y_dzl",4),0.01f,0.05f},{BAND_NAME("y_dzl",5),0.01f,0.05f},{BAND_NAME("y_dzl",6),0.01f,0.10f},{BAND_NAME("y_dzl",7),0.01f,0.20f},
+    /* Y DZ HL */
+    {BAND_NAME("y_dzh",0),0.01f,0.05f},{BAND_NAME("y_dzh",1),0.01f,0.05f},{BAND_NAME("y_dzh",2),0.01f,0.05f},{BAND_NAME("y_dzh",3),0.01f,0.05f},
+    {BAND_NAME("y_dzh",4),0.01f,0.05f},{BAND_NAME("y_dzh",5),0.01f,0.05f},{BAND_NAME("y_dzh",6),0.01f,0.10f},{BAND_NAME("y_dzh",7),0.01f,0.20f},
+    /* Y DZ HH */
+    {BAND_NAME("y_dzH",0),0.01f,0.05f},{BAND_NAME("y_dzH",1),0.01f,0.05f},{BAND_NAME("y_dzH",2),0.01f,0.05f},{BAND_NAME("y_dzH",3),0.01f,0.05f},
+    {BAND_NAME("y_dzH",4),0.01f,0.05f},{BAND_NAME("y_dzH",5),0.01f,0.05f},{BAND_NAME("y_dzH",6),0.01f,0.10f},{BAND_NAME("y_dzH",7),0.01f,0.20f},
+    /* C 4:4:4 LH */
+    {BAND_NAME("c_lh",0),0.01f,0.10f},{BAND_NAME("c_lh",1),0.01f,0.10f},{BAND_NAME("c_lh",2),0.01f,0.10f},{BAND_NAME("c_lh",3),0.01f,0.10f},
+    {BAND_NAME("c_lh",4),0.01f,0.10f},{BAND_NAME("c_lh",5),0.01f,0.10f},{BAND_NAME("c_lh",6),0.01f,0.20f},{BAND_NAME("c_lh",7),0.01f,0.40f},
+    /* C 4:4:4 HL */
+    {BAND_NAME("c_hl",0),0.01f,0.10f},{BAND_NAME("c_hl",1),0.01f,0.10f},{BAND_NAME("c_hl",2),0.01f,0.10f},{BAND_NAME("c_hl",3),0.01f,0.10f},
+    {BAND_NAME("c_hl",4),0.01f,0.10f},{BAND_NAME("c_hl",5),0.01f,0.10f},{BAND_NAME("c_hl",6),0.01f,0.20f},{BAND_NAME("c_hl",7),0.01f,0.40f},
+    /* C 4:4:4 HH */
+    {BAND_NAME("c_hh",0),0.01f,0.10f},{BAND_NAME("c_hh",1),0.01f,0.10f},{BAND_NAME("c_hh",2),0.01f,0.10f},{BAND_NAME("c_hh",3),0.01f,0.10f},
+    {BAND_NAME("c_hh",4),0.01f,0.10f},{BAND_NAME("c_hh",5),0.01f,0.10f},{BAND_NAME("c_hh",6),0.01f,0.20f},{BAND_NAME("c_hh",7),0.01f,0.40f},
+    /* C 4:4:4 DZ LH */
+    {BAND_NAME("c_dzl",0),0.01f,0.05f},{BAND_NAME("c_dzl",1),0.01f,0.05f},{BAND_NAME("c_dzl",2),0.01f,0.05f},{BAND_NAME("c_dzl",3),0.01f,0.05f},
+    {BAND_NAME("c_dzl",4),0.01f,0.05f},{BAND_NAME("c_dzl",5),0.01f,0.05f},{BAND_NAME("c_dzl",6),0.01f,0.10f},{BAND_NAME("c_dzl",7),0.01f,0.20f},
+    /* C 4:4:4 DZ HL */
+    {BAND_NAME("c_dzh",0),0.01f,0.05f},{BAND_NAME("c_dzh",1),0.01f,0.05f},{BAND_NAME("c_dzh",2),0.01f,0.05f},{BAND_NAME("c_dzh",3),0.01f,0.05f},
+    {BAND_NAME("c_dzh",4),0.01f,0.05f},{BAND_NAME("c_dzh",5),0.01f,0.05f},{BAND_NAME("c_dzh",6),0.01f,0.10f},{BAND_NAME("c_dzh",7),0.01f,0.20f},
+    /* C 4:4:4 DZ HH */
+    {BAND_NAME("c_dzH",0),0.01f,0.05f},{BAND_NAME("c_dzH",1),0.01f,0.05f},{BAND_NAME("c_dzH",2),0.01f,0.05f},{BAND_NAME("c_dzH",3),0.01f,0.05f},
+    {BAND_NAME("c_dzH",4),0.01f,0.05f},{BAND_NAME("c_dzH",5),0.01f,0.05f},{BAND_NAME("c_dzH",6),0.01f,0.10f},{BAND_NAME("c_dzH",7),0.01f,0.20f},
+    /* DC */
+    {"dc_y",0.01f,0.05f},{"dc_c",0.01f,0.05f},
 };
 
 static const ParamCfg param_cfg_420[NPARAMS_420] = {
-    {"c420b0(coarsest)", 0.01f, 0.8f},
-    {"c420b1",           0.01f, 0.8f},
-    {"c420b2",           0.01f, 0.8f},
-    {"c420b3",           0.01f, 0.8f},
-    {"c420b4",           0.01f, 0.8f},
-    {"c420b5",           0.01f, 0.8f},
-    {"c420b6",           0.01f, 1.0f},
-    {"c420b7(finest)",   0.01f, 1.5f},
-    /* Per-band chroma 4:2:0 DZ */
-    {"dz420_c0(coarsest)", 0.01f, 0.05f},
-    {"dz420_c1",           0.01f, 0.05f},
-    {"dz420_c2",           0.01f, 0.05f},
-    {"dz420_c3",           0.01f, 0.05f},
-    {"dz420_c4",           0.01f, 0.05f},
-    {"dz420_c5",           0.01f, 0.05f},
-    {"dz420_c6",           0.01f, 0.10f},
-    {"dz420_c7(finest)",   0.01f, 0.20f},
+    /* C420 LH */
+    {BAND_NAME("c4_lh",0),0.01f,0.8f},{BAND_NAME("c4_lh",1),0.01f,0.8f},{BAND_NAME("c4_lh",2),0.01f,0.8f},{BAND_NAME("c4_lh",3),0.01f,0.8f},
+    {BAND_NAME("c4_lh",4),0.01f,0.8f},{BAND_NAME("c4_lh",5),0.01f,0.8f},{BAND_NAME("c4_lh",6),0.01f,1.0f},{BAND_NAME("c4_lh",7),0.01f,1.5f},
+    /* C420 HL */
+    {BAND_NAME("c4_hl",0),0.01f,0.8f},{BAND_NAME("c4_hl",1),0.01f,0.8f},{BAND_NAME("c4_hl",2),0.01f,0.8f},{BAND_NAME("c4_hl",3),0.01f,0.8f},
+    {BAND_NAME("c4_hl",4),0.01f,0.8f},{BAND_NAME("c4_hl",5),0.01f,0.8f},{BAND_NAME("c4_hl",6),0.01f,1.0f},{BAND_NAME("c4_hl",7),0.01f,1.5f},
+    /* C420 HH */
+    {BAND_NAME("c4_hh",0),0.01f,0.8f},{BAND_NAME("c4_hh",1),0.01f,0.8f},{BAND_NAME("c4_hh",2),0.01f,0.8f},{BAND_NAME("c4_hh",3),0.01f,0.8f},
+    {BAND_NAME("c4_hh",4),0.01f,0.8f},{BAND_NAME("c4_hh",5),0.01f,0.8f},{BAND_NAME("c4_hh",6),0.01f,1.0f},{BAND_NAME("c4_hh",7),0.01f,1.5f},
+    /* C420 DZ LH */
+    {BAND_NAME("c4dzl",0),0.01f,0.05f},{BAND_NAME("c4dzl",1),0.01f,0.05f},{BAND_NAME("c4dzl",2),0.01f,0.05f},{BAND_NAME("c4dzl",3),0.01f,0.05f},
+    {BAND_NAME("c4dzl",4),0.01f,0.05f},{BAND_NAME("c4dzl",5),0.01f,0.05f},{BAND_NAME("c4dzl",6),0.01f,0.10f},{BAND_NAME("c4dzl",7),0.01f,0.20f},
+    /* C420 DZ HL */
+    {BAND_NAME("c4dzh",0),0.01f,0.05f},{BAND_NAME("c4dzh",1),0.01f,0.05f},{BAND_NAME("c4dzh",2),0.01f,0.05f},{BAND_NAME("c4dzh",3),0.01f,0.05f},
+    {BAND_NAME("c4dzh",4),0.01f,0.05f},{BAND_NAME("c4dzh",5),0.01f,0.05f},{BAND_NAME("c4dzh",6),0.01f,0.10f},{BAND_NAME("c4dzh",7),0.01f,0.20f},
+    /* C420 DZ HH */
+    {BAND_NAME("c4dzH",0),0.01f,0.05f},{BAND_NAME("c4dzH",1),0.01f,0.05f},{BAND_NAME("c4dzH",2),0.01f,0.05f},{BAND_NAME("c4dzH",3),0.01f,0.05f},
+    {BAND_NAME("c4dzH",4),0.01f,0.05f},{BAND_NAME("c4dzH",5),0.01f,0.05f},{BAND_NAME("c4dzH",6),0.01f,0.10f},{BAND_NAME("c4dzH",7),0.01f,0.20f},
+    /* C420 DC */
+    {"dc_c420",0.01f,0.05f},
+};
+
+static const ParamCfg param_cfg_ext[NPARAMS_EXT] = {
+    {"ext_y",0.01f,0.20f},{"ext_hh_y",0.01f,0.20f},
+    {"ext_c",0.01f,0.20f},{"ext_hh_c",0.01f,0.20f},
+    {"ext_c420",0.01f,0.20f},{"ext_hh_c420",0.01f,0.20f},
 };
 
 static float g_params[NPARAMS];
 
 static void apply_params(void) {
-    for (int b = 0; b < MAX_BANDS; b++) g_quant_y[b]              = g_params[P_BAND0 + b];
-    for (int b = 0; b < MAX_BANDS; b++) g_quant_c[b]              = g_params[P_CBAND0 + b];
-    for (int b = 0; b < MAX_BANDS; b++) g_quant_c420[b]           = g_params[P420_BAND0 + b];
-    for (int b = 0; b < MAX_BANDS; b++) g_quant_y[MAX_BANDS + b]  = g_params[P_DZ_Y0 + b];
-    for (int b = 0; b < MAX_BANDS; b++) g_quant_c[MAX_BANDS + b]  = g_params[P_DZ_C0 + b];
-    for (int b = 0; b < MAX_BANDS; b++) g_quant_c420[MAX_BANDS + b] = g_params[P420_DZ_C0 + b];
+    /* Y multipliers */
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_y_lh[b] = g_params[P_Y_LH0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_y_hl[b] = g_params[P_Y_HL0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_y_hh[b] = g_params[P_Y_HH0 + b];
+    /* Y DZ */
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_y_lh[MAX_BANDS+b] = g_params[P_Y_DZ_LH0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_y_hl[MAX_BANDS+b] = g_params[P_Y_DZ_HL0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_y_hh[MAX_BANDS+b] = g_params[P_Y_DZ_HH0 + b];
+    /* C multipliers */
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c_lh[b] = g_params[P_C_LH0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c_hl[b] = g_params[P_C_HL0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c_hh[b] = g_params[P_C_HH0 + b];
+    /* C DZ */
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c_lh[MAX_BANDS+b] = g_params[P_C_DZ_LH0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c_hl[MAX_BANDS+b] = g_params[P_C_DZ_HL0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c_hh[MAX_BANDS+b] = g_params[P_C_DZ_HH0 + b];
+    /* C420 multipliers */
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c420_lh[b] = g_params[P_C420_LH0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c420_hl[b] = g_params[P_C420_HL0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c420_hh[b] = g_params[P_C420_HH0 + b];
+    /* C420 DZ */
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c420_lh[MAX_BANDS+b] = g_params[P_C420_DZ_LH0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c420_hl[MAX_BANDS+b] = g_params[P_C420_DZ_HL0 + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_quant_c420_hh[MAX_BANDS+b] = g_params[P_C420_DZ_HH0 + b];
+    /* DC */
+    g_quant_y_lh[MAX_BANDS*2] = g_params[P_DC_Y];
+    g_quant_c_lh[MAX_BANDS*2] = g_params[P_DC_C];
+    g_quant_c420_lh[MAX_BANDS*2] = g_params[P_DC_C420];
+    /* EXT multipliers for bands 8+ */
+    g_quant_y_lh[MAX_BANDS*2+1] = g_params[P_EXT_MULT_Y];
+    g_quant_y_lh[MAX_BANDS*2+2] = g_params[P_EXT_MULT_HH_Y];
+    g_quant_c_lh[MAX_BANDS*2+1] = g_params[P_EXT_MULT_C];
+    g_quant_c_lh[MAX_BANDS*2+2] = g_params[P_EXT_MULT_HH_C];
+    g_quant_c420_lh[MAX_BANDS*2+1] = g_params[P_EXT_MULT_C420];
+    g_quant_c420_lh[MAX_BANDS*2+2] = g_params[P_EXT_MULT_HH_C420];
 }
 
 static void print_all_params(int chroma) {
     if (!chroma) {
-        printf("static WTPC_TABLES_CONST float g_quant_y[MAX_BANDS*2]    = {"); for (int b = 0; b < MAX_BANDS*2; b++) printf("%s%.2ff", b ? ", " : "", g_quant_y[b]); printf("};\n");
-        printf("static WTPC_TABLES_CONST float g_quant_c[MAX_BANDS*2]    = {"); for (int b = 0; b < MAX_BANDS*2; b++) printf("%s%.2ff", b ? ", " : "", g_quant_c[b]); printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_y_lh[MAX_BANDS*2+3] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_y_lh[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_y_lh[MAX_BANDS+b]);
+        printf(", /*DC*/ %.2ff, /*EXT*/ %.2ff, /*EXT_HH*/ %.2ff};\n", g_quant_y_lh[MAX_BANDS*2], g_quant_y_lh[MAX_BANDS*2+1], g_quant_y_lh[MAX_BANDS*2+2]);
+        printf("static WTPC_TABLES_CONST float g_quant_y_hl[MAX_BANDS*2] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_y_hl[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_y_hl[MAX_BANDS+b]);
+        printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_y_hh[MAX_BANDS*2] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_y_hh[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_y_hh[MAX_BANDS+b]);
+        printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_c_lh[MAX_BANDS*2+3] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c_lh[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c_lh[MAX_BANDS+b]);
+        printf(", /*DC*/ %.2ff, /*EXT*/ %.2ff, /*EXT_HH*/ %.2ff};\n", g_quant_c_lh[MAX_BANDS*2], g_quant_c_lh[MAX_BANDS*2+1], g_quant_c_lh[MAX_BANDS*2+2]);
+        printf("static WTPC_TABLES_CONST float g_quant_c_hl[MAX_BANDS*2] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c_hl[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c_hl[MAX_BANDS+b]);
+        printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_c_hh[MAX_BANDS*2] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c_hh[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c_hh[MAX_BANDS+b]);
+        printf("};\n");
     } else {
-        printf("static WTPC_TABLES_CONST float g_quant_c420[MAX_BANDS*2] = {"); for (int b = 0; b < MAX_BANDS*2; b++) printf("%s%.2ff", b ? ", " : "", g_quant_c420[b]); printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_c420_lh[MAX_BANDS*2+3] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c420_lh[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c420_lh[MAX_BANDS+b]);
+        printf(", /*DC*/ %.2ff, /*EXT*/ %.2ff, /*EXT_HH*/ %.2ff};\n", g_quant_c420_lh[MAX_BANDS*2], g_quant_c420_lh[MAX_BANDS*2+1], g_quant_c420_lh[MAX_BANDS*2+2]);
+        printf("static WTPC_TABLES_CONST float g_quant_c420_hl[MAX_BANDS*2] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c420_hl[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c420_hl[MAX_BANDS+b]);
+        printf("};\n");
+        printf("static WTPC_TABLES_CONST float g_quant_c420_hh[MAX_BANDS*2] = {");
+        for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c420_hh[b]);
+        printf(", /*DZ*/ "); for (int b = 0; b < MAX_BANDS; b++) printf("%s%.2ff", b ? "," : "", g_quant_c420_hh[MAX_BANDS+b]);
+        printf("};\n");
     }
     fflush(stdout);
 }
@@ -466,10 +563,11 @@ typedef struct {
     char **names;
     PreloadedImg *images;  /* pre-decoded RGB (owned by tune_grid) */
     int nimg;
-    int *targets;
+    const int *targets;
     int ntargets;
     int ntotal;            /* nimg * ntargets */
     volatile int *guard_overshoot;  /* shared flag set by any thread on guard fail */
+    int skip_guard;        /* disable guard check (large-image EXT tuning) */
     /* per-target stats (allocated per thread, [ntargets]) */
     PerTargetStats *stats;
 } ThreadCtx;
@@ -496,16 +594,16 @@ static void *tune_worker(void *arg) {
         wtpc_enc_info info;
         int guard_size = 0, exclude_guard_test = !strcmp(ctx->names[i], "sample-alpha-checker-400x300.png") || !strcmp(ctx->names[i], "sample-alpha-circle-400x300.png");
         unsigned char *enc;
-        if (!exclude_guard_test) {
-            enc = wtpc_encode_mem(img, &info, w, h, 0, MAX_QUALITY, ctx->chroma_mode, 2, 0, pimg->has_alpha, 0);
+        if (!ctx->skip_guard && !exclude_guard_test) {
+            enc = wtpc_encode_mem(img, &info, w, h, 0, MAX_QUALITY, ctx->chroma_mode, 2, 0, pimg->has_alpha, 0, 0);
             guard_size = info.encoded_bytes;
             free(enc);
         }
-        enc = wtpc_encode_mem(img, &info, w, h, ctx->targets[t], 0, ctx->chroma_mode, 2, 0, pimg->has_alpha, 0);
+        enc = wtpc_encode_mem(img, &info, w, h, ctx->targets[t], 0, ctx->chroma_mode, 2, 0, pimg->has_alpha, 0, 0);
         if (!enc) {
             fprintf(stderr, "[th%d] BAD ENCODE %s: %dx%dx%d\n", ctx->tid, ctx->names[i], w, h, pimg->has_alpha ? 4 : 3); continue;
         }
-        if (info.encoded_bytes > ctx->targets[t] || guard_size > GUARD_SIZE) {
+        if (!ctx->skip_guard && (info.encoded_bytes > ctx->targets[t] || guard_size > GUARD_SIZE)) {
             *ctx->guard_overshoot = 1;
             fprintf(stderr, "[th%d t=%d] ENCODE OVERSHOOT %s: %dx%dx%d size=%d guard_size=%d\n", ctx->tid, ctx->targets[t], ctx->names[i], w, h, pimg->has_alpha ? 4 : 3, info.encoded_bytes, guard_size);
         }
@@ -562,27 +660,46 @@ static void *tune_worker(void *arg) {
     return NULL;
 }
 
-/* Weight multipliers per target: give more importance to small targets (800B..2KB),
+/* Weight multipliers per target: give more importance to small targets (800B..2KB, 50..80KB for big images),
    since we can borrow quality from large files (q=1) without visual loss. */
 static const float tune_weights[] = {3.0f, 2.0f, 1.5f, 1.0f, 1.0f, 1.0f, 1.0f};
 
 /* --- Automated grid-search: sweeps one param at a time, keeps best, continues --- */
-static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, int base_idx, int chroma_mode, int start_param) {
+static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, int base_idx, int chroma_mode, int start_param, int big_images, const int *targets, int ntargets) {
     if (system("which ssimulacra2 >/dev/null 2>&1") != 0) {
         fprintf(stderr, "Error: ssimulacra2 not found in PATH\n");
         return;
     }
-
-    int targets[] = {1000, 2000, 4000, 8000, 16000, 26000, 36000};
-    int ntargets = sizeof(targets) / sizeof(targets[0]);
-
     /* Init g_params from current g_quant tables (start from previous run's values) */
-    for (int b = 0; b < MAX_BANDS; b++) g_params[P_BAND0 + b]    = g_quant_y[b];
-    for (int b = 0; b < MAX_BANDS; b++) g_params[P_CBAND0 + b]   = g_quant_c[b];
-    for (int b = 0; b < MAX_BANDS; b++) g_params[P420_BAND0 + b] = g_quant_c420[b];
-    for (int b = 0; b < MAX_BANDS; b++) g_params[P_DZ_Y0 + b]     = g_quant_y[MAX_BANDS + b];
-    for (int b = 0; b < MAX_BANDS; b++) g_params[P_DZ_C0 + b]     = g_quant_c[MAX_BANDS + b];
-    for (int b = 0; b < MAX_BANDS; b++) g_params[P420_DZ_C0 + b]  = g_quant_c420[MAX_BANDS + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_Y_LH0 + b] = g_quant_y_lh[b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_Y_HL0 + b] = g_quant_y_hl[b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_Y_HH0 + b] = g_quant_y_hh[b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_Y_DZ_LH0 + b] = g_quant_y_lh[MAX_BANDS + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_Y_DZ_HL0 + b] = g_quant_y_hl[MAX_BANDS + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_Y_DZ_HH0 + b] = g_quant_y_hh[MAX_BANDS + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_C_LH0 + b] = g_quant_c_lh[b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_C_HL0 + b] = g_quant_c_hl[b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_C_HH0 + b] = g_quant_c_hh[b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_C_DZ_LH0 + b] = g_quant_c_lh[MAX_BANDS + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_C_DZ_HL0 + b] = g_quant_c_hl[MAX_BANDS + b];
+    for (int b = 0; b < MAX_BANDS; b++) g_params[P_C_DZ_HH0 + b] = g_quant_c_hh[MAX_BANDS + b];
+    g_params[P_DC_Y] = g_quant_y_lh[MAX_BANDS*2];
+    g_params[P_DC_C] = g_quant_c_lh[MAX_BANDS*2];
+    g_params[P_EXT_MULT_Y] = g_quant_y_lh[MAX_BANDS*2+1];
+    g_params[P_EXT_MULT_HH_Y] = g_quant_y_lh[MAX_BANDS*2+2];
+    g_params[P_EXT_MULT_C] = g_quant_c_lh[MAX_BANDS*2+1];
+    g_params[P_EXT_MULT_HH_C] = g_quant_c_lh[MAX_BANDS*2+2];
+    if (chroma_mode) {
+        for (int b = 0; b < MAX_BANDS; b++) g_params[P_C420_LH0 + b] = g_quant_c420_lh[b];
+        for (int b = 0; b < MAX_BANDS; b++) g_params[P_C420_HL0 + b] = g_quant_c420_hl[b];
+        for (int b = 0; b < MAX_BANDS; b++) g_params[P_C420_HH0 + b] = g_quant_c420_hh[b];
+        for (int b = 0; b < MAX_BANDS; b++) g_params[P_C420_DZ_LH0 + b] = g_quant_c420_lh[MAX_BANDS + b];
+        for (int b = 0; b < MAX_BANDS; b++) g_params[P_C420_DZ_HL0 + b] = g_quant_c420_hl[MAX_BANDS + b];
+        for (int b = 0; b < MAX_BANDS; b++) g_params[P_C420_DZ_HH0 + b] = g_quant_c420_hh[MAX_BANDS + b];
+        g_params[P_DC_C420] = g_quant_c420_lh[MAX_BANDS*2];
+        g_params[P_EXT_MULT_C420] = g_quant_c420_lh[MAX_BANDS*2+1];
+        g_params[P_EXT_MULT_HH_C420] = g_quant_c420_lh[MAX_BANDS*2+2];
+    }
     apply_params();
 
     /* Collect image list */
@@ -675,6 +792,7 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
             _ctx[_tid].ntargets    = ntargets; \
             _ctx[_tid].ntotal      = _ntotal; \
             _ctx[_tid].guard_overshoot = &_guard_overshoot; \
+            _ctx[_tid].skip_guard    = big_images; \
             _ctx[_tid].stats       = _astats + _tid * ntargets; \
             memset(_ctx[_tid].stats, 0, ntargets * sizeof(PerTargetStats)); \
             pthread_create(&_th[_tid], NULL, tune_worker, &_ctx[_tid]); \
@@ -707,7 +825,7 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
                 double _as = _ts / _tn; \
                 double _ad = _td / _tn; \
                 double _aq = _tq / _tn; \
-                float _w = tune_weights[_tidx]; \
+                float _w = big_images ? 1.0f : tune_weights[_tidx]; \
                 _sum_ssim2 += _as * _w; _sum_w += _w; _count++; \
                 double _dp = _ad * 100.0 / targets[_tidx]; \
                 double _mp = _tm * 100.0 / targets[_tidx]; \
@@ -759,7 +877,7 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
             }
             if (!neg_stop) {
                 float val = center - d * pcfg->delta;
-                if (val <= 0.0f) { neg_stop = 1; skipped_neg = max_d - d + 1; }
+                if (val <= 0.0f || (strstr(pcfg->name, "dz") && val < 0.5f)) { neg_stop = 1; skipped_neg = max_d - d + 1; }
                 else {
                     TUNE_EVAL(val, &ssim, " -");
                     if (ssim < -9000.0f) {
@@ -811,12 +929,10 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
                                 }
                             }
                         }
-                        /* Step 3: cross-channel (Y<>C), same band index */
+                        /* Step 3: cross-channel (Y<>C), same subband type + band */
                         if (!trade_ok && chroma_mode == 0) {
                             int cross_p = -1;
-                            int col = p % 8;
-                            if (p < 16)      cross_p = (p < 8 ? 8 : 0) + col;     /* multiplier: Y<>C */
-                            else             cross_p = (p < 24 ? 24 : 16) + col;  /* DZ: Y<>C */
+                            if (p < 96) cross_p = (p < 48) ? p + 48 : p - 48;  /* Y<->C */
                             if (cross_p >= 0 && cross_p < nparams) {
                                 float cross_center = g_params[base_idx + cross_p];
                                 fprintf(stderr, "  Trying trade cross: %s\n", cfg[cross_p].name);
@@ -889,14 +1005,14 @@ static void tune_grid(const char *dir_path, const ParamCfg *cfg, int nparams, in
  * ===================================================================== */
 
 /* One encoder configuration = a row/col of the qfit table. */
-typedef struct { const char *name; int huffman_mode; int huf_extra_ctx; int chroma_420; } CalibCfg;
+typedef struct { const char *name; int encode_mode; int huf_extra_ctx; int chroma_420; } CalibCfg;
 static const CalibCfg calib_cfgs[6] = {
-    {"EBCOT       4:4:4", 2, 0, 0},
-    {"EBCOT       4:2:0", 2, 0, 1},
-    {"Huffman1tbl 4:4:4", 1, 0, 0},
-    {"Huffman1tbl 4:2:0", 1, 0, 1},
-    {"Huffman ctx 4:4:4", 1, 1, 0},
-    {"Huffman ctx 4:2:0", 1, 1, 1},
+    {"EBCOT       4:4:4", WTPC_ENC_EBCOT, 0, 0},
+    {"EBCOT       4:2:0", WTPC_ENC_EBCOT, 0, 1},
+    {"Huffman1tbl 4:4:4", WTPC_ENC_HUFFMAN, 0, 0},
+    {"Huffman1tbl 4:2:0", WTPC_ENC_HUFFMAN, 0, 1},
+    {"Huffman ctx 4:4:4", WTPC_ENC_HUFFMAN, 1, 0},
+    {"Huffman ctx 4:2:0", WTPC_ENC_HUFFMAN, 1, 1},
 };
 
 typedef struct {
@@ -932,7 +1048,7 @@ static void *calib_worker(void *arg) {
         if (!pimg->rgb || pimg->w <= 0 || pimg->h <= 0) continue;
         wtpc_enc_info info;
         unsigned char *enc = wtpc_encode_mem(pimg->rgb, &info, pimg->w, pimg->h,
-            ctx->targets[t], 0, cfg->chroma_420, cfg->huffman_mode, cfg->huf_extra_ctx, pimg->has_alpha, 0);
+            ctx->targets[t], 0, cfg->chroma_420, cfg->encode_mode, cfg->huf_extra_ctx, pimg->has_alpha, 0, 0);
         if (!enc) continue;
         free(enc);
         int dev = abs(info.encoded_bytes - ctx->targets[t]);
@@ -1042,7 +1158,7 @@ static void calibrate_qfit(const char *dir_path) {
         /* Emit the table row (grouped 3 rows of 2 cols: coder x chroma). */
         int is444 = !cfg->chroma_420;
         if (is444) printf("        /* %-12s */ { { %9.5ff, %9.5ff, %9.5ff },   /* 4:4:4 */\n",
-                          cfg->huffman_mode == 2 ? "EBCOT" : (cfg->huf_extra_ctx ? "Huffman ctx" : "Huffman 1tbl"),
+                          cfg->encode_mode == WTPC_ENC_EBCOT ? "EBCOT" : (cfg->huf_extra_ctx ? "Huffman ctx" : "Huffman 1tbl"),
                           fits[cc][0], fits[cc][1], fits[cc][2]);
         else       printf("                            { %9.5ff, %9.5ff, %9.5ff } }, /* 4:2:0 */\n",
                           fits[cc][0], fits[cc][1], fits[cc][2]);
@@ -1134,7 +1250,7 @@ static void train_priors(const char *dir_path) {
             if (!rgb || w <= 0 || h <= 0) { if (rgb) stbi_image_free(rgb); continue; }
 
             wtpc_enc_info info = {0};
-            unsigned char *enc = wtpc_encode_mem(rgb, &info, w, h, 0, q, 0, 2, 0, has_alpha, 0);
+            unsigned char *enc = wtpc_encode_mem(rgb, &info, w, h, 0, q, 0, 2, 0, has_alpha, 0, 0);
             if (enc) { total_bytes += info.encoded_bytes; free(enc); }
 
             if (ext && strcmp(ext, ".png") == 0) free(rgb); else stbi_image_free(rgb);
@@ -1346,18 +1462,22 @@ int main(int argc, char **argv) {
     int mode = -1;  /* 0=decode, 1=encode, 2=test */
     int quality = 20;
     int chroma_420 = 0;
-    int huffman_mode = 2;  /* 0=auto, 1=huff, 2=ebcot. default to ebcot because it currently winning, no need try huffman and slower -b */
+    int encode_mode = WTPC_ENC_EBCOT;  /* WTPC_ENC_AUTO/HUFFMAN/EBCOT, default EBCOT */
     int target_bytes = 0;  /* 0 means use -q directly */
-    int huf_extra_ctx = 0;  /* 0=single table, faster, 1 - context-aware (2 Huffman tables) for better compression, slower */
+    int block_size = 0;
+    int huf_extra_ctx = 0; /* 0=single table, faster, 1 - context-aware (2 Huffman tables) for better compression, slower */
+    int hash_mode = 0;     /* set by -m whash */
 #ifdef WTPC_TUNE_PARAMS
     int tune_start = 0;  /* -S: start grid from this param index (0=first) */
     int tune_420   = 0;  /* -420: tune chroma 4:2:0 params instead of main */
-#endif
-#ifdef _WIN32    
-    timeBeginPeriod(1);
+    int tune_ext   = 0;  /* -E: tune EXT multipliers (large-image dataset) */
+    { const char *ev = getenv("WTPC_EXT_BASE_THRESH"); if (ev) g_ext_base_thresh = (float)atof(ev); }
 #endif
 #ifdef WTPC_TUNE_CDF97_D
     { const char *ev = getenv("WTPC_CDF97_D"); if (ev) g_cdf97_d = (float)atof(ev); }
+#endif
+#ifdef _WIN32
+    timeBeginPeriod(1);
 #endif
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-e") == 0) mode = 1;
@@ -1366,8 +1486,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-q") == 0 && i+1 < argc) quality = atoi(argv[++i]);
         else if (strcmp(argv[i], "-b") == 0 && i+1 < argc) target_bytes = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0) chroma_420 = 1;
-        else if (strcmp(argv[i], "-m") == 0 && i+1 < argc) { const char *m = argv[++i]; if (strcmp(m, "huffman") == 0) huffman_mode = 1; else if (strcmp(m, "ebcot") == 0) huffman_mode = 2; }
+        else if (strcmp(argv[i], "-m") == 0 && i+1 < argc) { const char *m = argv[++i]; if (strcmp(m, "huffman") == 0) encode_mode = WTPC_ENC_HUFFMAN; else if (strcmp(m, "ebcot") == 0) encode_mode = WTPC_ENC_EBCOT; else if (strcmp(m, "best") == 0) encode_mode = WTPC_ENC_AUTO; else if (strcmp(m, "whash") == 0) hash_mode = 1; else { printf("Unknown -m mode: %s\n", m); return 1; } }
         else if (strcmp(argv[i], "-h") == 0 && i+1 < argc) huf_extra_ctx = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--block") == 0 && i+1 < argc) block_size = atoi(argv[++i]);
 #ifndef _WIN32
         else if (strcmp(argv[i], "-G") == 0) mode = 3;
 #endif
@@ -1380,6 +1501,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-S") == 0 && i+1 < argc) tune_start = atoi(argv[++i]);
         else if (strcmp(argv[i], "-v") == 0) g_tune_verbose = 1;
         else if (strcmp(argv[i], "-420") == 0) tune_420 = 1;
+        else if (strcmp(argv[i], "-E") == 0) tune_ext = 1;
 #endif
         else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) output = argv[++i];
         else if (argv[i][0] != '-') input = argv[i];
@@ -1390,13 +1512,16 @@ int main(int argc, char **argv) {
         printf("  wtpc -e input.png -o output.wtp [-q QUALITY] [-c] [-b TARGET_BYTES]\n");
         printf("  wtpc -d input.wtp -o output.png\n");
         printf("  wtpc -t input.png [-q quality]   (self-test)\n");
+        printf("  wtpc -e input.png -o output -m whash   (encode wavelet hash -> .whash)\n");
+        printf("  wtpc -d input.whash -o output.png -m whash   (decode wavelet hash -> .png)\n");
         printf("  -e  encode mode\n");
         printf("  -d  decode mode\n");
         printf("  -q  quality 1 - %d (default 20)\n", MAX_QUALITY);
         printf("  -b  target size in bytes (auto-finds q, overrides -q)\n");
         printf("  -c  4:2:0 chroma subsampling\n");
-        printf("  -m  best|ebcot|huffman  encoding mode (default: ebcot)\n");
+        printf("  -m  best|ebcot|huffman|whash  encoding mode (default: ebcot)\n");
         printf("  -h  context-aware Huffman tables (default: 0 = single table - faster, 1 - slower and slightly better compression ~35kb->36kb)\n");
+        printf("  --block N  EBCOT mode only: split bit planes into NxN blocks for fast large-image encoding (32/64/128/256/512/1024/2048)\n");
 #ifndef _WIN32
         printf("  -G  generate huffman tables from images in directory\n");
 #endif
@@ -1407,7 +1532,8 @@ int main(int argc, char **argv) {
         printf("  -T  grid-search multipliers for tuning\n");
         printf("  -R  recalibrate qfit rate-control model (prints qfit table + step stats)\n");
         printf("  -420  tune chroma 4:2:0 params (default: main luma+chroma444+DZ)\n");
-        printf("  -S  start grid from param index (0..%d, default 0)\n", (tune_420 ? NPARAMS_420 : NPARAMS_MAIN)-1);
+        printf("  -E    tune EXT multipliers (bands 8+, large-image dataset)\n");
+        printf("  -S  start grid from param index (0..%d, default 0)\n", (tune_ext ? (tune_420 ? NPARAMS_EXT - 1 : 3) : (tune_420 ? NPARAMS_420 - 1 : NPARAMS_MAIN - 1)));
         printf("  -v  verbose: per-encode progress logging\n");
 #endif
         printf("  -o  output file\n");
@@ -1415,6 +1541,37 @@ int main(int argc, char **argv) {
     }
 
     if (mode == 1) {
+        if (hash_mode) {
+            /* Wavelet hash encode: PNG -> .whash */
+            char auto_out[1024];
+            if (!output) {
+                const char *dot = strrchr(input, '.');
+                if (dot) { int len = (int)(dot - input); snprintf(auto_out, sizeof(auto_out), "%.*s.whash", len, input); }
+                else snprintf(auto_out, sizeof(auto_out), "%s.whash", input);
+                output = auto_out;
+            } else {
+                /* Append .whash if not already present */
+                const char *oext = strrchr(output, '.');
+                if (!oext || strcmp(oext, ".whash") != 0) {
+                    snprintf(auto_out, sizeof(auto_out), "%s.whash", output);
+                    output = auto_out;
+                }
+            }
+            int w, h, comp;
+            unsigned char *img = stbi_load(input, &w, &h, &comp, 3);
+            if (!img) { printf("Cannot load: %s, reason: %s\n", input, stbi_failure_reason()); return 1; }
+            if (w > 256 || h > 256) { printf("Hash mode supports max 256x256 (got %dx%d)\n", w, h); stbi_image_free(img); return 1; }
+            int hlen;
+            uint8_t *hash = wtpc_hash_encode_mem(img, w, h, &hlen);
+            stbi_image_free(img);
+            if (!hash) { printf("Hash encoding failed!\n"); return 1; }
+            FILE *f = fopen(output, "wb");
+            if (!f) { printf("Cannot write: %s\n", output); free(hash); return 1; }
+            fwrite(hash, 1, (size_t)hlen, f);
+            fclose(f);
+            printf("Hash: %dx%d -> %d bytes -> %s\n", w, h, hlen, output);
+            free(hash);
+        } else {
         /* Encode: auto-output = replace extension with .wtpc */
         char auto_out[1024];
         wtpc_enc_info info;
@@ -1440,39 +1597,70 @@ int main(int argc, char **argv) {
                 has_alpha = (comp == 4);
             }
         }
+        /* Validate --block: must be 0 or power of 2 in [32..2048], EBCOT-only */
+        if (block_size > 0) {
+            int valid = 0;
+            for (int s = 32; s <= 2048; s <<= 1) if (s == block_size) { valid = 1; break; }
+            if (!valid) { printf("Invalid --block %d: must be 32,64,128,256,512,1024,2048\n", block_size); return 1; }
+            if (encode_mode == WTPC_ENC_HUFFMAN) { printf("--block requires ebcot mode, not huffman\n"); return 1; }
+        }
         double t0 = now_ms();
-        int ret = wtpc_encode_file(output, img, &info, w, h, target_bytes, quality, chroma_420, huffman_mode, huf_extra_ctx, has_alpha, 0);
+        int ret = wtpc_encode_file(output, img, &info, w, h, target_bytes, quality, chroma_420, encode_mode, huf_extra_ctx, has_alpha, 0, block_size);
         double dt = now_ms() - t0;
         stbi_image_free(img);
         if (ret != 0) {
             printf("Encoding failed!\n"); return 1;
         }
-        printf("Encoded %s -> %s (q=%d mode=%s%s result_mode=%s steps=%d alpha=%s) in %.3f ms\n", input, output, info.result_q, huffman_mode == 1 ? "huffman" : huffman_mode == 2 ? "ebcot" : "best", chroma_420 ? " 420":"", info.ebcot ? "ebcot" : "huffman", info.search_steps, has_alpha ? (info.alpha_one ? "skip" : "encoded") : "none", dt);
+        printf("Encoded %s -> %s (q=%d mode=%s%s result_mode=%s steps=%d alpha=%s) in %.3f ms\n", input, output, info.result_q, encode_mode == WTPC_ENC_HUFFMAN ? "huffman" : encode_mode == WTPC_ENC_EBCOT ? "ebcot" : "best", chroma_420 ? " 420":"", info.ebcot ? "ebcot" : "huffman", info.search_steps, has_alpha ? (info.alpha_one ? "skip" : "encoded") : "none", dt);
         if (!info.ebcot)
             printf("  huffman  Y:tbl=%d(%s) U:tbl=%d(%s) V:tbl=%d(%s)  custom_bits=Y:%d U:%d V:%d\n",
                 info.huffman_y_table, info.huffman_y_table == NUM_DEF_TABLES ? "custom" : "static",
                 info.huffman_u_table, info.huffman_u_table == NUM_DEF_TABLES ? "custom" : "static",
                 info.huffman_v_table, info.huffman_v_table == NUM_DEF_TABLES ? "custom" : "static",
                 info.huffman_y_size, info.huffman_u_size, info.huffman_v_size);
+        }
     } else if (mode == 0) {
-        /* Decode: auto-output = append .png */
-        char auto_out[1024];
-        if (!output) { snprintf(auto_out, sizeof(auto_out), "%s.png", input); output = auto_out; }
-        double t0 = now_ms();
-        int w, h, quality, comp;
-        unsigned char *rgb = wtpc_decode_file(input, &w, &h, &quality, &comp);
-        double dt = now_ms() - t0;
-        if (!rgb) { printf("Decoding failed!\n"); return 1; }
-        /* Detect format from extension: .png .bmp .tga .jpg */
-        const char *ext = strrchr(output, '.');
-        int ret = -1;
-        if (ext && strcmp(ext, ".bmp") == 0) ret = stbi_write_bmp(output, w, h, comp, rgb) ? 0 : -1;
-        else if (ext && strcmp(ext, ".tga") == 0) ret = stbi_write_tga(output, w, h, comp, rgb) ? 0 : -1;
-        else if (ext && strcmp(ext, ".jpg") == 0) ret = stbi_write_jpg(output, w, h, comp, rgb, 90) ? 0 : -1;
-        else ret = stbi_write_png(output, w, h, comp, rgb, w*comp) ? 0 : -1;
-        free(rgb);
-        if (ret != 0) { printf("Cannot write output: %s\n", output); return 1; }
-        printf("Decoded %s -> %s (%d comp) in %.3f ms\n", input, output, comp, dt);
+        /* Auto-detect whash vs wtpc from extension or -m flag */
+        const char *iext = strrchr(input, '.');
+        int is_whash = hash_mode || (iext && strcmp(iext, ".whash") == 0);
+        if (is_whash) {
+            /* Wavelet hash decode: .whash -> .png */
+            char auto_out[1024];
+            if (!output) { snprintf(auto_out, sizeof(auto_out), "%s.png", input); output = auto_out; }
+            FILE *f = fopen(input, "rb");
+            if (!f) { printf("Cannot open: %s\n", input); return 1; }
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            if (sz < 3 || sz > 4096) { fclose(f); printf("Invalid whash file: %s (%ld bytes)\n", input, sz); return 1; }
+            uint8_t *hash = (uint8_t*)malloc((size_t)sz);
+            if (!hash || fread(hash, 1, (size_t)sz, f) != (size_t)sz) { free(hash); fclose(f); return 1; }
+            fclose(f);
+            int dec_w, dec_h;
+            unsigned char *rgb = wtpc_hash_decode_mem(hash, (int)sz, &dec_w, &dec_h);
+            free(hash);
+            if (!rgb) { printf("Hash decoding failed!\n"); return 1; }
+            if (!stbi_write_png(output, dec_w, dec_h, 3, rgb, dec_w*3)) { free(rgb); printf("Cannot write: %s\n", output); return 1; }
+            free(rgb);
+            printf("Hash: %dx%d <- %ld bytes -> %s\n", dec_w, dec_h, sz, output);
+        } else {
+            /* Decode: auto-output = append .png */
+            char auto_out[1024];
+            if (!output) { snprintf(auto_out, sizeof(auto_out), "%s.png", input); output = auto_out; }
+            double t0 = now_ms();
+            int w, h, quality, comp;
+            unsigned char *rgb = wtpc_decode_file(input, &w, &h, &quality, &comp);
+            double dt = now_ms() - t0;
+            if (!rgb) { printf("Decoding failed!\n"); return 1; }
+            /* Detect format from extension: .png .bmp .tga .jpg */
+            const char *ext = strrchr(output, '.');
+            int ret = -1;
+            if (ext && strcmp(ext, ".bmp") == 0) ret = stbi_write_bmp(output, w, h, comp, rgb) ? 0 : -1;
+            else if (ext && strcmp(ext, ".tga") == 0) ret = stbi_write_tga(output, w, h, comp, rgb) ? 0 : -1;
+            else if (ext && strcmp(ext, ".jpg") == 0) ret = stbi_write_jpg(output, w, h, comp, rgb, 90) ? 0 : -1;
+            else ret = stbi_write_png(output, w, h, comp, rgb, w*comp) ? 0 : -1;
+            free(rgb);
+            if (ret != 0) { printf("Cannot write output: %s\n", output); return 1; }
+            printf("Decoded %s -> %s (%d comp) in %.3f ms\n", input, output, comp, dt);
+        }
 #ifndef _WIN32
     } else if (mode == 3) {
         if (!input) { printf("Usage: wtpc -g <directory>\n"); return 1; }
@@ -1480,13 +1668,33 @@ int main(int argc, char **argv) {
 #endif
 #ifdef WTPC_TUNE_PARAMS
     } else if (mode == 4) {
-        int nparams = tune_420 ? NPARAMS_420 : NPARAMS_MAIN;
-        if (!input) { printf("Usage: wtpc -T <directory> [-420] [-S <start>] [-v]\n"); return 1; }
-        if (tune_start < 0 || tune_start >= nparams) { printf("Invalid -S: must be 0..%d\n", nparams-1); return 1; }
-        if (tune_420)
-            tune_grid(input, param_cfg_420, NPARAMS_420, P420_BAND0, 1, tune_start);
-        else
-            tune_grid(input, param_cfg, NPARAMS_MAIN, 0, 0, tune_start);
+        if (!input) { printf("Usage: wtpc -T <directory> [-420] [-E] [-S <start>] [-v]\n"); return 1; }
+        int tune_targets[] = {1000, 2000, 4000, 8000, 16000, 26000, 36000};
+        int tune_targets_ext[] = {50*1024, 80*1024, 130*1024, 200*1024, 540*1024, 1000*1024, 1500*1024};
+        int ntargets = sizeof(tune_targets) / sizeof(tune_targets[0]);
+        if (tune_420 && !tune_ext) {
+            /* -T -420: band C420 tuning */
+            int nparams = NPARAMS_420;
+            if (tune_start < 0 || tune_start >= nparams) { printf("Invalid -S: must be 0..%d\n", nparams-1); return 1; }
+            tune_grid(input, param_cfg_420, NPARAMS_420, P_C420_LH0, 1, tune_start, 0, tune_targets, ntargets);
+        } else if (tune_ext) {
+            if (tune_420) {
+                /* -T -E -420: EXT 4:2:0 (params 4..5, auto start=4) */
+                int start = tune_start >= 0 ? tune_start : 4;
+                if (start < 4 || start >= NPARAMS_EXT) { printf("Invalid -S: must be 4..%d\n", NPARAMS_EXT-1); return 1; }
+                tune_grid(input, param_cfg_ext, NPARAMS_EXT, P_EXT_MULT_C420 - 4, 1, start, 1, tune_targets_ext, (int)(sizeof(tune_targets_ext)/sizeof(tune_targets_ext[0])));
+            } else {
+                /* -T -E: EXT 4:4:4 (params 0..3) */
+                int nparams = 4;
+                if (tune_start < 0 || tune_start >= nparams) { printf("Invalid -S: must be 0..%d\n", nparams-1); return 1; }
+                tune_grid(input, param_cfg_ext, nparams, P_EXT_MULT_Y, 0, tune_start, 1, tune_targets_ext, (int)(sizeof(tune_targets_ext)/sizeof(tune_targets_ext[0])));
+            }
+        } else {
+            /* -T: main band tuning */
+            int nparams = NPARAMS_MAIN;
+            if (tune_start < 0 || tune_start >= nparams) { printf("Invalid -S: must be 0..%d\n", nparams-1); return 1; }
+            tune_grid(input, param_cfg, NPARAMS_MAIN, 0, 0, tune_start, 0, tune_targets, ntargets);
+        }
     } else if (mode == 5) {
         if (!input) { printf("Usage: wtpc -R <directory>\n"); return 1; }
         calibrate_qfit(input);
@@ -1502,24 +1710,27 @@ int main(int argc, char **argv) {
         int16_t test_coeffs[1000];
         for(int i = 0; i < 1000; i++) test_coeffs[i] = 0;
         test_coeffs[0] = 5; test_coeffs[10] = -3; test_coeffs[50] = 120; test_coeffs[999] = 7;
+        int t_pw = 1000+2; int16_t t_pad[1002*3] = {0};
+        for(int x=0;x<1000;x++) t_pad[1*t_pw+(x+1)]=test_coeffs[x];
         int freq[NUM_HUFF_SYMBOLS];
-        count_frequencies(test_coeffs, 1000, freq);
+        count_frequencies(t_pad, 1000, 1, freq);
         int cl[NUM_HUFF_SYMBOLS];
         uint32_t hc[NUM_HUFF_SYMBOLS];
         build_huffman_codes(freq, NUM_HUFF_SYMBOLS, cl);
         generate_canonical_codes(cl, NUM_HUFF_SYMBOLS, hc);
         uint8_t *enc_buf=(uint8_t*)malloc(10000);
         Bitstream bs; bitstream_init(&bs, enc_buf, 10000);
-        huffman_encode_runval(&bs, test_coeffs, 1000, 1, hc, cl);
+        huffman_encode_runval(&bs, t_pad, 1000, 1, hc, cl);
         bitstream_flush(&bs);
         int enc_len = bitstream_bytes(&bs);
-        int16_t *dec_coeffs = (int16_t*)calloc(1000, sizeof(int16_t));
+        int16_t *dec_coeffs = (int16_t*)calloc((size_t)(1000+2)*3, sizeof(int16_t));
         Bitstream rbs;
         bitstream_init(&rbs, enc_buf, enc_len);
         huffman_decode_channel(&rbs, dec_coeffs, 1000, 1, cl, hc);
         int errors = 0;
-        for(int i = 0; i < 1000; i++)
-            if(test_coeffs[i] != dec_coeffs[i]) { if(errors<10) printf("[%d] %d!=%d\n", i, test_coeffs[i], dec_coeffs[i]); errors++; }
+        for(int y = 0; y < 1; y++)
+            for(int x = 0; x < 1000; x++)
+                if(test_coeffs[y*1000 + x] != dec_coeffs[(size_t)(y+1)*1002 + (x+1)]) { if(errors<10) printf("[%d] %d!=%d\n", y*1000+x, test_coeffs[y*1000+x], (int)dec_coeffs[(size_t)(y+1)*1002 + (x+1)]); errors++; }
         if(errors == 0)
             printf("[SELF-TEST HUFFMAN] OK: 1000 coeffs, %d bytes\n", enc_len);
         else
@@ -1533,10 +1744,15 @@ int main(int argc, char **argv) {
             int nsz = (int)(sizeof(szs)/sizeof(szs[0]));
             for (int mode = 0; mode < 2 && !hf2; mode++) {  /* 0=single, 1=ctx */
                 for (int t = 0; t < nsz && !hf2; t++) {
-                    int tw = szs[t][0], th = szs[t][1], tt = tw*th;
-                    int16_t *src = malloc(tt*sizeof(int16_t));
-                    for (int i = 0; i < tt; i++) { int r = (i*37+13)%97; src[i] = (r<70)?0 : (int16_t)((r*7)%127-63); }
-                    int fq[NUM_HUFF_SYMBOLS]; count_frequencies(src, tt, fq);
+                    int tw = szs[t][0], th = szs[t][1], tt = tw*th, spw = tw+2;
+                    int16_t *src = calloc((size_t)spw*(th+2), sizeof(int16_t));
+                    for (int y = 0; y < th; y++) {
+                        for (int x = 0; x < tw; x++) {
+                            int i = y*tw + x, r = (i*37+13)%97;
+                            src[(size_t)(y+1)*spw + (x+1)] = (r<70)?0 : (int16_t)((r*7)%127-63);
+                        }
+                    }
+                    int fq[NUM_HUFF_SYMBOLS]; count_frequencies(src, tw, th, fq);
                     int cl[NUM_HUFF_SYMBOLS]; uint32_t hc[NUM_HUFF_SYMBOLS];
                     build_huffman_codes(fq, NUM_HUFF_SYMBOLS, cl);
                     generate_canonical_codes(cl, NUM_HUFF_SYMBOLS, hc);
@@ -1548,37 +1764,41 @@ int main(int argc, char **argv) {
                     else      huffman_encode_runval(&w, src, tw, th, hc, cl);
                     bitstream_flush(&w);
                     int el = bitstream_bytes(&w);
-                    int16_t *dst = calloc(tt, sizeof(int16_t));
+                    int16_t *dst = calloc((size_t)spw*(th+2), sizeof(int16_t));
                     Bitstream rb; bitstream_init(&rb, eb, el);
                     if (mode) huffman_decode_ctx(&rb, dst, tw, th, cl, hc, cl1, hc1);
                     else      huffman_decode_channel(&rb, dst, tw, th, cl, hc);
-                    for (int i = 0; i < tt; i++)
-                        if (src[i] != dst[i]) { hf2++; printf("  HF2D mode=%d %dx%d idx=%d: %d!=%d\n", mode, tw, th, i, src[i], dst[i]); break; }
+                    for (int y = 0; y < th && !hf2; y++)
+                        for (int x = 0; x < tw && !hf2; x++)
+                            if (src[(size_t)(y+1)*spw + (x+1)] != dst[(size_t)(y+1)*spw + (x+1)]) { hf2++; printf("  HF2D mode=%d %dx%d idx=%d: %d!=%d\n", mode, tw, th, y*tw+x, (int)src[(size_t)(y+1)*spw + (x+1)], (int)dst[(size_t)(y+1)*spw + (x+1)]); break; }
                     free(src); free(dst); free(eb);
                 }
             }
             if (hf2 == 0) printf("[SELF-TEST HUFFMAN-2D] OK: %d sizes x 2 modes exact roundtrip\n", nsz);
             else { printf("[SELF-TEST HUFFMAN-2D] FAIL: %d\n", hf2); all_ok = 0; }
         }
-        /* Self-test: EBCOT roundtrip (small block) */
-        int w = 4, h = 4, total = 16;
-        int16_t c[16] = {0,5,-3,0, 0,0,12,0, 0,-7,0,0, 1,0,0,0};
+        /* Self-test: EBCOT roundtrip (small block). 4x4 padded to 6x6. */
+        int w = 4, h = 4, pw = w + 2;
+        int16_t c[(4+2)*(4+2)] = { 0,0,0,0,0,0, 0,0,5,-3,0,0, 0,0,0,12,0,0, 0,0,-7,0,0,0, 0,1,0,0,0,0, 0,0,0,0,0,0};
         int bp = 0, mv = 0;
-        for(int i = 0; i < total; i++) { int av = abs(c[i]); if(av > mv) mv = av; }
+        for (int y = 1; y <= h; y++)
+            for (int x = 1; x <= w; x++) { int av = abs(c[(size_t)y*pw + x]); if (av > mv) mv = av; }
         while(mv > 0) { bp++; mv >>= 1; }
         if(bp == 0) bp = 1;
         uint8_t *buf = (uint8_t*)malloc(4096);
         BacEnc e;
         bac_init_enc(&e, buf, 4096);
-        ebcot_encode_channel(&e, c, w, h, NULL, 20);
+        ebcot_encode_channel(&e, c, w, h, NULL, 20, pw);
         int sz = bac_flush_enc(&e);
-        int16_t *d=(int16_t*)calloc(total, sizeof(int16_t));
+        int16_t *d=(int16_t*)calloc((size_t)pw*(h+2), sizeof(int16_t));
         BacDec dec;
         bac_init_dec(&dec, buf, sz);
-        ebcot_decode_channel(&dec, d, w, h, NULL, 20);
+        ebcot_decode_channel(&dec, d, w, h, NULL, 20, pw);
         errors = 0;
-        for(int i = 0; i < total;i++)
-            if(c[i] != d[i]) { if(errors < 10) printf("[%d] %d!=%d\n", i, c[i], d[i]); errors++; }
+        for(int y = 0; y < h; y++)
+            for(int x = 0; x < w; x++)
+                if(c[(size_t)(y+1)*pw + (x+1)] != d[(size_t)(y+1)*pw + (x+1)])
+                    { if(errors < 10) printf("[%d] %d!=%d\n", y*w+x, (int)c[(size_t)(y+1)*pw + (x+1)], (int)d[(size_t)(y+1)*pw + (x+1)]); errors++; }
         if(errors == 0)
             printf("[SELF-TEST EBCOT]  OK: 4x4 roundtrip, %d bytes\n", sz);
         else
@@ -1586,32 +1806,37 @@ int main(int argc, char **argv) {
         free(buf); free(d);
         /* Stress-test: EBCOT roundtrip on pseudo-random coeffs w/ large range */
         {
-            int sw = 48, sh = 48, st = sw*sh;
-            int16_t *sc = (int16_t*)malloc(st*sizeof(int16_t));
-            int16_t *sd = (int16_t*)calloc(st, sizeof(int16_t));
+            int sw = 48, sh = 48, st = sw*sh, spw = sw + 2;
+            int16_t *sc = (int16_t*)calloc((size_t)spw*(sh+2), sizeof(int16_t));
+            int16_t *sd = (int16_t*)calloc((size_t)spw*(sh+2), sizeof(int16_t));
             unsigned rng = 12345, fails = 0;
             for(int trial = 0; trial < 200 && fails == 0; trial++) {
                 int maxbits = 1 + (trial % 15);  /* 1..15-bit magnitudes; include tiny */
-                for(int i = 0; i < st; i++){
-                    rng = rng*1664525u + 1013904223u;
-                    int mag = (rng >> 9) & ((1 << maxbits) - 1);
-                    /* make it sparse like real wavelet coeffs */
-                    if(((rng >> 3) & 7) < 5) mag = 0;
-                    sc[i] = (rng & 0x100) ? -mag : mag;
+                for(int y = 0; y < sh; y++) {
+                    for(int x = 0; x < sw; x++) {
+                        rng = rng*1664525u + 1013904223u;
+                        int mag = (rng >> 9) & ((1 << maxbits) - 1);
+                        /* make it sparse like real wavelet coeffs */
+                        if(((rng >> 3) & 7) < 5) mag = 0;
+                        sc[(size_t)(y+1)*spw + (x+1)] = (rng & 0x100) ? (int16_t)(-mag) : (int16_t)mag;
+                    }
                 }
                 int sbp=0, smv=0;
-                for(int i = 0; i < st;i++) { int av = abs(sc[i]); if(av>smv) smv=av; }
+                for(int y = 1; y <= sh; y++)
+                    for(int x = 1; x <= sw; x++)
+                        { int av = abs(sc[(size_t)y*spw + x]); if(av>smv) smv=av; }
                 while(smv > 0) { sbp++; smv >>= 1; } if(sbp == 0) sbp=1;
                 uint8_t *sbuf = (uint8_t*)malloc(st*6 + 4096);
                 BacEnc se; bac_init_enc(&se, sbuf, st*6 + 4096);
-                ebcot_encode_channel(&se, sc, sw, sh, NULL, 20);
+                ebcot_encode_channel(&se, sc, sw, sh, NULL, 20, spw);
                 int ssz=bac_flush_enc(&se);
-                memset(sd, 0, st*sizeof(int16_t));
+                memset(sd, 0, (size_t)spw*(sh+2)*sizeof(int16_t));
                 BacDec sdec;
                 bac_init_dec(&sdec, sbuf, ssz);
-                ebcot_decode_channel(&sdec, sd, sw, sh, NULL, 20);
-                for(int i = 0; i < st; i++)
-                    if(sc[i] != sd[i]) { fails++; if(fails <= 3) printf("[STRESS trial %d bits %d] idx %d: %d!=%d\n", trial, maxbits, i, sc[i], sd[i]); }
+                ebcot_decode_channel(&sdec, sd, sw, sh, NULL, 20, spw);
+                for(int y = 0; y < sh; y++)
+                    for(int x = 0; x < sw; x++)
+                        if(sc[(size_t)(y+1)*spw + (x+1)] != sd[(size_t)(y+1)*spw + (x+1)]) { fails++; if(fails <= 3) printf("[STRESS trial %d bits %d] idx %d: %d!=%d\n", trial, maxbits, y*sw+x, (int)sc[(size_t)(y+1)*spw + (x+1)], (int)sd[(size_t)(y+1)*spw + (x+1)]); }
                 free(sbuf);
             }
             if(fails == 0)
@@ -1626,29 +1851,31 @@ int main(int argc, char **argv) {
             unsigned rng = 999983, total_fails = 0, total_trials = 0;
             for (int si = 0; test_w[si] != 0; si++) {
                 int sw = test_w[si], sh = sw + (si & 1);
-                int st = sw * sh;
-                int16_t *sc = (int16_t*)malloc(st*sizeof(int16_t));
-                int16_t *sd = (int16_t*)calloc(st, sizeof(int16_t));
+                int st = sw * sh, spw = sw + 2;
+                int16_t *sc = (int16_t*)calloc((size_t)spw*(sh+2), sizeof(int16_t));
+                int16_t *sd = (int16_t*)calloc((size_t)spw*(sh+2), sizeof(int16_t));
                 for (int trial = 0; trial < 20; trial++) {
                     int maxbits = 1 + (trial % 14);
-                    for (int i = 0; i < st; i++) {
-                        rng = rng*1664525u + 1013904223u;
-                        int mag = (rng >> 9) & ((1 << maxbits) - 1);
-                        if (((rng >> 3) & 7) < 5) mag = 0;
-                        sc[i] = (rng & 0x100) ? (int16_t)-mag : (int16_t)mag;
+                    for (int y = 0; y < sh; y++) {
+                        for (int x = 0; x < sw; x++) {
+                            rng = rng*1664525u + 1013904223u;
+                            int mag = (rng >> 9) & ((1 << maxbits) - 1);
+                            if (((rng >> 3) & 7) < 5) mag = 0;
+                            sc[(size_t)(y+1)*spw + (x+1)] = (rng & 0x100) ? (int16_t)(-mag) : (int16_t)mag;
+                        }
                     }
                     int sbp=0, smv=0;
-                    for (int i=0;i<st;i++){int av=abs(sc[i]);if(av>smv)smv=av;}
+                    for (int y=1;y<=sh;y++)for(int x=1;x<=sw;x++){int av=abs(sc[(size_t)y*spw+x]);if(av>smv)smv=av;}
                     while(smv>0){sbp++;smv>>=1;} if(sbp==0)sbp=1;
                     uint8_t *sbuf=(uint8_t*)malloc(st*6+4096);
                     BacEnc se; bac_init_enc(&se,sbuf,st*6+4096);
-                    ebcot_encode_channel(&se, sc, sw, sh, NULL, 20);
+                    ebcot_encode_channel(&se, sc, sw, sh, NULL, 20, spw);
                     int ssz=bac_flush_enc(&se);
-                    memset(sd,0,st*sizeof(int16_t));
+                    memset(sd,0,(size_t)spw*(sh+2)*sizeof(int16_t));
                     BacDec sdec; bac_init_dec(&sdec,sbuf,ssz);
-                    ebcot_decode_channel(&sdec, sd, sw, sh, NULL, 20);
+                    ebcot_decode_channel(&sdec, sd, sw, sh, NULL, 20, spw);
                     unsigned f=0;
-                    for(int i=0;i<st;i++) if(sc[i]!=sd[i]) f++;
+                    for(int y=0;y<sh;y++)for(int x=0;x<sw;x++) if(sc[(size_t)(y+1)*spw+(x+1)]!=sd[(size_t)(y+1)*spw+(x+1)]) f++;
                     if(f){total_fails++; printf("[BAC-SIZE %dx%d trial %d] %u mismatches\n",sw,sh,trial,f);}
                     total_trials++;
                     free(sbuf);
@@ -1731,9 +1958,9 @@ int main(int argc, char **argv) {
             cdf97_forward_2d(ty, tw, th);
             cdf97_forward_2d(tu, tw, th);
             cdf97_forward_2d(tv, tw, th);
-            int16_t *qy = (int16_t*)malloc(tt*2), *qu = (int16_t*)malloc(tt*2), *qv = (int16_t*)malloc(tt*2);
-            quantize_coeffs(ty, qy, tw, th, compute_base(1), g_quant_y); quantize_coeffs(tu, qu, tw, th, compute_base(1), g_quant_c); quantize_coeffs(tv, qv, tw, th, compute_base(1), g_quant_c);
-            dequantize_channel(qy, ty, tw, th, compute_base(1), g_quant_y); dequantize_channel(qu, tu, tw, th, compute_base(1), g_quant_c); dequantize_channel(qv, tv, tw, th, compute_base(1), g_quant_c);
+            int16_t *qy = (int16_t*)malloc((size_t)(tw+2)*(th+2) * sizeof(int16_t)), *qu = (int16_t*)malloc((size_t)(tw+2)*(th+2) * sizeof(int16_t)), *qv = (int16_t*)malloc((size_t)(tw+2)*(th+2) * sizeof(int16_t));
+            quantize_coeffs(ty, qy, tw, th, compute_base(1), g_qt_y); quantize_coeffs(tu, qu, tw, th, compute_base(1), g_qt_c); quantize_coeffs(tv, qv, tw, th, compute_base(1), g_qt_c);
+            dequantize_channel(qy, ty, tw, th, compute_base(1), g_qt_y); dequantize_channel(qu, tu, tw, th, compute_base(1), g_qt_c); dequantize_channel(qv, tv, tw, th, compute_base(1), g_qt_c);
             cdf97_inverse_2d(ty, tw, th);
             cdf97_inverse_2d(tu, tw, th);
             cdf97_inverse_2d(tv, tw, th);
@@ -1763,13 +1990,13 @@ int main(int argc, char **argv) {
             cdf97_forward_2d(ty, tw, th);
             cdf97_forward_2d(tu, tw, th);
             cdf97_forward_2d(tv, tw, th);
-            qy = (int16_t*)malloc(tt*2); qu=(int16_t*)malloc(tt*2); qv=(int16_t*)malloc(tt*2);
-            quantize_coeffs(ty, qy, tw, th, compute_base(1), g_quant_y);
-            quantize_coeffs(tu, qu, tw, th, compute_base(1), g_quant_c);
-            quantize_coeffs(tv, qv, tw, th, compute_base(1), g_quant_c);
-            dequantize_channel(qy, ty, tw, th, compute_base(1), g_quant_y);
-            dequantize_channel(qu, tu, tw, th, compute_base(1), g_quant_c);
-            dequantize_channel(qv, tv, tw, th, compute_base(1), g_quant_c);
+            qy = (int16_t*)malloc((size_t)(tw+2)*(th+2) * sizeof(int16_t)); qu=(int16_t*)malloc((size_t)(tw+2)*(th+2) * sizeof(int16_t)); qv=(int16_t*)malloc((size_t)(tw+2)*(th+2) * sizeof(int16_t));
+            quantize_coeffs(ty, qy, tw, th, compute_base(1), g_qt_y);
+            quantize_coeffs(tu, qu, tw, th, compute_base(1), g_qt_c);
+            quantize_coeffs(tv, qv, tw, th, compute_base(1), g_qt_c);
+            dequantize_channel(qy, ty, tw, th, compute_base(1), g_qt_y);
+            dequantize_channel(qu, tu, tw, th, compute_base(1), g_qt_c);
+            dequantize_channel(qv, tv, tw, th, compute_base(1), g_qt_c);
             cdf97_inverse_2d(ty, tw, th);
             cdf97_inverse_2d(tu, tw, th);
             cdf97_inverse_2d(tv, tw, th);
@@ -1783,6 +2010,41 @@ int main(int argc, char **argv) {
             else
                 { printf("[SELF-TEST Q-ROUNDTRIP] FAIL: 256x256 psnr=%.2f dB (mse=%.1f)\n", psnr, mse); all_ok = 0; }
             free(ty); free(tu); free(tv); free(orig); free(dec); free(qy); free(qu); free(qv);
+        }
+        /* Full encode/decode roundtrip on narrow (1xN / Nx1) images.
+           The wavelet-only test covers 1xN, but the full pipeline (chroma
+           down/up, quant, entropy) has its own width/height asymmetries; a
+           1xN image must not decode to garbage while Nx1 is fine. */
+        {
+            int nfail = 0;
+            int narrow[][2] = {{1,16},{16,1},{1,64},{64,1},{1,256},{256,1},{2,64},{64,2},{1,3},{3,1},{1,2},{2,1}};
+            int nn = (int)(sizeof(narrow)/sizeof(narrow[0]));
+            for (int t = 0; t < nn; t++) {
+                int tw = narrow[t][0], th = narrow[t][1], tt = tw*th;
+                uint8_t *orig = (uint8_t*)malloc(tt*3);
+                unsigned rng = 777 + (unsigned)(tw*31 + th*7);
+                for (int i = 0; i < tt*3; i++) { rng = rng*1664525u + 1013904223u; orig[i] = (uint8_t)(rng >> 24); }
+                /* Test BOTH entropy coders: a mode-specific bug (e.g. EBCOT at
+                   width==1) must not hide behind the auto pick. */
+                for (int mode = 1; mode <= 2; mode++) {  /* 1=huffman, 2=ebcot */
+                    wtpc_enc_info info;
+                    unsigned char *enc = wtpc_encode_mem(orig, &info, tw, th, 0, 30, 0, mode, 0, 0, 0, 0);
+                    if (!enc) { nfail++; printf("  NARROW %dx%d mode=%d: encode failed\n", tw, th, mode); continue; }
+                    int dw = 0, dh = 0, dq = 0, dcomp = 0;
+                    unsigned char *dec = wtpc_decode_mem(enc, info.encoded_bytes, &dw, &dh, &dq, &dcomp);
+                    free(enc);
+                    if (!dec || dw != tw || dh != th) { nfail++; printf("  NARROW %dx%d mode=%d: decode failed\n", tw, th, mode); free(dec); continue; }
+                    double mse = 0;
+                    for (int i = 0; i < tt*3; i++) { double d = (double)orig[i] - (double)dec[i]; mse += d*d; }
+                    mse /= (tt*3);
+                    double psnr = (mse > 0) ? 10.0*log10(255.0*255.0/mse) : 99.0;
+                    if (psnr < 20.0) { nfail++; printf("  NARROW %dx%d mode=%d: psnr=%.2f dB (broken)\n", tw, th, mode, psnr); }
+                    free(dec);
+                }
+                free(orig);
+            }
+            if (nfail == 0) printf("[SELF-TEST NARROW] OK: %d narrow sizes x 2 modes roundtrip psnr>=20 dB\n", nn);
+            else { printf("[SELF-TEST NARROW] FAIL: %d broken\n", nfail); all_ok = 0; }
         }
         /* Bitstream edge case tests */
         {
@@ -1853,6 +2115,31 @@ int main(int argc, char **argv) {
                 printf("[SELF-TEST BITSTREAM] OK: edge cases passed\n");
             else
                 { printf("[SELF-TEST BITSTREAM] FAIL: %d failures\n", fails); all_ok = 0; }
+        }
+        /* Self-test: wavelet hash roundtrip (thumbhash-like ultra-compact) */
+        {
+            uint8_t rgb[4*4*3];
+            for (int i = 0; i < 4*4; i++) { rgb[i*3]=64; rgb[i*3+1]=128; rgb[i*3+2]=192; }
+            int hlen;
+            uint8_t *hash = wtpc_hash_encode_mem(rgb, 4, 4, &hlen);
+            if (!hash || hlen < 3) {
+                printf("[SELF-TEST HASH] FAIL: encode=%d\n", hlen); all_ok = 0; free(hash);
+            } else {
+                int dw, dh;
+                uint8_t *dec = wtpc_hash_decode_mem(hash, hlen, &dw, &dh);
+                free(hash);
+                if (!dec || dw != 4 || dh != 4) {
+                    printf("[SELF-TEST HASH] FAIL: decode\n"); all_ok = 0; free(dec);
+                } else {
+                    double err = 0; for (int i = 0; i < 4*4*3; i++) { double d = (double)rgb[i] - dec[i]; err += d*d; }
+                    err = sqrt(err / (4*4*3));
+                    if (err < 50.0)
+                        printf("[SELF-TEST HASH] OK: 4x4 roundtrip, %d bytes, rmse=%.1f\n", hlen, err);
+                    else
+                        { printf("[SELF-TEST HASH] FAIL: rmse=%.1f\n", err); all_ok = 0; }
+                    free(dec);
+                }
+            }
         }
         if(!all_ok) return 1;
     }
