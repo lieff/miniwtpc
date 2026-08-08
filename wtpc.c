@@ -1457,6 +1457,85 @@ static void train_priors(const char *dir_path) {
 }
 #endif  /* WTPC_TUNE_CTX */
 
+/* Simple area-average RGB downsample for whash resize */
+static unsigned char *downsample_rgb(const uint8_t *src, int sw, int sh, int *dw, int *dh) {
+    int max_dim = sw > sh ? sw : sh;
+    if (max_dim <= 256) { *dw = sw; *dh = sh; return NULL; }
+    double scale = 256.0 / max_dim;
+    *dw = (int)(sw * scale + 0.5); if (*dw < 1) *dw = 1;
+    *dh = (int)(sh * scale + 0.5); if (*dh < 1) *dh = 1;
+    unsigned char *dst = (unsigned char*)malloc((size_t)(*dw) * (*dh) * 3);
+    if (!dst) return NULL;
+    for (int y = 0; y < *dh; y++) {
+        int sy0 = (int)((double)y * sh / *dh), sy1 = (int)((double)(y + 1) * sh / *dh);
+        if (sy1 > sh) sy1 = sh;
+        for (int x = 0; x < *dw; x++) {
+            int sx0 = (int)((double)x * sw / *dw), sx1 = (int)((double)(x + 1) * sw / *dw);
+            if (sx1 > sw) sx1 = sw;
+            int r = 0, g = 0, b = 0, n = 0;
+            for (int sy = sy0; sy < sy1; sy++)
+                for (int sx = sx0; sx < sx1; sx++) {
+                    const uint8_t *p = src + ((size_t)sy * sw + sx) * 3;
+                    r += p[0]; g += p[1]; b += p[2]; n++;
+                }
+            uint8_t *d = dst + ((size_t)y * (*dw) + x) * 3;
+            d[0] = (uint8_t)((r + n/2) / n); d[1] = (uint8_t)((g + n/2) / n); d[2] = (uint8_t)((b + n/2) / n);
+        }
+    }
+    return dst;
+}
+
+static const char b64_alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char *base64_encode(const uint8_t *data, int len) {
+    int out_len = (len + 2) / 3 * 4;
+    char *out = (char*)malloc((size_t)out_len + 1);
+    if (!out) return NULL;
+    int j = 0;
+    for (int i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)data[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)data[i + 1] << 8;
+        if (i + 2 < len) v |= (uint32_t)data[i + 2];
+        out[j++] = b64_alphabet[(v >> 18) & 0x3F];
+        out[j++] = b64_alphabet[(v >> 12) & 0x3F];
+        out[j++] = (i + 1 < len) ? b64_alphabet[(v >> 6) & 0x3F] : '=';
+        out[j++] = (i + 2 < len) ? b64_alphabet[v & 0x3F] : '=';
+    }
+    out[j] = '\0';
+    return out;
+}
+
+static int b64_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static uint8_t *base64_decode(const char *in, int *out_len) {
+    int ilen = (int)strlen(in);
+    if (ilen < 4) return NULL;
+    int olen = ilen / 4 * 3;
+    if (ilen > 0 && in[ilen-1] == '=') olen--;
+    if (ilen > 1 && in[ilen-2] == '=') olen--;
+    uint8_t *out = (uint8_t*)malloc((size_t)olen);
+    if (!out) return NULL;
+    int j = 0;
+    for (int i = 0; i < ilen; i += 4) {
+        int v0 = b64_val(in[i]), v1 = b64_val(in[i+1]);
+        int v2 = (in[i+2] == '=') ? 0 : b64_val(in[i+2]);
+        int v3 = (in[i+3] == '=') ? 0 : b64_val(in[i+3]);
+        uint32_t v = ((uint32_t)v0 << 18) | ((uint32_t)v1 << 12) | ((uint32_t)v2 << 6) | (uint32_t)v3;
+        out[j++] = (uint8_t)(v >> 16);
+        if (in[i+2] != '=') out[j++] = (uint8_t)(v >> 8);
+        if (in[i+3] != '=') out[j++] = (uint8_t)(v);
+    }
+    *out_len = olen;
+    return out;
+}
+
 int main(int argc, char **argv) {
     const char *input = NULL, *output = NULL;
     int mode = -1;  /* 0=decode, 1=encode, 2=test */
@@ -1467,6 +1546,7 @@ int main(int argc, char **argv) {
     int block_size = 0;
     int huf_extra_ctx = 0; /* 0=single table, faster, 1 - context-aware (2 Huffman tables) for better compression, slower */
     int hash_mode = 0;     /* set by -m whash */
+    int decode_b64  = 0;   /* set by -dbase64 */
 #ifdef WTPC_TUNE_PARAMS
     int tune_start = 0;  /* -S: start grid from this param index (0=first) */
     int tune_420   = 0;  /* -420: tune chroma 4:2:0 params instead of main */
@@ -1482,6 +1562,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-e") == 0) mode = 1;
         else if (strcmp(argv[i], "-d") == 0) mode = 0;
+        else if (strcmp(argv[i], "-dbase64") == 0 && i+1 < argc) { input = argv[++i]; mode = 0; hash_mode = 1; decode_b64 = 1; }
         else if (strcmp(argv[i], "-t") == 0) mode = 2;
         else if (strcmp(argv[i], "-q") == 0 && i+1 < argc) quality = atoi(argv[++i]);
         else if (strcmp(argv[i], "-b") == 0 && i+1 < argc) target_bytes = atoi(argv[++i]);
@@ -1510,10 +1591,11 @@ int main(int argc, char **argv) {
     if (mode == -1 || !input) {
         printf("Usage:\n");
         printf("  wtpc -e input.png -o output.wtp [-q QUALITY] [-c] [-b TARGET_BYTES]\n");
-        printf("  wtpc -d input.wtp -o output.png\n");
+        printf("  wtpc -d input.wtpc -o output.png\n");
         printf("  wtpc -t input.png [-q quality]   (self-test)\n");
         printf("  wtpc -e input.png -o output -m whash   (encode wavelet hash -> .whash)\n");
-        printf("  wtpc -d input.whash -o output.png -m whash   (decode wavelet hash -> .png)\n");
+        printf("  wtpc -d input.whash -o output.png -m whash  (decode wavelet hash -> .png)\n");
+        printf("  wtpc -dbase64 HASH_STRING [-o output.png]   (decode base64 whash)\n");
         printf("  -e  encode mode\n");
         printf("  -d  decode mode\n");
         printf("  -q  quality 1 - %d (default 20)\n", MAX_QUALITY);
@@ -1560,7 +1642,13 @@ int main(int argc, char **argv) {
             int w, h, comp;
             unsigned char *img = stbi_load(input, &w, &h, &comp, 3);
             if (!img) { printf("Cannot load: %s, reason: %s\n", input, stbi_failure_reason()); return 1; }
-            if (w > 256 || h > 256) { printf("Hash mode supports max 256x256 (got %dx%d)\n", w, h); stbi_image_free(img); return 1; }
+            if (w > 256 || h > 256) {
+                int rw, rh;
+                unsigned char *rs = downsample_rgb(img, w, h, &rw, &rh);
+                if (!rs) { printf("Hash resize failed!\n"); stbi_image_free(img); return 1; }
+                stbi_image_free(img);
+                img = rs; w = rw; h = rh;
+            }
             int hlen;
             uint8_t *hash = wtpc_hash_encode_mem(img, w, h, &hlen);
             stbi_image_free(img);
@@ -1570,6 +1658,8 @@ int main(int argc, char **argv) {
             fwrite(hash, 1, (size_t)hlen, f);
             fclose(f);
             printf("Hash: %dx%d -> %d bytes -> %s\n", w, h, hlen, output);
+            char *b64 = base64_encode(hash, hlen);
+            if (b64) { printf("base64: %s\n", b64); free(b64); }
             free(hash);
         } else {
         /* Encode: auto-output = replace extension with .wtpc */
@@ -1623,24 +1713,52 @@ int main(int argc, char **argv) {
         /* Auto-detect whash vs wtpc from extension or -m flag */
         const char *iext = strrchr(input, '.');
         int is_whash = hash_mode || (iext && strcmp(iext, ".whash") == 0);
-        if (is_whash) {
-            /* Wavelet hash decode: .whash -> .png */
+        if (is_whash || decode_b64) {
+            uint8_t *hash = NULL;
+            int hash_len = 0;
+            if (decode_b64) {
+                /* Decode from base64 string */
+                hash = base64_decode(input, &hash_len);
+                if (!hash) { printf("Base64 decode failed!\n"); return 1; }
+            } else {
+                /* Read from .whash file */
+                char auto_out[1024];
+                if (!output) { snprintf(auto_out, sizeof(auto_out), "%s.png", input); output = auto_out; }
+                FILE *f = fopen(input, "rb");
+                if (!f) { printf("Cannot open: %s\n", input); return 1; }
+                fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                if (sz < 3 || sz > 4096) { fclose(f); printf("Invalid whash file: %s (%ld bytes)\n", input, sz); return 1; }
+                hash = (uint8_t*)malloc((size_t)sz);
+                if (!hash || fread(hash, 1, (size_t)sz, f) != (size_t)sz) { free(hash); fclose(f); return 1; }
+                fclose(f);
+                hash_len = (int)sz;
+            }
+            /* Generate output filename if not specified */
             char auto_out[1024];
-            if (!output) { snprintf(auto_out, sizeof(auto_out), "%s.png", input); output = auto_out; }
-            FILE *f = fopen(input, "rb");
-            if (!f) { printf("Cannot open: %s\n", input); return 1; }
-            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-            if (sz < 3 || sz > 4096) { fclose(f); printf("Invalid whash file: %s (%ld bytes)\n", input, sz); return 1; }
-            uint8_t *hash = (uint8_t*)malloc((size_t)sz);
-            if (!hash || fread(hash, 1, (size_t)sz, f) != (size_t)sz) { free(hash); fclose(f); return 1; }
-            fclose(f);
+            if (!output) {
+                if (decode_b64) {
+                    /* Replace invalid filename chars from base64 string */
+                    int j = 0, max_len = 100;
+                    for (const char *s = input; *s && j < max_len; s++) {
+                        char ch = *s;
+                        if (ch == '/') ch = '_';
+                        else if (ch == '+' || ch == '=' || ch == '\n' || ch == '\r') continue;
+                        auto_out[j++] = ch;
+                    }
+                    auto_out[j] = '\0';
+                    strcat(auto_out, ".png");
+                } else {
+                    snprintf(auto_out, sizeof(auto_out), "%s.png", input);
+                }
+                output = auto_out;
+            }
             int dec_w, dec_h;
-            unsigned char *rgb = wtpc_hash_decode_mem(hash, (int)sz, &dec_w, &dec_h);
+            unsigned char *rgb = wtpc_hash_decode_mem(hash, hash_len, &dec_w, &dec_h);
             free(hash);
             if (!rgb) { printf("Hash decoding failed!\n"); return 1; }
             if (!stbi_write_png(output, dec_w, dec_h, 3, rgb, dec_w*3)) { free(rgb); printf("Cannot write: %s\n", output); return 1; }
             free(rgb);
-            printf("Hash: %dx%d <- %ld bytes -> %s\n", dec_w, dec_h, sz, output);
+            printf("Hash: %dx%d <- %d bytes -> %s\n", dec_w, dec_h, hash_len, output);
         } else {
             /* Decode: auto-output = append .png */
             char auto_out[1024];

@@ -747,7 +747,7 @@ if any(k.startswith('AVIF_S') for k in data):
         if speed == '0':
             md.append('> **Speed 0:** AVIF wins on ssim2 from 2 KB to 26 KB, but encoding is up to 370x slower than WTPC.')
         elif speed == '6':
-            md.append('> **Speed 6:** AVIF wins on ssim2 from 2 KB to 16 KB and the gap narrows, but encoding is still up to 8x slower than WTPC.')
+            md.append('> **Speed 6:** AVIF wins on ssim2 from 4 KB to 16 KB and the gap narrows, but encoding is still up to 8x slower than WTPC.')
         elif speed == '10':
             md.append('> **Speed 10:** AVIF loses on ssim2 at all sizes, but encoding speed is now comparable (though slightly slower than WTPC).')
         md.append('')

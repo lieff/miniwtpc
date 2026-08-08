@@ -3,7 +3,7 @@
 **Test image:** `lena256.png` (256x256, 24-bit RGB)  
 **Target range:** 200 B - 36 KB (thumbnails / previews)  
 **Metrics:** PSNR (dB, higher is better), ssimulacra2 (0-100, higher is better)
-**Date:** 2026-08-07
+**Date:** 2026-08-08
 
 ## PSNR vs File Size
 
@@ -26,7 +26,7 @@ xychart-beta
 ### Standard range (1.4 KB - 36 KB)
 
 ```mermaid
-%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#3366cc, #dc3912, #ff9900, #109618, #0099c6, #990099, #dd4477"}}}}%%
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#0099c6, #990099, #dd4477, #3366cc, #dc3912, #ff9900, #109618"}}}}%%
 xychart-beta
     title "Standard range"
     y-axis "PSNR (dB)" 21 --> 42
@@ -39,7 +39,7 @@ xychart-beta
     line "W420 EBC" [26.01, 26.25, 27.11, 28.52, 29.63, 30.62, 31.48, 32.93, 34.11, 35.42, 36.01, 36.74, 37.10, 37.36, 37.69, 37.91, 38.05, 38.15, 38.31]
     line "W420 Huff" [25.33, 25.63, 26.63, 28.01, 28.97, 29.87, 30.64, 31.97, 33.12, 34.45, 35.14, 35.98, 36.37, 36.76, 37.18, 37.49, 37.67, 37.81, 38.03]
 ```
-🔵 WTPC EBC  🔴 WTPC Huff  🟠 W420 EBC  🟢 W420 Huff  🔹 JPEG  🟣 JPEG2000  💗 JPEGXL
+🔹 JPEG  🟣 JPEG2000  💗 JPEGXL  🔵 WTPC EBC  🔴 WTPC Huff  🟠 W420 EBC  🟢 W420 Huff
 
 ## Comparison by Size Steps
 
@@ -233,4 +233,4 @@ WTPC uses -b to match avif sizes.
 
 ---
 
-*Tools: ImageMagick 7.1.2, OpenJPEG 2.5.4, libjxl 0.11.1, avifenc 1.3.0. Date: 2026-08-07.*
+*Tools: ImageMagick 7.1.2, OpenJPEG 2.5.4, libjxl 0.11.1, avifenc 1.3.0. Date: 2026-08-08.*

@@ -91,8 +91,7 @@ Link with `-lm`.
    typedef enum {
        WTPC_ENC_AUTO    = 0,
        WTPC_ENC_HUFFMAN = 1,
-       WTPC_ENC_EBCOT   = 2,
-       WTPC_ENC_WHASH   = 3
+       WTPC_ENC_EBCOT   = 2
    } wtpc_enc_mode;
 
    typedef struct {
@@ -195,8 +194,9 @@ The standalone `wtpc` binary (built via `build.sh` or `gcc -O3 wtpc.c -o wtpc -l
 
 | Flag | Description |
 |------|-------------|
-| `-e in.png` | Encode mode (requires `-o out.wtp`). With `-m whash`: encode wavelet hash -> `.whash` |
+| `-e in.png` | Encode mode (requires `-o out.wtp`). With `-m whash`: encode wavelet hash -> `.whash` (also prints base64) |
 | `-d in.wtp` | Decode mode (requires `-o out.png`). With `.whash` input: auto-detect hash decode |
+| `-dbase64 STR` | Decode base64-encoded whash string to PNG (see `-m whash` output) |
 | `-t in.png` | Self-test: encode + decode + compare PSNR |
 | `-q N` | Quality 1..1024 (lower = better/larger) |
 | `-b N` | Target file size in bytes (auto-finds q) |
@@ -327,14 +327,24 @@ Click any image to view full size.
 | 16 KB | ![](samples/AVIF_S6_16kb.png) | ![](samples/WTPC_vs_AVIF_16kb.png) |
 | 36 KB | ![](samples/AVIF_S6_36kb.png) | ![](samples/WTPC_vs_AVIF_36kb.png) |
 
-**Whash vs ThumbHash** -- wavelet hash vs DCT hash on lena 256x256
+**Whash vs thumb / splat / blur hashes on same set as SplatHash (avg sizes over 10 images)**
 
-| lena 256x256 | WTPC Whash (48 B) | ThumbHash (24 B) |
-|:------------:|:-----------------:|:----------------:|
-| ![](lena256.png) | ![](samples/lena256.whash.png) | ![](samples/lena128.thumbhash.png) |
+| Original | WTPC Whash (~36 B) | SplatHash (~16 B) | BlurHash (~28 B) | ThumbHash (~20 B) |
+|:--------:|:------------------:|:-----------------:|:----------------:|:-----------------:|
+| ![](lena256.png) | ![](samples/lena256.whash.png) | ![](samples/lena256.splathash.png) | ![](samples/lena256.blurhash.png) | ![](samples/lena256.thumbhash.png) |
+| ![](samples/wallhaven-3q3j6y_256.png) | ![](samples/wallhaven-3q3j6y_256.whash.png) | ![](samples/wallhaven-3q3j6y_256.splathash.png) | ![](samples/wallhaven-3q3j6y_256.blurhash.png) | ![](samples/wallhaven-3q3j6y_256.thumbhash.png) |
+| ![](samples/wallhaven-8525yy_256.png) | ![](samples/wallhaven-8525yy_256.whash.png) | ![](samples/wallhaven-8525yy_256.splathash.png) | ![](samples/wallhaven-8525yy_256.blurhash.png) | ![](samples/wallhaven-8525yy_256.thumbhash.png) |
+| ![](samples/wallhaven-gw5dq3_256.png) | ![](samples/wallhaven-gw5dq3_256.whash.png) | ![](samples/wallhaven-gw5dq3_256.splathash.png) | ![](samples/wallhaven-gw5dq3_256.blurhash.png) | ![](samples/wallhaven-gw5dq3_256.thumbhash.png) |
+| ![](samples/wallhaven-gwpgv3_256.png) | ![](samples/wallhaven-gwpgv3_256.whash.png) | ![](samples/wallhaven-gwpgv3_256.splathash.png) | ![](samples/wallhaven-gwpgv3_256.blurhash.png) | ![](samples/wallhaven-gwpgv3_256.thumbhash.png) |
+| ![](samples/wallhaven-ogy2m7_256.png) | ![](samples/wallhaven-ogy2m7_256.whash.png) | ![](samples/wallhaven-ogy2m7_256.splathash.png) | ![](samples/wallhaven-ogy2m7_256.blurhash.png) | ![](samples/wallhaven-ogy2m7_256.thumbhash.png) |
+| ![](samples/wallhaven-ogy7ql_256.png) | ![](samples/wallhaven-ogy7ql_256.whash.png) | ![](samples/wallhaven-ogy7ql_256.splathash.png) | ![](samples/wallhaven-ogy7ql_256.blurhash.png) | ![](samples/wallhaven-ogy7ql_256.thumbhash.png) |
+| ![](samples/wallhaven-q2yx9l_256.png) | ![](samples/wallhaven-q2yx9l_256.whash.png) | ![](samples/wallhaven-q2yx9l_256.splathash.png) | ![](samples/wallhaven-q2yx9l_256.blurhash.png) | ![](samples/wallhaven-q2yx9l_256.thumbhash.png) |
+| ![](samples/wallhaven-w513lr_256.png) | ![](samples/wallhaven-w513lr_256.whash.png) | ![](samples/wallhaven-w513lr_256.splathash.png) | ![](samples/wallhaven-w513lr_256.blurhash.png) | ![](samples/wallhaven-w513lr_256.thumbhash.png) |
+| ![](samples/wallhaven-yq5ejd_3840x2160_256.png) | ![](samples/wallhaven-yq5ejd_3840x2160_256.whash.png) | ![](samples/wallhaven-yq5ejd_3840x2160_256.splathash.png) | ![](samples/wallhaven-yq5ejd_3840x2160_256.blurhash.png) | ![](samples/wallhaven-yq5ejd_3840x2160_256.thumbhash.png) |
 
-Whash uses **48 bytes** (vs ThumbHash's 24 bytes, downscaled to 128x128) but preserves significantly
-more detail and support up to 256x256 resolution (vs ThumbHash's 128x128).
+Whash uses (~36 B avg) but preserves significantly more detail and support up to 256x256 resolution (vs ThumbHash's 100x100, SplatHash 32x32).
+SplatHash (16 B) is the most compact but limited to 32x32 internal resolution.
+ThumbHash (~20 B) and BlurHash (28 B) provide intermediate quality at moderate sizes.
 
 ## Interesting Links
 
@@ -347,6 +357,8 @@ more detail and support up to 256x256 resolution (vs ThumbHash's 128x128).
  * https://github.com/LMP88959/Digital-Subband-Video-2
  * https://github.com/curioustorvald/TAV-video-codec
  * https://github.com/datocms/fast_thumbhash
+ * https://github.com/junevm/splathash
+ * https://github.com/woltapp/blurhash
  * https://github.com/gopro/cineform-sdk
  * https://github.com/emericg/libcineform
  * https://github.com/bbc/vc2-reference
